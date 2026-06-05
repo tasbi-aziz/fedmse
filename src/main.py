@@ -34,8 +34,8 @@ logging.basicConfig(level=logging.INFO,  # Set the logging level (DEBUG, INFO, W
 
 
 num_participants = 0.5
-epoch = 100
-num_rounds = 20
+epoch = 50
+num_rounds = 10
 lr_rate = 1e-5
 shrink_lambda = 10
 network_size = 50
@@ -44,7 +44,7 @@ data_seed = 1234
 no_Exp = f"IID-Update_Exp6_scale_{epoch}epoch_{network_size}client_{num_rounds}rounds_lr{lr_rate}_lamda{shrink_lambda}_ratio{num_participants*100}_dataseed{data_seed}"
 
 num_runs = 5
-batch_size = 12
+batch_size = 10
 
 new_device = True
 min_val_loss = float("inf")
