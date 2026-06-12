@@ -38,13 +38,13 @@ epoch = 2
 num_rounds = 5
 lr_rate = 1e-5
 shrink_lambda = 5
-network_size = 50
+network_size = 10
 data_seed = 1234
 # no_Exp = f"nonIID_Exp1_Rerun_{epoch}epoch_10client_lr0001_lamda{shrink_lambda}_ratio{num_participants*100}"
 no_Exp = f"IID-Update_Exp6_scale_{epoch}epoch_{network_size}client_{num_rounds}rounds_lr{lr_rate}_lamda{shrink_lambda}_ratio{num_participants*100}_dataseed{data_seed}"
 
 num_runs = 2
-batch_size = 5
+batch_size = 32
 
 new_device = True
 min_val_loss = float("inf")
@@ -57,7 +57,7 @@ dim_features = 115   #nba-iot: 115; cic-2023: 46
 
 scen_name = 'FL-IoT' 
 
-config_file = f"Configuration/scen2-nba-iot-50clients.json"
+config_file = f"Configuration/scen2-nba-iot-10clients.json"
 # config_file = "Configuration/scen2-nba-iot-10clients.json"
 # config_file = "Configuration/cic-config.json"
 
