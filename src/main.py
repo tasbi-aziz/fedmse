@@ -87,15 +87,16 @@ if __name__ == "__main__":
         for device in devices_list:
             logging.info("Creating metadata for client...")
             normal_data_path = os.path.join(config['data_path'], device["normal_data_path"])
-            abnormal_data_path = os.path.join(config['data_path'], device["abnormal_data_path"])
+    
+    # FORCED FIX: Change this line to point to test_normal directly
+            abnormal_data_path = os.path.join(config['data_path'], device["normal_data_path"].replace("normal", "test_normal"))
+    
             test_new_normal_data_path = os.path.join(config['data_path'], device["test_normal_data_path"])
-            
+    
             logging.info("Loading data from {}...".format(device['name']))
-            
-            # normal_data = load_data(normal_data_path, header="infer")
+    
             normal_data = load_data(normal_data_path)
             normal_data = normal_data.sample(frac=1).reset_index(drop=True)
-            # abnormal_data = load_data(abnormal_data_path, header="infer")
 
             abnormal_data = load_data(abnormal_data_path)
             abnormal_data = abnormal_data.sample(frac=1).reset_index(drop=True)
