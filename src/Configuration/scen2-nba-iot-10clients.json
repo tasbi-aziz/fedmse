@@ -15,6 +15,6 @@
             "normal_data_path": "Client-9/normal",
             "abnormal_data_path": "Client-9/abnormal",
             "test_normal_data_path": "Client-9/test_normal"
-        },
+        }
     ]
 }
