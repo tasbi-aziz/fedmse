@@ -73,7 +73,8 @@ if __name__ == "__main__":
         np.random.seed(data_seed)
         try:
             logging.info("Loading configuration...")
-            with open(config_file, "r") as config_file:
+            # FORCED PATH: Changing config_file directly to the 10-client path
+            with open("/content/fedmse/Configuration/scen2-nba-iot-10clients.json", "r") as config_file:
                 config = json.load(config_file)
         except Exception as e:
             logging.info("Failed to load configuration.")
