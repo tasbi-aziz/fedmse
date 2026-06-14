@@ -1,5 +1,5 @@
 {
-    "data_path": "../Data/N-BaIoT/IID-10-Client_Data",
+    "data_path": "/content/fedmse/Data/N-BaIoT/nonIID-10-Client_Data",
     "devices_list": [
         {
             "id": 1,
