@@ -57,7 +57,7 @@ dim_features = 115   #nba-iot: 115; cic-2023: 46
 
 scen_name = 'FL-IoT' 
 
-config_file = f"Configuration/scen2-nba-iot-10clients.json"
+config_file = "/content/fedmse/Configuration/scen2-nba-iot-10clients.json"
 # config_file = "Configuration/scen2-nba-iot-10clients.json"
 # config_file = "Configuration/cic-config.json"
 
