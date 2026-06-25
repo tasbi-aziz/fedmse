@@ -2,6 +2,41 @@
     "data_path": "/content/fedmse/Data/N-BaIoT/nonIID-10-Client_Data",
     "devices_list": [
         {
+            "id": 1,
+            "name": "NBa-Scen2-Client-1",
+            "normal_data_path": "Client-1/normal",
+            "abnormal_data_path": "Client-1/test_normal",
+            "test_normal_data_path": "Client-1/test_normal"
+        },
+        {
+            "id": 2,
+            "name": "NBa-Scen2-Client-2",
+            "normal_data_path": "Client-2/normal",
+            "abnormal_data_path": "Client-2/test_normal",
+            "test_normal_data_path": "Client-2/test_normal"
+        },
+        {
+            "id": 3,
+            "name": "NBa-Scen2-Client-3",
+            "normal_data_path": "Client-3/normal",
+            "abnormal_data_path": "Client-3/test_normal",
+            "test_normal_data_path": "Client-3/test_normal"
+        },
+        {
+            "id": 4,
+            "name": "NBa-Scen2-Client-4",
+            "normal_data_path": "Client-4/normal",
+            "abnormal_data_path": "Client-4/test_normal",
+            "test_normal_data_path": "Client-4/test_normal"
+        },
+        {
+            "id": 5,
+            "name": "NBa-Scen2-Client-5",
+            "normal_data_path": "Client-5/normal",
+            "abnormal_data_path": "Client-5/test_normal",
+            "test_normal_data_path": "Client-5/test_normal"
+        },
+        {
             "id": 8,
             "name": "NBa-Scen2-Client-8",
             "normal_data_path": "Client-8/normal",
