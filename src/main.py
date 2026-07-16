@@ -66,6 +66,17 @@ def set_seeds(seed):
         torch.cuda.manual_seed_all(seed)
 
 if __name__ == "__main__":
+    # --- Parse Command Line Arguments ---
+    # We define the argument as --similarity_threshold to match security_buffer.py
+    parser = argparse.ArgumentParser(description="Federated Learning with Dual-Pathway Gateway Routing")
+    parser.add_argument(
+        "--similarity_threshold", 
+        type=float, 
+        default=1.5, 
+        help="Similarity threshold parameter for the Temporal Security Buffer tracker (default: 1.5)"
+    )
+    args = parser.parse_args()
+
     random.seed(data_seed)
     np.random.seed(data_seed)
     try:
@@ -195,11 +206,11 @@ if __name__ == "__main__":
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
                 buffer_aggregator = GlobalAggregator(global_model_buffer, update_type=update_type)
                 
-                # Initialize Temporal Security Buffer tracker
+                # Initialize Temporal Security Buffer tracker using similarity_threshold
                 sec_buffer_tracker = SecurityBuffer(
                     global_model=global_model,
                     window_size=5,
-                    anomaly_threshold=1.5
+                    similarity_threshold=args.similarity_threshold
                 )
 
                 # Set dev dataset for aggregators
