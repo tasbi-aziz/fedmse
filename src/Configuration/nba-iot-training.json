@@ -27,24 +27,24 @@
       "name": "Philips_B120N10_Baby_Monitor",
       "normal_data_path": "Philips_B120N10_Baby_Monitor/normal",
       "abnormal_data_path": "Philips_B120N10_Baby_Monitor/abnormal",
-      "simulated_training_time": 1.5,
-      "simulated_comm_time": 0.5
+      "simulated_training_time": 8.8,
+      "simulated_comm_time": 3.0
     },
     {
       "id": 4,
       "name": "Provision_PT_737E_Security_Camera",
       "normal_data_path": "Provision_PT_737E_Security_Camera/normal",
       "abnormal_data_path": "Provision_PT_737E_Security_Camera/abnormal",
-      "simulated_training_time": 2.2,
-      "simulated_comm_time": 0.8
+      "simulated_training_time": 10.2,
+      "simulated_comm_time": 3.5
     },
     {
       "id": 5,
       "name": "Provision_PT_838_Security_Camera",
       "normal_data_path": "Provision_PT_838_Security_Camera/normal",
       "abnormal_data_path": "Provision_PT_838_Security_Camera/abnormal",
-      "simulated_training_time": 2.1,
-      "simulated_comm_time": 0.7
+      "simulated_training_time": 9.5,
+      "simulated_comm_time": 2.9
     },
     {
       "id": 6,
@@ -59,16 +59,16 @@
       "name": "SimpleHome_XCS7_1002_WHT_Security_Camera",
       "normal_data_path": "SimpleHome_XCS7_1002_WHT_Security_Camera/normal",
       "abnormal_data_path": "SimpleHome_XCS7_1002_WHT_Security_Camera/abnormal",
-      "simulated_training_time": 2.5,
-      "simulated_comm_time": 0.9
+      "simulated_training_time": 11.0,
+      "simulated_comm_time": 4.0
     },
     {
       "id": 8,
       "name": "SimpleHome_XCS7_1003_WHT_Security_Camera",
       "normal_data_path": "SimpleHome_XCS7_1003_WHT_Security_Camera/normal",
       "abnormal_data_path": "SimpleHome_XCS7_1003_WHT_Security_Camera/abnormal",
-      "simulated_training_time": 2.4,
-      "simulated_comm_time": 0.8
+      "simulated_training_time": 10.5,
+      "simulated_comm_time": 3.8
     },
     {
       "id": 9,
