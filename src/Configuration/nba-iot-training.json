@@ -1,59 +1,82 @@
 {
-    "data_path": "../Data/N-BaIoT",
-    "devices_list": [
-        {
-            "id": 1,
-            "name": "Danmini_Doorbell",
-            "normal_data_path": "Danmini_Doorbell/normal",
-            "abnormal_data_path": "Danmini_Doorbell/abnormal"
-        },
-        {
-            "id": 2,
-            "name": "Ecobee_Thermostat",
-            "normal_data_path": "Ecobee_Thermostat/normal",
-            "abnormal_data_path": "Ecobee_Thermostat/abnormal"
-        },
-        {
-            "id": 3,
-            "name": "Philips_B120N10_Baby_Monitor",
-            "normal_data_path": "Philips_B120N10_Baby_Monitor/normal",
-            "abnormal_data_path": "Philips_B120N10_Baby_Monitor/abnormal"
-        },
-        {
-            "id": 4,
-            "name": "Provision_PT_737E_Security_Camera",
-            "normal_data_path": "Provision_PT_737E_Security_Camera/normal",
-            "abnormal_data_path": "Provision_PT_737E_Security_Camera/abnormal"
-        },
-        {
-            "id": 5,
-            "name": "Provision_PT_838_Security_Camera",
-            "normal_data_path": "Provision_PT_838_Security_Camera/normal",
-            "abnormal_data_path": "Provision_PT_838_Security_Camera/abnormal"
-        },
-        {
-            "id": 6,
-            "name": "Samsung_SNH_1011_N_Webcam",
-            "normal_data_path": "Samsung_SNH_1011_N_Webcam/normal",
-            "abnormal_data_path": "Samsung_SNH_1011_N_Webcam/abnormal"
-        },
-        {
-            "id": 7,
-            "name": "SimpleHome_XCS7_1002_WHT_Security_Camera",
-            "normal_data_path": "SimpleHome_XCS7_1002_WHT_Security_Camera/normal",
-            "abnormal_data_path": "SimpleHome_XCS7_1002_WHT_Security_Camera/abnormal"
-        },
-        {
-            "id": 8,
-            "name": "SimpleHome_XCS7_1003_WHT_Security_Camera",
-            "normal_data_path": "SimpleHome_XCS7_1003_WHT_Security_Camera/normal",
-            "abnormal_data_path": "SimpleHome_XCS7_1003_WHT_Security_Camera/abnormal"
-        },
-        {
-            "id": 9,
-            "name": "Ennio_Doorbell",
-            "normal_data_path": "Ennio_Doorbell/normal",
-            "abnormal_data_path": "Ennio_Doorbell/abnormal"
-        }
-    ]
+  "data_path": "../Data/N-BaIoT",
+  "asynchronous_settings": {
+    "preliminary_rounds": 20,
+    "alpha": 0.7,
+    "beta": 0.3
+  },
+  "devices_list": [
+    {
+      "id": 1,
+      "name": "Danmini_Doorbell",
+      "normal_data_path": "Danmini_Doorbell/normal",
+      "abnormal_data_path": "Danmini_Doorbell/abnormal",
+      "simulated_training_time": 1.2,
+      "simulated_comm_time": 0.4
+    },
+    {
+      "id": 2,
+      "name": "Ecobee_Thermostat",
+      "normal_data_path": "Ecobee_Thermostat/normal",
+      "abnormal_data_path": "Ecobee_Thermostat/abnormal",
+      "simulated_training_time": 1.8,
+      "simulated_comm_time": 0.6
+    },
+    {
+      "id": 3,
+      "name": "Philips_B120N10_Baby_Monitor",
+      "normal_data_path": "Philips_B120N10_Baby_Monitor/normal",
+      "abnormal_data_path": "Philips_B120N10_Baby_Monitor/abnormal",
+      "simulated_training_time": 1.5,
+      "simulated_comm_time": 0.5
+    },
+    {
+      "id": 4,
+      "name": "Provision_PT_737E_Security_Camera",
+      "normal_data_path": "Provision_PT_737E_Security_Camera/normal",
+      "abnormal_data_path": "Provision_PT_737E_Security_Camera/abnormal",
+      "simulated_training_time": 2.2,
+      "simulated_comm_time": 0.8
+    },
+    {
+      "id": 5,
+      "name": "Provision_PT_838_Security_Camera",
+      "normal_data_path": "Provision_PT_838_Security_Camera/normal",
+      "abnormal_data_path": "Provision_PT_838_Security_Camera/abnormal",
+      "simulated_training_time": 2.1,
+      "simulated_comm_time": 0.7
+    },
+    {
+      "id": 6,
+      "name": "Samsung_SNH_1011_N_Webcam",
+      "normal_data_path": "Samsung_SNH_1011_N_Webcam/normal",
+      "abnormal_data_path": "Samsung_SNH_1011_N_Webcam/abnormal",
+      "simulated_training_time": 1.1,
+      "simulated_comm_time": 0.3
+    },
+    {
+      "id": 7,
+      "name": "SimpleHome_XCS7_1002_WHT_Security_Camera",
+      "normal_data_path": "SimpleHome_XCS7_1002_WHT_Security_Camera/normal",
+      "abnormal_data_path": "SimpleHome_XCS7_1002_WHT_Security_Camera/abnormal",
+      "simulated_training_time": 2.5,
+      "simulated_comm_time": 0.9
+    },
+    {
+      "id": 8,
+      "name": "SimpleHome_XCS7_1003_WHT_Security_Camera",
+      "normal_data_path": "SimpleHome_XCS7_1003_WHT_Security_Camera/normal",
+      "abnormal_data_path": "SimpleHome_XCS7_1003_WHT_Security_Camera/abnormal",
+      "simulated_training_time": 2.4,
+      "simulated_comm_time": 0.8
+    },
+    {
+      "id": 9,
+      "name": "Ennio_Doorbell",
+      "normal_data_path": "Ennio_Doorbell/normal",
+      "abnormal_data_path": "Ennio_Doorbell/abnormal",
+      "simulated_training_time": 1.3,
+      "simulated_comm_time": 0.4
+    }
+  ]
 }
