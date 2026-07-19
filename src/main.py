@@ -31,17 +31,17 @@ import logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
-num_participants = 0.5
-epoch = 2
-num_rounds = 5
+num_participants = 1
+epoch = 10
+num_rounds = 20
 lr_rate = 1e-5
 shrink_lambda = 5
-network_size = 2
+network_size = 10
 data_seed = 1234
 
 no_Exp = f"IID-Update_Exp6_scale_{epoch}epoch_{network_size}client_{num_rounds}rounds_lr{lr_rate}_lamda{shrink_lambda}_ratio{num_participants*100}_dataseed{data_seed}"
 
-num_runs = 2
+num_runs = 5
 batch_size = 32
 
 new_device = True
