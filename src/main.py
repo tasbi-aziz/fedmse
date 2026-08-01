@@ -395,3 +395,5 @@ if __name__ == "__main__":
                     os.makedirs(os.path.dirname(file_path), exist_ok=True)
                     with open(file_path, 'wb') as f:
                         pickle.dump(client_latent, f)
+                if experiment:
+                    experiment.end()
