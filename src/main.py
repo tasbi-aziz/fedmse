@@ -1,5 +1,5 @@
 """
-This is training endpoint updated with dual-pathway gateway routing.
+This is training endpoint updated with dual-pathway gateway routing and Comet.ml logging.
 """
 
 import os
@@ -11,6 +11,22 @@ import torch
 import argparse
 import copy
 import random
+import logging
+
+# --- STEP 1: COMET.ML INTEGRATION ---
+import comet_ml
+
+# Check if an experiment was already started in Colab, otherwise initialize from environment
+experiment = comet_ml.get_global_experiment()
+if experiment is None:
+    api_key = os.environ.get("COMET_API_KEY")
+    project_name = os.environ.get("COMET_PROJECT_NAME", "fedmse-security-buffer")
+    if api_key:
+        experiment = comet_ml.Experiment(
+            api_key=api_key,
+            project_name=project_name
+        )
+
 from torch.utils.data import DataLoader, random_split, ConcatDataset
 from Model import Shrink_Autoencoder
 from Model import Autoencoder
@@ -22,10 +38,7 @@ from Trainer import GlobalAggregator
 from Evaluator import Evaluator
 
 # Import security buffer for Phase 2 holding
-# Make sure src/Trainer/security_buffer.py exists with your SecurityBuffer implementation
 from Trainer.security_buffer import SecurityBuffer  
-
-import logging
 
 # Configure the logging module
 logging.basicConfig(level=logging.INFO,
@@ -67,7 +80,6 @@ def set_seeds(seed):
 
 if __name__ == "__main__":
     # --- Parse Command Line Arguments ---
-    # We define the argument as --similarity_threshold to match security_buffer.py
     parser = argparse.ArgumentParser(description="Federated Learning with Dual-Pathway Gateway Routing")
     parser.add_argument(
         "--similarity_threshold", 
@@ -76,6 +88,19 @@ if __name__ == "__main__":
         help="Similarity threshold parameter for the Temporal Security Buffer tracker (default: 1.5)"
     )
     args = parser.parse_args()
+
+    # Log hyperparameter settings to Comet dashboard
+    if experiment:
+        experiment.log_parameters({
+            "num_rounds": num_rounds,
+            "epoch": epoch,
+            "learning_rate": lr_rate,
+            "shrink_lambda": shrink_lambda,
+            "network_size": network_size,
+            "batch_size": batch_size,
+            "similarity_threshold": args.similarity_threshold,
+            "prelim_rounds": prelim_rounds
+        })
 
     random.seed(data_seed)
     np.random.seed(data_seed)
@@ -156,7 +181,6 @@ if __name__ == "__main__":
             pin_memory=True
         )
         
-        # Save client latency simulations directly from config to track metrics
         client_info.append({
             "device": device['name'],
             "save_dir": "",
@@ -165,7 +189,7 @@ if __name__ == "__main__":
             "test_loader": test_loader,
             "test_dataset": (processed_test_data, test_label),
             "dev_normal_dataset": dev_normal_data,
-            "sim_train_time": device.get("simulated_training_time", 1.5),  # safe fallbacks if not present
+            "sim_train_time": device.get("simulated_training_time", 1.5),
             "sim_comm_time": device.get("simulated_comm_time", 0.5)
         })
 
@@ -189,31 +213,27 @@ if __name__ == "__main__":
                 # Model initializations
                 if model_type == "hybrid":
                     global_model = Shrink_Autoencoder(input_dim=dim_features,
-                                                      output_dim=dim_features,
-                                                      shrink_lambda=shrink_lambda,
-                                                      latent_dim=11,
-                                                      hidden_neus=50)
+                                                       output_dim=dim_features,
+                                                       shrink_lambda=shrink_lambda,
+                                                       latent_dim=11,
+                                                       hidden_neus=50)
                 else:
                     global_model = Autoencoder(input_dim=dim_features,
-                                               output_dim=dim_features,
-                                               latent_dim=11,
-                                               hidden_neus=50)
+                                                output_dim=dim_features,
+                                                latent_dim=11,
+                                                hidden_neus=50)
                     
-                # Create Main model and separate verification holding buffer models
                 global_model_buffer = copy.deepcopy(global_model)
                 
-                # Load aggregators
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
                 buffer_aggregator = GlobalAggregator(global_model_buffer, update_type=update_type)
                 
-                # Initialize Temporal Security Buffer tracker using similarity_threshold
                 sec_buffer_tracker = SecurityBuffer(
                     global_model=global_model,
                     window_size=5,
                     similarity_threshold=args.similarity_threshold
                 )
 
-                # Set dev dataset for aggregators
                 min_len = min([len(client['dev_normal_dataset']) for client in client_info])
                 dev_dataset_sampled = []
                 for client in client_info:
@@ -237,7 +257,6 @@ if __name__ == "__main__":
                     
                     total_training_samples = sum([len(client['train_loader'].dataset) for client in selected_clients])
                     
-                    # Store models mapped to paths
                     fast_path_weights = []
                     slow_path_weights = []
                     
@@ -255,15 +274,12 @@ if __name__ == "__main__":
                         raw_weights = copy.deepcopy(device_trainer.model.state_dict())
                         sample_count = len(client["train_loader"].dataset)
                         
-                        # Prepare weight structure for the standard aggregator list: (state_dict, total_samples, local_samples)
                         weight_entry = (raw_weights, total_training_samples, sample_count)
                         
                         # Apply Dual-Pathway Gatekeeper Routing logic
                         if round_idx < prelim_rounds:
-                            # Phase 1: All updates process through the main lane
                             fast_path_weights.append(weight_entry)
                             
-                            # Log metrics to calculate short-term threshold values
                             global_aggregator.record_phase1_metric(
                                 round_idx=round_idx,
                                 client_id=client['device'],
@@ -272,7 +288,6 @@ if __name__ == "__main__":
                                 dataset_size=sample_count
                             )
                         else:
-                            # Phase 2: Gateway Routing Check
                             is_fast = global_aggregator.evaluate_routing_lane(
                                 train_time=client['sim_train_time'],
                                 comm_time=client['sim_comm_time'],
@@ -286,29 +301,29 @@ if __name__ == "__main__":
                                 logging.info(f"⏳ {client['device']} -> SLOW PATH (Held in Temporal Security Buffer)")
                                 slow_path_weights.append(weight_entry)
                                 
-                                # Push slow client update into temporal tracking buffer
                                 sec_buffer_tracker.add_to_buffer(client['device'], raw_weights)
                                 
                         logging.info(f"Client {client['device']} training completed.")
                     
+                    # Log routing counts to Comet dashboard
+                    if experiment:
+                        experiment.log_metric("fast_path_clients_count", len(fast_path_weights), step=round_idx + 1)
+                        experiment.log_metric("slow_path_clients_count", len(slow_path_weights), step=round_idx + 1)
+
                     # --- Step 1: Execute aggregation for Fast lane ---
                     if fast_path_weights:
                         global_aggregator.update(local_models=fast_path_weights)
                     
                     # --- Step 2: Handle Phase-specific Operations ---
                     if round_idx < prelim_rounds:
-                        # Phase 1: Calculate current short-term threshold
                         global_aggregator.calculate_round_st_threshold(round_idx)
                         
-                        # Calculate long-term baseline threshold at the end of Phase 1
                         if round_idx == (prelim_rounds - 1):
                             global_aggregator.compute_final_lt_threshold()
                     else:
-                        # Phase 2: Slow lane security checks and buffer updates
                         if slow_path_weights:
                             buffer_aggregator.update(local_models=slow_path_weights)
                         
-                        # Extract verified clean parameter dictionaries from holding buffer
                         safe_extracted_weights = sec_buffer_tracker.extract_safe_updates()
                         
                         if safe_extracted_weights:
@@ -323,10 +338,14 @@ if __name__ == "__main__":
                                 
                             global_aggregator.model.load_state_dict(avg_extracted)
                     
-                    # Synchronize models
                     buffer_aggregator.model.load_state_dict(copy.deepcopy(global_aggregator.model.state_dict()))
 
                     logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {global_aggregator.val_loss}")
+                    
+                    # Log loss to Comet dashboard
+                    if experiment and global_aggregator.val_loss is not None:
+                        experiment.log_metric("global_loss", global_aggregator.val_loss, step=round_idx + 1)
+
                     logging.info("Training round finished! Evaluating performance...")
                     
                     evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type)
@@ -342,15 +361,17 @@ if __name__ == "__main__":
                         
                         round_results[client['device']] = auc_score
                         
+                        # Log individual client AUC to Comet
+                        if experiment and isinstance(auc_score, (int, float)):
+                            experiment.log_metric(f"auc_{client['device']}", auc_score, step=round_idx + 1)
+
                     round_results["global_loss"] = global_aggregator.val_loss
                     round_results['join_clients'] = selected_idx
                     round_results = {f'round_{round_idx+1}': round_results}
                     
-                    # Log results to output JSON
                     with open(filename, 'a') as f:
                         f.write(json.dumps(round_results) + '\n')
                     
-                    # Check for global early stopping criteria
                     if global_aggregator.val_loss < min_val_loss:
                         min_val_loss = global_aggregator.val_loss
                         global_worse = 0
@@ -360,7 +381,6 @@ if __name__ == "__main__":
                             logging.info("Early stopping triggered in global round!")
                             break
                 
-                # Save latent models for visualization analyses 
                 if model_type == "hybrid":
                     file_path = f'Checkpoint/LatentData/{network_size}/{no_Exp}/Run_{run}/latent_{model_type}_{update_type}.pkl'
                     os.makedirs(os.path.dirname(file_path), exist_ok=True)
