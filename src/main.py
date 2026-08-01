@@ -18,14 +18,23 @@ import comet_ml
 
 # Check if an experiment was already started in Colab, otherwise initialize from environment
 experiment = comet_ml.get_global_experiment()
+
 if experiment is None:
     api_key = os.environ.get("COMET_API_KEY")
-    project_name = os.environ.get("COMET_PROJECT_NAME", "fedmse-security-buffer")
+    project_name = os.environ.get("COMET_PROJECT_NAME")
+    workspace = os.environ.get("COMET_WORKSPACE")
+
     if api_key:
         experiment = comet_ml.Experiment(
             api_key=api_key,
-            project_name=project_name
+            project_name=project_name,
+            workspace=workspace
         )
+
+if experiment:
+    print("✅ Comet connected successfully!")
+else:
+    print("❌ Comet experiment NOT created!")
 
 from torch.utils.data import DataLoader, random_split, ConcatDataset
 from Model import Shrink_Autoencoder
