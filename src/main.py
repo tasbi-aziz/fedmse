@@ -55,7 +55,7 @@ logging.basicConfig(level=logging.INFO,
 
 num_participants = 1
 epoch = 10
-num_rounds = 20
+num_rounds = 10
 lr_rate = 1e-5
 shrink_lambda = 5
 network_size = 10
