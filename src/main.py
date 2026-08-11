@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO,
 num_participants = 1
 epoch = 10
 num_rounds = 10
-lr_rate = 1e-5
+lr_rate = 1e-3
 shrink_lambda = 5
 network_size = 10
 data_seed = 1234
@@ -55,7 +55,7 @@ scen_name = 'FL-IoT'
 config_file = "/content/fedmse/Configuration/scen2-nba-iot-10clients.json"
 
 # Phase 1 setup (e.g., first 2 rounds of training for quick testing out of 5 rounds)
-prelim_rounds = 2 
+prelim_rounds = 5 
 
 def set_seeds(seed):
     random.seed(seed)
