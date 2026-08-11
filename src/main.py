@@ -30,9 +30,9 @@ from Trainer.security_buffer import SecurityBuffer
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
-num_participants = 1
-epoch = 10
-num_rounds = 10
+num_participants = 1.0
+epoch = 5
+num_rounds = 12
 lr_rate = 1e-3
 shrink_lambda = 5
 network_size = 10
@@ -41,11 +41,11 @@ data_seed = 1234
 no_Exp = f"IID-Update_Exp6_scale_{epoch}epoch_{network_size}client_{num_rounds}rounds_lr{lr_rate}_lamda{shrink_lambda}_ratio{num_participants*100}_dataseed{data_seed}"
 
 num_runs = 5
-batch_size = 32
+batch_size = 64
 
 new_device = True
 min_val_loss = float("inf")
-global_patience = 1
+global_patience = 5
 global_worse = 0
 metric = "AUC" 
 dim_features = 115   # nba-iot: 115; cic-2023: 46
@@ -55,7 +55,7 @@ scen_name = 'FL-IoT'
 config_file = "/content/fedmse/Configuration/scen2-nba-iot-10clients.json"
 
 # Phase 1 setup (e.g., first 2 rounds of training for quick testing out of 5 rounds)
-prelim_rounds = 5 
+prelim_rounds = 10 
 
 def set_seeds(seed):
     random.seed(seed)
