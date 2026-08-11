@@ -1,5 +1,5 @@
 """
-This is training endpoint updated with dual-pathway gateway routing and Comet.ml logging.
+This is training endpoint updated with dual-pathway gateway routing.
 """
 
 import os
@@ -12,29 +12,6 @@ import argparse
 import copy
 import random
 import logging
-
-# --- STEP 1: COMET.ML INTEGRATION ---
-import comet_ml
-
-# Check if an experiment was already started in Colab, otherwise initialize from environment
-experiment = comet_ml.get_global_experiment()
-
-if experiment is None:
-    api_key = os.environ.get("COMET_API_KEY")
-    project_name = os.environ.get("COMET_PROJECT_NAME")
-    workspace = os.environ.get("COMET_WORKSPACE")
-
-    if api_key:
-        experiment = comet_ml.Experiment(
-            api_key=api_key,
-            project_name=project_name,
-            workspace=workspace
-        )
-
-if experiment:
-    print("✅ Comet connected successfully!")
-else:
-    print("❌ Comet experiment NOT created!")
 
 from torch.utils.data import DataLoader, random_split, ConcatDataset
 from Model import Shrink_Autoencoder
@@ -97,19 +74,6 @@ if __name__ == "__main__":
         help="Similarity threshold parameter for the Temporal Security Buffer tracker (default: 1.5)"
     )
     args = parser.parse_args()
-
-    # Log hyperparameter settings to Comet dashboard
-    if experiment:
-        experiment.log_parameters({
-            "num_rounds": num_rounds,
-            "epoch": epoch,
-            "learning_rate": lr_rate,
-            "shrink_lambda": shrink_lambda,
-            "network_size": network_size,
-            "batch_size": batch_size,
-            "similarity_threshold": args.similarity_threshold,
-            "prelim_rounds": prelim_rounds
-        })
 
     random.seed(data_seed)
     np.random.seed(data_seed)
@@ -313,11 +277,6 @@ if __name__ == "__main__":
                                 sec_buffer_tracker.add_to_buffer(client['device'], raw_weights)
                                 
                         logging.info(f"Client {client['device']} training completed.")
-                    
-                    # Log routing counts to Comet dashboard
-                    if experiment:
-                        experiment.log_metric("fast_path_clients_count", len(fast_path_weights), step=round_idx + 1)
-                        experiment.log_metric("slow_path_clients_count", len(slow_path_weights), step=round_idx + 1)
 
                     # --- Step 1: Execute aggregation for Fast lane ---
                     if fast_path_weights:
@@ -350,10 +309,6 @@ if __name__ == "__main__":
                     buffer_aggregator.model.load_state_dict(copy.deepcopy(global_aggregator.model.state_dict()))
 
                     logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {global_aggregator.val_loss}")
-                    
-                    # Log loss to Comet dashboard
-                    if experiment and global_aggregator.val_loss is not None:
-                        experiment.log_metric("global_loss", global_aggregator.val_loss, step=round_idx + 1)
 
                     logging.info("Training round finished! Evaluating performance...")
                     
@@ -369,10 +324,6 @@ if __name__ == "__main__":
                             auc_score = evaluator.evaluate(client["test_loader"], client["train_loader"])
                         
                         round_results[client['device']] = auc_score
-                        
-                        # Log individual client AUC to Comet
-                        if experiment and isinstance(auc_score, (int, float)):
-                            experiment.log_metric(f"auc_{client['device']}", auc_score, step=round_idx + 1)
 
                     round_results["global_loss"] = global_aggregator.val_loss
                     round_results['join_clients'] = selected_idx
@@ -395,5 +346,3 @@ if __name__ == "__main__":
                     os.makedirs(os.path.dirname(file_path), exist_ok=True)
                     with open(file_path, 'wb') as f:
                         pickle.dump(client_latent, f)
-                if experiment:
-                    experiment.end()
