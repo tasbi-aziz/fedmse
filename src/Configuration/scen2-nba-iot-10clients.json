@@ -1,5 +1,5 @@
 {
-  "data_path": "/content/fedmse/Data/N-BaIoT/nonIID-10-Client_Data",
+  "data_path": "/content/drive/MyDrive/Prepared_dataset/IID-10-Client_Datat",
   "asynchronous_settings": {
     "preliminary_rounds": 20,
     "alpha": 0.7,
