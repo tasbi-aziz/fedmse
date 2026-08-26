@@ -1,11 +1,12 @@
 """
 Dataset-Aware Security Buffer for FedMSE.
 Integrates Workload-Scaled Cosine Similarity (Security Gate) 
-and Arrival Time Routing (Synchronization Gate).
+and Robust Dynamic Latency Thresholding (Synchronization Gate).
 """
 
 import copy
 import logging
+import numpy as np
 import torch
 
 class SecurityBuffer:
@@ -25,7 +26,7 @@ class SecurityBuffer:
             global_model: Main model reference on the server.
             window_size: Max history rounds kept in quarantine.
             base_similarity_threshold: Base similarity threshold (tau_0).
-            latency_threshold: Max seconds allowed for Direct Path.
+            latency_threshold: Initial max seconds allowed for Direct Path.
             trust_penalty: Trust score reduction on anomalous update.
             trust_reward: Trust score increase on aligned update.
         """
@@ -44,6 +45,34 @@ class SecurityBuffer:
         
         # Dynamic trust scores: { client_id: score }
         self.trust_scores = {}
+
+    def update_dynamic_latency_threshold(self, arrival_times, k=1.5):
+        """
+        Calculates dynamic latency threshold using: Median(T) + K * IQR(T).
+        
+        Args:
+            arrival_times (list or np.ndarray): Arrival times of clients in current round.
+            k (float): Outlier sensitivity multiplier (typically 1.5 to 2.0).
+        """
+        if not arrival_times or len(arrival_times) == 0:
+            return self.latency_threshold
+
+        times = np.array(arrival_times)
+        median_t = np.median(times)
+        q75, q25 = np.percentile(times, [75, 25])
+        iqr_t = q75 - q25
+
+        # Dynamic formula calculation
+        calculated_threshold = median_t + (k * iqr_t)
+        
+        # Keep threshold at a safe positive non-zero floor
+        self.latency_threshold = max(1.0, float(calculated_threshold))
+        
+        logging.info(
+            f"[Synchronization Gate] Dynamic Latency Threshold updated to: "
+            f"{self.latency_threshold:.2f}s (Median={median_t:.2f}s, IQR={iqr_t:.2f}s, k={k})"
+        )
+        return self.latency_threshold
 
     def _flatten_state_dict(self, state_dict):
         """Flattens PyTorch state_dict parameters into a 1D vector."""
@@ -74,15 +103,9 @@ class SecurityBuffer:
         1. Scales Cosine Similarity threshold by workload ratio (n_k / n_avg).
         2. Phase 1 (Security): Checks weight drift against dynamic threshold.
         3. Phase 2 (Synchronization): Bypasses Quarantine for clean updates and routes by latency.
-        
-        Returns:
-            route_status (str): 'DIRECT_PATH', 'TIME_BUFFER', or 'QUARANTINE'
-            current_sim (float): Measured Cosine Similarity
-            tau_sim (float): Dynamic threshold calculated for this client
         """
         global_state = self.global_model.state_dict()
         
-        # Initialize client registries if first interaction
         if client_id not in self.trust_scores:
             self.trust_scores[client_id] = 1.0
             self.quarantine_buffer[client_id] = []
@@ -94,14 +117,11 @@ class SecurityBuffer:
         current_sim = self.calculate_cosine_similarity(local_model_state, global_state)
 
         # -------------------------------------------------------------
-        # STEP 2: Workload-Aware Threshold Scaling
+        # STEP 2: Workload-Aware Similarity Threshold Scaling
         # Dynamic Formula: tau_k = tau_0 / sqrt(n_k / n_avg)
-        # Larger datasets naturally shift weights more, lowering the required similarity bound.
         # -------------------------------------------------------------
         r_k = dataset_size / n_avg if n_avg > 0 else 1.0
         tau_sim = self.base_similarity_threshold / (r_k ** 0.5)
-        
-        # Keep threshold within realistic boundary limits [0.60, 0.95]
         tau_sim = max(0.60, min(0.95, tau_sim))
 
         # -------------------------------------------------------------
@@ -110,11 +130,9 @@ class SecurityBuffer:
         is_excessive_drift = current_sim < tau_sim
 
         if is_excessive_drift:
-            # Penalize trust score and store in Quarantine Buffer
             self.trust_scores[client_id] = max(0.0, self.trust_scores[client_id] - self.trust_penalty)
-            
-            # Store copy in quarantine pool
             self.quarantine_buffer[client_id].append(copy.deepcopy(local_model_state))
+            
             if len(self.quarantine_buffer[client_id]) > self.window_size:
                 self.quarantine_buffer[client_id].pop(0)
 
@@ -125,25 +143,24 @@ class SecurityBuffer:
             )
             return "QUARANTINE", current_sim, tau_sim
 
-        # Update trust score for clean update
+        # Reward clean client
         self.trust_scores[client_id] = min(1.0, self.trust_scores[client_id] + self.trust_reward)
         self.similarity_history[client_id].append(current_sim)
 
         # -------------------------------------------------------------
         # STEP 4: PHASE 2 — Synchronization Gate (Latency Routing)
-        # Clean updates bypass Quarantine completely!
         # -------------------------------------------------------------
         if arrival_time <= self.latency_threshold:
             logging.info(
                 f"[Security Gate] Client {client_id} CLEAN & FAST "
-                f"(Sim: {current_sim:.4f} >= Tau: {tau_sim:.4f}, Delay: {arrival_time:.1f}s) "
+                f"(Sim: {current_sim:.4f} >= Tau: {tau_sim:.4f}, Delay: {arrival_time:.1f}s <= Threshold: {self.latency_threshold:.1f}s) "
                 f"-> Routed to DIRECT PATH."
             )
             return "DIRECT_PATH", current_sim, tau_sim
         else:
             logging.info(
                 f"[Security Gate] Client {client_id} CLEAN but SLOW "
-                f"(Sim: {current_sim:.4f} >= Tau: {tau_sim:.4f}, Delay: {arrival_time:.1f}s) "
+                f"(Sim: {current_sim:.4f} >= Tau: {tau_sim:.4f}, Delay: {arrival_time:.1f}s > Threshold: {self.latency_threshold:.1f}s) "
                 f"-> Routed to TIME BUFFER."
             )
             return "TIME_BUFFER", current_sim, tau_sim
@@ -151,7 +168,6 @@ class SecurityBuffer:
     def process_quarantine_validation(self, evaluator_fn, validation_loader):
         """
         Runs server-side SAE reconstruction validation on quarantined updates.
-        Clears malicious updates and returns verified updates for aggregation.
         """
         released_updates = []
         clients_to_clear = []
@@ -161,11 +177,8 @@ class SecurityBuffer:
                 continue
             
             latest_update = updates[-1]
-            
-            # Run server-side reconstruction validation score
             mse_score = evaluator_fn(latest_update, validation_loader)
             
-            # If MSE error is within reasonable reconstruction limits (e.g., < 0.05)
             if mse_score <= 0.05 and self.trust_scores[client_id] >= 0.4:
                 logging.info(f"[Quarantine Verification] Client {client_id} passed MSE check ({mse_score:.4f}). Releasing.")
                 released_updates.append(latest_update)
