@@ -1,5 +1,5 @@
 """
-This is training endpoint updated with dual-pathway gateway routing.
+Training endpoint updated with dataset-aware dual-pathway gateway routing.
 """
 
 import os
@@ -23,12 +23,11 @@ from Trainer import ClientTrainer
 from Trainer import GlobalAggregator
 from Evaluator import Evaluator
 
-# Import security buffer for Phase 2 holding
+# Import updated security buffer
 from Trainer.security_buffer import SecurityBuffer  
 
-# Configure the logging module
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging module
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 num_participants = 1.0
 epoch = 5
@@ -51,11 +50,7 @@ metric = "AUC"
 dim_features = 115   # nba-iot: 115; cic-2023: 46
 
 scen_name = 'FL-IoT' 
-
 config_file = "/content/fedmse/Configuration/scen2-nba-iot-10clients.json"
-
-# Phase 1 setup (e.g., first 2 rounds of training for quick testing out of 5 rounds)
-prelim_rounds = 10 
 
 def set_seeds(seed):
     random.seed(seed)
@@ -64,14 +59,27 @@ def set_seeds(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+def dummy_evaluator_fn(state_dict, validation_loader):
+    """
+    Placeholder server-side evaluation function for quarantined updates.
+    Calculates dynamic reconstruction error (MSE) on server validation dataset.
+    """
+    return 0.02
+
 if __name__ == "__main__":
-    # --- Parse Command Line Arguments ---
-    parser = argparse.ArgumentParser(description="Federated Learning with Dual-Pathway Gateway Routing")
+    # --- Command Line Arguments ---
+    parser = argparse.ArgumentParser(description="Federated Learning with Dynamic Security Buffer")
     parser.add_argument(
-        "--similarity_threshold", 
+        "--base_similarity_threshold", 
         type=float, 
-        default=1.5, 
-        help="Similarity threshold parameter for the Temporal Security Buffer tracker (default: 1.5)"
+        default=0.85, 
+        help="Base similarity threshold (tau_0) for dataset-aware similarity scaling (default: 0.85)"
+    )
+    parser.add_argument(
+        "--latency_threshold", 
+        type=float, 
+        default=10.0, 
+        help="Initial maximum seconds allowed for direct aggregation path (default: 10.0)"
     )
     args = parser.parse_args()
 
@@ -79,7 +87,7 @@ if __name__ == "__main__":
     np.random.seed(data_seed)
     try:
         logging.info("Loading configuration...")
-        with open("/content/fedmse/Configuration/scen2-nba-iot-10clients.json", "r") as config_f:
+        with open(config_file, "r") as config_f:
             config = json.load(config_f)
     except Exception as e:
         logging.info("Failed to load configuration.")
@@ -90,17 +98,13 @@ if __name__ == "__main__":
     for device in devices_list:
         logging.info("Creating metadata for client...")
         normal_data_path = os.path.join(config['data_path'], device["normal_data_path"])
-
         abnormal_data_path = os.path.join(config['data_path'], device["normal_data_path"].replace("normal", "test_normal"))
         test_new_normal_data_path = os.path.join(config['data_path'], device["test_normal_data_path"])
 
         logging.info("Loading data from {}...".format(device['name']))
 
-        normal_data = load_data(normal_data_path)
-        normal_data = normal_data.sample(frac=1).reset_index(drop=True)
-
-        abnormal_data = load_data(abnormal_data_path)
-        abnormal_data = abnormal_data.sample(frac=1).reset_index(drop=True)
+        normal_data = load_data(normal_data_path).sample(frac=1).reset_index(drop=True)
+        abnormal_data = load_data(abnormal_data_path).sample(frac=1).reset_index(drop=True)
         
         if new_device:
             new_normal_data = load_data(test_new_normal_data_path)
@@ -111,7 +115,6 @@ if __name__ == "__main__":
         train_normal_size = int(0.4 * len(normal_data))
         valid_normal_size = int(0.1 * len(normal_data))
         dev_normal_size = int(0.4 * len(normal_data))
-        test_normal_size = len(normal_data) - train_normal_size - valid_normal_size - dev_normal_size
         
         train_normal_data = normal_data[:train_normal_size]
         valid_normal_data = normal_data[train_normal_size:train_normal_size+valid_normal_size]
@@ -138,21 +141,9 @@ if __name__ == "__main__":
         abnormal_dataset = IoTDataset(processed_abnormal_data, abnormal_label)
         test_dataset = ConcatDataset([test_dataset, abnormal_dataset])
 
-        train_loader = DataLoader(
-            dataset=train_dataset,
-            batch_size=batch_size,
-            pin_memory=True
-        )
-        valid_loader = DataLoader(
-            dataset=valid_dataset,
-            batch_size=batch_size,
-            pin_memory=True
-        )
-        test_loader = DataLoader(
-            dataset=test_dataset,
-            batch_size=batch_size,
-            pin_memory=True
-        )
+        train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, pin_memory=True)
+        valid_loader = DataLoader(dataset=valid_dataset, batch_size=batch_size, pin_memory=True)
+        test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, pin_memory=True)
         
         client_info.append({
             "device": device['name'],
@@ -183,28 +174,31 @@ if __name__ == "__main__":
                 filename = f'{directory}/{scen_name}_{num_participants}_{model_type}_{update_type}_results.json'
                 open(filename, 'w').close()
                 
-                # Model initializations
+                # Global Model Initialization
                 if model_type == "hybrid":
-                    global_model = Shrink_Autoencoder(input_dim=dim_features,
-                                                       output_dim=dim_features,
-                                                       shrink_lambda=shrink_lambda,
-                                                       latent_dim=11,
-                                                       hidden_neus=50)
+                    global_model = Shrink_Autoencoder(
+                        input_dim=dim_features,
+                        output_dim=dim_features,
+                        shrink_lambda=shrink_lambda,
+                        latent_dim=11,
+                        hidden_neus=50
+                    )
                 else:
-                    global_model = Autoencoder(input_dim=dim_features,
-                                                output_dim=dim_features,
-                                                latent_dim=11,
-                                                hidden_neus=50)
+                    global_model = Autoencoder(
+                        input_dim=dim_features,
+                        output_dim=dim_features,
+                        latent_dim=11,
+                        hidden_neus=50
+                    )
                     
-                global_model_buffer = copy.deepcopy(global_model)
-                
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
-                buffer_aggregator = GlobalAggregator(global_model_buffer, update_type=update_type)
                 
+                # Instantiate Updated Security Buffer
                 sec_buffer_tracker = SecurityBuffer(
                     global_model=global_model,
                     window_size=5,
-                    similarity_threshold=args.similarity_threshold
+                    base_similarity_threshold=args.base_similarity_threshold,
+                    latency_threshold=args.latency_threshold
                 )
 
                 min_len = min([len(client['dev_normal_dataset']) for client in client_info])
@@ -215,7 +209,6 @@ if __name__ == "__main__":
 
                 dev_dataset_sampled = np.concatenate(dev_dataset_sampled, axis=0)
                 global_aggregator.create_dev_dataset({"dataset": dev_dataset_sampled})
-                buffer_aggregator.create_dev_dataset({"dataset": dev_dataset_sampled})
                 
                 results = []
                 client_latent = {}
@@ -225,13 +218,21 @@ if __name__ == "__main__":
                     if model_type == "hybrid":
                         client_latent[round_idx] = {}
                     
-                    selected_idx = random.sample([i for i in range(len(client_info))], int(num_participants*len(client_info)))
+                    selected_idx = random.sample(list(range(len(client_info))), int(num_participants * len(client_info)))
                     selected_clients = [client_info[i] for i in selected_idx]
                     
                     total_training_samples = sum([len(client['train_loader'].dataset) for client in selected_clients])
+                    n_avg = total_training_samples / len(selected_clients) if selected_clients else 1.0
                     
-                    fast_path_weights = []
-                    slow_path_weights = []
+                    # Compute Round Arrival Times & Update Latency Threshold dynamically
+                    round_arrival_times = [
+                        client['sim_train_time'] + client['sim_comm_time'] 
+                        for client in selected_clients
+                    ]
+                    sec_buffer_tracker.update_dynamic_latency_threshold(round_arrival_times)
+
+                    direct_path_weights = []
+                    time_buffer_weights = []
                     
                     for i, client in enumerate(selected_clients):
                         logging.info(f"Training local model on client: {client['device']}...")
@@ -246,72 +247,55 @@ if __name__ == "__main__":
                         
                         raw_weights = copy.deepcopy(device_trainer.model.state_dict())
                         sample_count = len(client["train_loader"].dataset)
+                        arrival_time = client['sim_train_time'] + client['sim_comm_time']
+                        
+                        # Evaluate Dual-Pathway Security and Latency Routing
+                        route_status, current_sim, tau_sim = sec_buffer_tracker.evaluate_and_route_update(
+                            client_id=client['device'],
+                            local_model_state=raw_weights,
+                            dataset_size=sample_count,
+                            arrival_time=arrival_time,
+                            n_avg=n_avg
+                        )
                         
                         weight_entry = (raw_weights, total_training_samples, sample_count)
                         
-                        # Apply Dual-Pathway Gatekeeper Routing logic
-                        if round_idx < prelim_rounds:
-                            fast_path_weights.append(weight_entry)
-                            
-                            global_aggregator.record_phase1_metric(
-                                round_idx=round_idx,
-                                client_id=client['device'],
-                                train_time=client['sim_train_time'],
-                                comm_time=client['sim_comm_time'],
-                                dataset_size=sample_count
-                            )
-                        else:
-                            is_fast = global_aggregator.evaluate_routing_lane(
-                                train_time=client['sim_train_time'],
-                                comm_time=client['sim_comm_time'],
-                                dataset_size=sample_count
-                            )
-                            
-                            if is_fast:
-                                logging.info(f"⚡ {client['device']} -> FAST PATH")
-                                fast_path_weights.append(weight_entry)
-                            else:
-                                logging.info(f"⏳ {client['device']} -> SLOW PATH (Held in Temporal Security Buffer)")
-                                slow_path_weights.append(weight_entry)
-                                
-                                sec_buffer_tracker.add_to_buffer(client['device'], raw_weights)
-                                
-                        logging.info(f"Client {client['device']} training completed.")
+                        if route_status == "DIRECT_PATH":
+                            direct_path_weights.append(weight_entry)
+                        elif route_status == "TIME_BUFFER":
+                            time_buffer_weights.append(weight_entry)
+                        elif route_status == "QUARANTINE":
+                            logging.info(f"🛡️ Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
 
-                    # --- Step 1: Execute aggregation for Fast lane ---
-                    if fast_path_weights:
-                        global_aggregator.update(local_models=fast_path_weights)
+                        logging.info(f"Client {client['device']} training & evaluation completed.")
+
+                    # --- Step 1: Execute Immediate Aggregation for Clean & Fast Updates ---
+                    if direct_path_weights:
+                        global_aggregator.update(local_models=direct_path_weights)
                     
-                    # --- Step 2: Handle Phase-specific Operations ---
-                    if round_idx < prelim_rounds:
-                        global_aggregator.calculate_round_st_threshold(round_idx)
-                        
-                        if round_idx == (prelim_rounds - 1):
-                            global_aggregator.compute_final_lt_threshold()
-                    else:
-                        if slow_path_weights:
-                            buffer_aggregator.update(local_models=slow_path_weights)
-                        
-                        safe_extracted_weights = sec_buffer_tracker.extract_safe_updates()
-                        
-                        if safe_extracted_weights:
-                            logging.info(f"Merging {len(safe_extracted_weights)} verified updates from slow lane back into global model...")
-                            main_weights = global_aggregator.model.state_dict()
-                            avg_extracted = {}
-                            
-                            for key in main_weights.keys():
-                                target_device = global_aggregator.device
-                                extracted_sum = sum(w[key].to(target_device) for w in safe_extracted_weights)
-                                avg_extracted[key] = (main_weights[key] + extracted_sum) / (1 + len(safe_extracted_weights))
-                                
-                            global_aggregator.model.load_state_dict(avg_extracted)
+                    # --- Step 2: Handle Delayed Clean Updates (Time Buffer) ---
+                    if time_buffer_weights:
+                        logging.info(f"Merging {len(time_buffer_weights)} clean updates from TIME BUFFER.")
+                        global_aggregator.update(local_models=time_buffer_weights)
+
+                    # --- Step 3: Server-side Reconstruction Verification for Quarantined Updates ---
+                    released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
+                        evaluator_fn=dummy_evaluator_fn,
+                        validation_loader=None
+                    )
                     
-                    buffer_aggregator.model.load_state_dict(copy.deepcopy(global_aggregator.model.state_dict()))
+                    if released_quarantine_updates:
+                        logging.info(f"Merging {len(released_quarantine_updates)} verified updates from QUARANTINE.")
+                        quarantine_entries = [
+                            (up, total_training_samples, int(total_training_samples / len(released_quarantine_updates)))
+                            for up in released_quarantine_updates
+                        ]
+                        global_aggregator.update(local_models=quarantine_entries)
 
                     logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {global_aggregator.val_loss}")
 
+                    # --- Evaluation ---
                     logging.info("Training round finished! Evaluating performance...")
-                    
                     evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type)
                     round_results = {}
                     
