@@ -265,7 +265,7 @@ if __name__ == "__main__":
                         elif route_status == "TIME_BUFFER":
                             time_buffer_weights.append(weight_entry)
                         elif route_status == "QUARANTINE":
-                            logging.info(f"🛡️ Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
+                            logging.info(f" Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
 
                         logging.info(f"Client {client['device']} training & evaluation completed.")
 
