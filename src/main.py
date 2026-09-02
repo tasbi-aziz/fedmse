@@ -19,7 +19,7 @@ from DataLoader import load_data, IoTDataset, IoTDataProccessor
 from Trainer import ClientTrainer, GlobalAggregator
 from Evaluator import Evaluator
 
-# Import updated security buffer
+# Import security buffer
 from Trainer.security_buffer import SecurityBuffer
 
 # Configure logging module
@@ -185,23 +185,23 @@ if __name__ == "__main__":
                 open(filename, 'w').close()
 
                 # Global Model Initialization
-               if model_type == "hybrid":
-                  global_model = Shrink_Autoencoder(
-                     input_dim=dim_features,
-                     shrink_lambda=shrink_lambda,
-                     latent_dim=11,
-                     hidden_neus=50
-                   )
-               else:
-                   global_model = Autoencoder(
-                       input_dim=dim_features,
-                       latent_dim=11,
-                       hidden_neus=50
-                   )
+                if model_type == "hybrid":
+                    global_model = Shrink_Autoencoder(
+                        input_dim=dim_features,
+                        shrink_lambda=shrink_lambda,
+                        latent_dim=11,
+                        hidden_neus=50
+                    )
+                else:
+                    global_model = Autoencoder(
+                        input_dim=dim_features,
+                        latent_dim=11,
+                        hidden_neus=50
+                    )
 
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
 
-                # Instantiate Updated Security Buffer
+                # Instantiate Security Buffer
                 sec_buffer_tracker = SecurityBuffer(
                     global_model=global_model,
                     window_size=5,
@@ -280,16 +280,16 @@ if __name__ == "__main__":
 
                         logging.info(f"Client {client['device']} training & evaluation completed.")
 
-                    # --- Step 1: Execute Immediate Aggregation for Clean & Fast Updates ---
+                    # Step 1: Immediate Aggregation
                     if direct_path_weights:
                         global_aggregator.update(local_models=direct_path_weights)
 
-                    # --- Step 2: Handle Delayed Clean Updates (Time Buffer) ---
+                    # Step 2: Time Buffer Aggregation
                     if time_buffer_weights:
                         logging.info(f"Merging {len(time_buffer_weights)} clean updates from TIME BUFFER.")
                         global_aggregator.update(local_models=time_buffer_weights)
 
-                    # --- Step 3: Server-side Verification for Quarantined Updates ---
+                    # Step 3: Quarantine Verification
                     released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
                         evaluator_fn=dummy_evaluator_fn,
                         validation_loader=None
@@ -305,7 +305,7 @@ if __name__ == "__main__":
 
                     logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {global_aggregator.val_loss}")
 
-                    # --- Evaluation ---
+                    # Evaluation
                     logging.info("Training round finished! Evaluating performance...")
                     evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type)
                     round_results = {}
@@ -327,7 +327,7 @@ if __name__ == "__main__":
                     with open(filename, 'a') as f:
                         f.write(json.dumps(round_results) + '\n')
 
-                    # --- Early Stopping Check ---
+                    # Early Stopping Check
                     if global_aggregator.val_loss < min_val_loss:
                         min_val_loss = global_aggregator.val_loss
                         global_worse = 0
