@@ -5,12 +5,12 @@ import pickle
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader as PyTorchDataLoader, TensorDataset
 
-# Updated Import
+# Updated Import to match your project files
+from dataloader import DataLoader as CustomDataLoader
 from Shrink_Autoencoder import Shrink_Autoencoder
 from client_trainer import ClientTrainer
-from data_processor import DataProcessor
 from global_aggregator import GlobalAggregator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
