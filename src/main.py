@@ -14,10 +14,13 @@ import random
 import logging
 
 from torch.utils.data import DataLoader, random_split, ConcatDataset
-from Model import Shrink_Autoencoder, Autoencoder
 from DataLoader import load_data, IoTDataset, IoTDataProccessor
 from Trainer import ClientTrainer, GlobalAggregator
 from Evaluator import Evaluator
+
+# Import your Shrink_Autoencoder definition directly
+# (Assuming it is saved in a local file or imported accordingly)
+from Model import Shrink_Autoencoder, Autoencoder
 
 # Import security buffer
 from Trainer.security_buffer import SecurityBuffer
@@ -30,13 +33,14 @@ num_participants = 1.0
 epoch = 5
 num_rounds = 12
 lr_rate = 1e-3
-shrink_lambda = 5
+shrink_dim = 11      # Maps to latent bottleneck dimension
+threshold_val = 0.2  # Threshold for shrinkage_operator
 network_size = 10
 data_seed = 1234
 
 no_Exp = (
     f"IID-Update_Exp6_scale_{epoch}epoch_{network_size}client_{num_rounds}rounds_"
-    f"lr{lr_rate}_lamda{shrink_lambda}_ratio{num_participants*100}_dataseed{data_seed}"
+    f"lr{lr_rate}_ratio{num_participants*100}_dataseed{data_seed}"
 )
 
 num_runs = 5
@@ -184,19 +188,17 @@ if __name__ == "__main__":
                 filename = f'{directory}/{scen_name}_{num_participants}_{model_type}_{update_type}_results.json'
                 open(filename, 'w').close()
 
-                # Global Model Initialization
+                # Model Initialization matching your class parameters precisely
                 if model_type == "hybrid":
                     global_model = Shrink_Autoencoder(
                         input_dim=dim_features,
-                        shrink_lambda=shrink_lambda,
-                        latent_dim=11,
-                        hidden_neus=50
+                        shrink_dim=shrink_dim,
+                        threshold=threshold_val
                     )
                 else:
                     global_model = Autoencoder(
                         input_dim=dim_features,
-                        latent_dim=11,
-                        hidden_neus=50
+                        latent_dim=shrink_dim
                     )
 
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
@@ -235,7 +237,6 @@ if __name__ == "__main__":
                     total_training_samples = sum([len(client['train_loader'].dataset) for client in selected_clients])
                     n_avg = total_training_samples / len(selected_clients) if selected_clients else 1.0
 
-                    # Compute Round Arrival Times & Update Latency Threshold dynamically
                     round_arrival_times = [
                         client['sim_train_time'] + client['sim_comm_time']
                         for client in selected_clients
@@ -260,7 +261,6 @@ if __name__ == "__main__":
                         sample_count = len(client["train_loader"].dataset)
                         arrival_time = client['sim_train_time'] + client['sim_comm_time']
 
-                        # Evaluate Dual-Pathway Security and Latency Routing
                         route_status, current_sim, tau_sim = sec_buffer_tracker.evaluate_and_route_update(
                             client_id=client['device'],
                             local_model_state=raw_weights,
@@ -280,16 +280,13 @@ if __name__ == "__main__":
 
                         logging.info(f"Client {client['device']} training & evaluation completed.")
 
-                    # Step 1: Immediate Aggregation
                     if direct_path_weights:
                         global_aggregator.update(local_models=direct_path_weights)
 
-                    # Step 2: Time Buffer Aggregation
                     if time_buffer_weights:
                         logging.info(f"Merging {len(time_buffer_weights)} clean updates from TIME BUFFER.")
                         global_aggregator.update(local_models=time_buffer_weights)
 
-                    # Step 3: Quarantine Verification
                     released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
                         evaluator_fn=dummy_evaluator_fn,
                         validation_loader=None
@@ -305,7 +302,6 @@ if __name__ == "__main__":
 
                     logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {global_aggregator.val_loss}")
 
-                    # Evaluation
                     logging.info("Training round finished! Evaluating performance...")
                     evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type)
                     round_results = {}
@@ -327,7 +323,6 @@ if __name__ == "__main__":
                     with open(filename, 'a') as f:
                         f.write(json.dumps(round_results) + '\n')
 
-                    # Early Stopping Check
                     if global_aggregator.val_loss < min_val_loss:
                         min_val_loss = global_aggregator.val_loss
                         global_worse = 0
