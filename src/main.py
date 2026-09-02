@@ -9,9 +9,9 @@ from torch.utils.data import DataLoader
 
 # Correct Imports matching dataloader.py
 from DataLoader.dataloader import load_data, IoTDataProccessor, IoTDataset
-from Shrink_Autoencoder import Shrink_Autoencoder
-from client_trainer import ClientTrainer
-from global_aggregator import GlobalAggregator
+from Model.Shrink_Autoencoder import Shrink_Autoencoder
+from Trainer.client_trainer import ClientTrainer
+from Trainer.global_aggregator import GlobalAggregator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
