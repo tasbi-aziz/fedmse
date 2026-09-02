@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import logging
 import pickle
@@ -6,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Correct Imports matching dataloader.py
 from DataLoader.dataloader import load_data, IoTDataProccessor, IoTDataset
@@ -18,8 +20,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Federated Learning Shrink Autoencoder Training")
-    parser.add_argument("--base_data_path", type=str, required=True, help="Base path to client folders")
-    parser.add_argument("--dev_data_path", type=str, required=True, help="Path to dev evaluation CSV folder")
+    
+    # Restored hardcoded defaults for seamless direct execution
+    parser.add_argument(
+        "--base_data_path", 
+        type=str, 
+        default="/content/fedmse/Data/noniid-10-Client_Data", 
+        help="Base path to client folders"
+    )
+    parser.add_argument(
+        "--dev_data_path", 
+        type=str, 
+        default="/content/fedmse/Data/dev", 
+        help="Path to dev evaluation CSV folder"
+    )
+    
     parser.add_argument("--num_clients", type=int, default=5, help="Number of federated clients")
     parser.add_argument("--num_rounds", type=int, default=20, help="Number of FL communication rounds")
     parser.add_argument("--local_epochs", type=int, default=5, help="Local training epochs per client")
@@ -34,6 +49,7 @@ def parse_args():
     parser.add_argument("--fedprox_mu", type=float, default=0.01, help="Mu parameter for FedProx")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save models")
+    
     return parser.parse_args()
 
 
@@ -41,7 +57,7 @@ def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # 1. Initialize Processor and Global Model Setup
+    # 1. Initialize Processor
     data_processor = IoTDataProccessor(scaler="standard")
     
     # 2. Process Client Data
@@ -53,7 +69,7 @@ def main():
         client_folder = os.path.join(args.base_data_path, f"client_{i}")
         raw_df = load_data(client_folder)
         
-        # Fit scaler on first client or transform across clients
+        # Fit scaler on first client dataset, then transform subsequent client datasets
         if i == 1:
             scaled_data, labels = data_processor.fit_transform(raw_df)
             input_dim = scaled_data.shape[1]
@@ -84,7 +100,7 @@ def main():
         )
         clients.append(client)
 
-    # 3. Process Global Dev Data using fitted scaler
+    # 3. Process Global Dev Evaluation Data using fitted scaler
     logging.info("Loading global evaluation dev set...")
     dev_raw_df = load_data(args.dev_data_path)
     dev_scaled_data, dev_labels = data_processor.transform(dev_raw_df, type="normal")
@@ -107,6 +123,7 @@ def main():
         client_weights = []
         client_data_sizes = []
 
+        # Broadcast global weights to local clients
         global_params = global_aggregator.get_global_parameters()
 
         for client in clients:
@@ -115,12 +132,14 @@ def main():
             client_weights.append(client.get_parameters())
             client_data_sizes.append(len(client.train_loader.dataset))
 
+        # Aggregate parameters on global server
         global_aggregator.aggregate(client_weights, client_data_sizes)
 
+        # Evaluate performance on dev evaluation set
         dev_loss = global_aggregator.evaluate()
         logging.info(f"Round {round_num} Global Dev Loss: {dev_loss:.6f}")
 
-    # Save final model
+    # Save final aggregated global model
     global_save_path = os.path.join(args.save_dir, "global_shrink_autoencoder.pt")
     torch.save(global_model.state_dict(), global_save_path)
     logging.info(f"Training Complete. Saved global model to {global_save_path}")
