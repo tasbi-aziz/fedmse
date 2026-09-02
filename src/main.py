@@ -185,21 +185,19 @@ if __name__ == "__main__":
                 open(filename, 'w').close()
 
                 # Global Model Initialization
-                if model_type == "hybrid":
-                    global_model = Shrink_Autoencoder(
-                        input_dim=dim_features,
-                        output_dim=dim_features,
-                        shrink_lambda=shrink_lambda,
-                        latent_dim=11,
-                        hidden_neus=50
-                    )
-                else:
-                    global_model = Autoencoder(
-                        input_dim=dim_features,
-                        output_dim=dim_features,
-                        latent_dim=11,
-                        hidden_neus=50
-                    )
+               if model_type == "hybrid":
+                  global_model = Shrink_Autoencoder(
+                     input_dim=dim_features,
+                     shrink_lambda=shrink_lambda,
+                     latent_dim=11,
+                     hidden_neus=50
+                   )
+               else:
+                   global_model = Autoencoder(
+                       input_dim=dim_features,
+                       latent_dim=11,
+                       hidden_neus=50
+                   )
 
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
 
