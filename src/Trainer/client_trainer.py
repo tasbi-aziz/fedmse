@@ -48,7 +48,7 @@ class ClientTrainer:
         """Returns local model state dict."""
         return self.model.state_dict()
 
-    def train((self) -> float:
+    def train(self) -> float:
         """Executes local training loop over configured epochs."""
         self.model.train()
         running_loss = 0.0
