@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 # Correct Imports matching dataloader.py
-from dataloader import load_data, IoTDataProccessor, IoTDataset
+from DataLoader.dataloader import load_data, IoTDataProccessor, IoTDataset
 from Shrink_Autoencoder import Shrink_Autoencoder
 from client_trainer import ClientTrainer
 from global_aggregator import GlobalAggregator
