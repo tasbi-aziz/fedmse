@@ -21,7 +21,7 @@ logging.basicConfig(
 
 class Encoder(nn.Module):
     """
-    Encoder module for AutoEncoder network.
+    A class that represents an encoder module for an AutoEncoder network.
     """
     def __init__(self, input_dim=115, hidden_neus=27, latent_dim=7):
         super(Encoder, self).__init__()
@@ -46,7 +46,7 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Decoder module for AutoEncoder network.
+    A decoder module that takes a latent vector as input and produces an output vector.
     """
     def __init__(self, latent_dim=7, hidden_neus=27, output_dim=115):
         super(Decoder, self).__init__()
@@ -84,13 +84,23 @@ class Autoencoder(nn.Module):
         return chain(self.encoder.parameters(recurse=recurse), self.decoder.parameters(recurse=recurse))
 
     def recon_loss(self, input, output):
-        return F.mse_loss(input, output, reduction='mean')
+        return F.mse_loss(output, input, reduction='mean')
     
     def forward(self, input):
+        """
+        Forward pass returning single reconstruction tensor for self.criterion compatibility.
+        """
         latent = self.encoder(input)
         output = self.decoder(latent)
-        loss = self.recon_loss(input, output)
-        return latent, output, loss
+        return output
+
+    def encode(self, input):
+        """Helper to retrieve latent embeddings directly."""
+        return self.encoder(input)
+
+    def decode(self, latent):
+        """Helper to reconstruct features from latent embeddings."""
+        return self.decoder(latent)
 
     def _to_numpy(self, tensor):
         return tensor.data.cpu().numpy()
