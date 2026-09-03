@@ -62,6 +62,12 @@ class ClientTrainer:
         """Returns local model state dict."""
         return self.model.state_dict()
 
+    def _get_reconstruction(self, output_obj):
+        """Helper to extract reconstruction tensor if model output is a tuple."""
+        if isinstance(output_obj, (tuple, list)):
+            return output_obj[1]  # Extract output from (latent, output, loss)
+        return output_obj
+
     def train(self, train_loader: DataLoader = None) -> float:
         """Executes local training loop over configured epochs."""
         loader = train_loader if train_loader is not None else self.train_loader
@@ -77,7 +83,9 @@ class ClientTrainer:
                 data = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else batch.to(self.device)
 
                 self.optimizer.zero_grad()
-                reconstruction = self.model(data)
+                output_obj = self.model(data)
+                reconstruction = self._get_reconstruction(output_obj)
+                
                 reconstruction_loss = self.criterion(reconstruction, data)
 
                 total_loss = reconstruction_loss
@@ -112,7 +120,9 @@ class ClientTrainer:
         with torch.no_grad():
             for batch in valid_loader:
                 data = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else batch.to(self.device)
-                reconstruction = self.model(data)
+                output_obj = self.model(data)
+                reconstruction = self._get_reconstruction(output_obj)
+                
                 loss = self.criterion(reconstruction, data)
                 running_loss += loss.item()
                 total_batches += 1
