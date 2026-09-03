@@ -321,7 +321,9 @@ if __name__ == "__main__":
                     logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {global_aggregator.val_loss}")
 
                     logging.info("Training round finished! Evaluating performance...")
-                    evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type)
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    global_aggregator.model.to(device) # Ensure aggregator model is on GPU
+                    evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type, device=device)
                     round_results = {}
 
                     for i, client in enumerate(client_info):
