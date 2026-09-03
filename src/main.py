@@ -135,19 +135,21 @@ if __name__ == "__main__":
         processed_test_data, test_label = data_processor.transform(test_normal_data)
         processed_abnormal_data, abnormal_label = data_processor.transform(abnormal_data, type="abnormal")
 
+        # Fix 1: Properly construct base test dataset without overwriting
         if new_device:
             processed_new_normal_data, new_normal_label = data_processor.transform(new_normal_data)
             processed_test_data = np.concatenate([processed_test_data, processed_new_normal_data], axis=0)
             processed_test_label = np.concatenate([test_label, new_normal_label], axis=0)
-            test_dataset = IoTDataset(processed_test_data, processed_test_label)
+            base_test_dataset = IoTDataset(processed_test_data, processed_test_label)
         else:
-            test_dataset = IoTDataset(processed_test_data, test_label)
+            base_test_dataset = IoTDataset(processed_test_data, test_label)
 
         train_dataset = IoTDataset(processed_train_data, train_label)
         valid_dataset = IoTDataset(processed_valid_data, valid_label)
-
         abnormal_dataset = IoTDataset(processed_abnormal_data, abnormal_label)
-        test_dataset = ConcatDataset([test_dataset, abnormal_dataset])
+
+        # Concatenate base test set with abnormal set
+        test_dataset = ConcatDataset([base_test_dataset, abnormal_dataset])
 
         train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, pin_memory=True)
         valid_loader = DataLoader(dataset=valid_dataset, batch_size=batch_size, pin_memory=True)
@@ -161,6 +163,7 @@ if __name__ == "__main__":
             "test_loader": test_loader,
             "test_dataset": (processed_test_data, test_label),
             "dev_normal_dataset": dev_normal_data,
+            "data_processor": data_processor,
             "sim_train_time": device.get("simulated_training_time", 1.5),
             "sim_comm_time": device.get("simulated_comm_time", 0.5)
         })
@@ -200,7 +203,7 @@ if __name__ == "__main__":
                         latent_dim=shrink_dim
                     )
 
-                # Initialize aggregator with the explicit update_type
+                # Initialize aggregator with explicit update_type
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
 
                 # Instantiate Security Buffer
@@ -211,14 +214,16 @@ if __name__ == "__main__":
                     latency_threshold=args.latency_threshold
                 )
 
+                # Fix 2: Concatenate dev DataFrames and transform using client processor
                 min_len = min([len(client['dev_normal_dataset']) for client in client_info])
-                dev_dataset_sampled = []
+                dev_dataset_sampled_list = []
                 for client in client_info:
-                    sample_data = client['dev_normal_dataset'].sample(n=min_len)
-                    dev_dataset_sampled.append(sample_data)
+                    sample_df = client['dev_normal_dataset'].sample(n=min_len)
+                    processed_sample, _ = client['data_processor'].transform(sample_df)
+                    dev_dataset_sampled_list.append(processed_sample)
 
-                dev_dataset_sampled = np.concatenate(dev_dataset_sampled, axis=0)
-                
+                dev_dataset_sampled = np.concatenate(dev_dataset_sampled_list, axis=0)
+
                 # Setup dev dataset if GlobalAggregator supports it
                 if hasattr(global_aggregator, "create_dev_dataset"):
                     global_aggregator.create_dev_dataset({"dataset": dev_dataset_sampled})
@@ -259,7 +264,7 @@ if __name__ == "__main__":
                             lr_rate=lr_rate,
                             update_type=update_type
                         )
-                        
+
                         # Train local client model
                         trainer_result = device_trainer.run(client["train_loader"], client["valid_loader"])
 
@@ -318,7 +323,12 @@ if __name__ == "__main__":
                             client_losses=None
                         )
 
-                    logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {global_aggregator.val_loss}")
+                    # Fix 3: Handle val_loss fallback if no models were aggregated
+                    current_global_loss = getattr(global_aggregator, "val_loss", None)
+                    if current_global_loss is None:
+                        current_global_loss = 0.0
+
+                    logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {current_global_loss}")
 
                     logging.info("Training round finished! Evaluating performance...")
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -336,15 +346,16 @@ if __name__ == "__main__":
 
                         round_results[client['device']] = auc_score
 
-                    round_results["global_loss"] = global_aggregator.val_loss
+                    round_results["global_loss"] = current_global_loss
                     round_results['join_clients'] = selected_idx
                     round_results = {f'round_{round_idx+1}': round_results}
 
                     with open(filename, 'a') as f:
                         f.write(json.dumps(round_results) + '\n')
 
-                    if global_aggregator.val_loss < min_val_loss:
-                        min_val_loss = global_aggregator.val_loss
+                    # Early stopping logic
+                    if current_global_loss < min_val_loss:
+                        min_val_loss = current_global_loss
                         global_worse = 0
                     else:
                         global_worse += 1
