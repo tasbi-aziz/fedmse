@@ -1,114 +1,65 @@
 import copy
-import logging
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+
 
 class GlobalAggregator:
-    def __init__(self, global_model: nn.Module, dev_loader: DataLoader = None, device: str = "cpu", eps: float = 1e-8):
-        self.global_model = global_model.to(device)
-        self.dev_loader = dev_loader
-        self.device = device
-        self.criterion = nn.MSELoss()
+    def __init__(self, model, update_type="avg"):
+        self.model = model
+        self.update_type = update_type
         self.val_loss = float("inf")
-        self.eps = eps
 
-    @property
-    def model(self):
-        return self.global_model
-
-    def get_global_parameters(self) -> dict:
-        return copy.deepcopy(self.global_model.state_dict())
-
-    def set_dev_loader(self, dev_loader: DataLoader):
-        self.dev_loader = dev_loader
-
-    def compute_client_mse(self, client_state_dict: dict, client_val_loader: DataLoader) -> float:
+    def aggregate(self, client_models, client_losses=None):
         """
-        Calculates MSE loss of a specific client's state_dict on its validation dataset.
+        Aggregates parameters from multiple client models into the global model.
+        
+        :param client_models: List of state_dict objects or model instances from clients.
+        :param client_losses: List of MSE validation/training losses corresponding to each client.
+                               Required when update_type is 'mse_avg'.
         """
-        temp_model = copy.deepcopy(self.global_model)
-        temp_model.load_state_dict(client_state_dict)
-        temp_model.eval()
-        temp_model.to(self.device)
+        if not client_models:
+            return self.model
 
-        total_loss = 0.0
-        total_batches = 0
+        # Ensure we are working with state_dict representations
+        client_states = [
+            m.state_dict() if hasattr(m, "state_dict") else m 
+            for m in client_models
+        ]
 
-        with torch.no_grad():
-            for batch in client_val_loader:
-                data = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else batch.to(self.device)
-                reconstruction = temp_model(data)
-                loss = self.criterion(reconstruction, data)
-                total_loss += loss.item()
-                total_batches += 1
+        global_dict = copy.deepcopy(client_states[0])
 
-        return total_loss / max(total_batches, 1)
+        if self.update_type == "mse_avg":
+            if client_losses is None or len(client_losses) != len(client_models):
+                raise ValueError("client_losses list is required and must match client_models length for 'mse_avg'.")
 
-    def aggregate_mse(self, client_weights: list, client_mses: list):
-        """
-        Executes MSE-weighted parameter aggregation (MSEAvg).
-        Lower MSE yields higher aggregation weight: weight_i = (1 / (mse_i + eps)) / sum(1 / (mse_k + eps))
-        """
-        inv_mses = [1.0 / (mse + self.eps) for mse in client_mses]
-        sum_inv_mses = sum(inv_mses)
-        weights_factor = [inv_m / sum_inv_mses for inv_m in inv_mses]
+            # Convert losses to inverse weights (lower MSE loss = higher weight)
+            # Add a small epsilon to avoid division by zero
+            epsilon = 1e-8
+            inv_losses = [1.0 / (loss + epsilon) for loss in client_losses]
+            total_inv_loss = sum(inv_losses)
+            weights = [w / total_inv_loss for w in inv_losses]
 
-        aggregated_dict = copy.deepcopy(client_weights[0])
+            # Weighted aggregation based on MSE performance
+            for key in global_dict.keys():
+                global_dict[key] = sum(
+                    client_states[i][key].float() * weights[i]
+                    for i in range(len(client_states))
+                )
 
-        for key in aggregated_dict.keys():
-            aggregated_dict[key] = torch.zeros_like(aggregated_dict[key], dtype=torch.float32)
+        elif self.update_type == "avg":
+            # Standard FedAvg (unweighted average across all clients)
+            num_clients = len(client_states)
+            for key in global_dict.keys():
+                global_dict[key] = sum(
+                    client_states[i][key].float() for i in range(num_clients)
+                ) / num_clients
 
-        for i in range(len(client_weights)):
-            factor = weights_factor[i]
-            for key in aggregated_dict.keys():
-                aggregated_dict[key] += client_weights[i][key].to(self.device) * factor
-
-        self.global_model.load_state_dict(aggregated_dict)
-
-    def update(self, local_models: list, client_val_loaders: list = None):
-        """
-        Extracts weights and computes MSE-based weights for aggregation.
-        Expects local_models entries as (state_dict, total_samples, sample_count).
-        """
-        if not local_models:
-            return
-
-        client_weights = [m[0] for m in local_models]
-
-        if client_val_loaders and len(client_val_loaders) == len(client_weights):
-            client_mses = [
-                self.compute_client_mse(w, loader) 
-                for w, loader in zip(client_weights, client_val_loaders)
-            ]
         else:
-            # Fallback: compute MSE for each model on global dev_loader if specific client loaders aren't passed
-            client_mses = [
-                self.compute_client_mse(w, self.dev_loader) 
-                for w in client_weights
-            ]
+            raise ValueError(f"Unsupported update_type: {self.update_type}")
 
-        self.aggregate_mse(client_weights, client_mses)
+        # Update global model parameters
+        if hasattr(self.model, "load_state_dict"):
+            self.model.load_state_dict(global_dict)
+        else:
+            self.model = global_dict
 
-        if self.dev_loader is not None:
-            self.val_loss = self.evaluate()
-
-    def evaluate(self) -> float:
-        if self.dev_loader is None:
-            logging.warning("dev_loader is not set. Skipping evaluation.")
-            return float("inf")
-
-        self.global_model.eval()
-        total_loss = 0.0
-        total_batches = 0
-
-        with torch.no_grad():
-            for batch in self.dev_loader:
-                data = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else batch.to(self.device)
-                reconstruction = self.global_model(data)
-                loss = self.criterion(reconstruction, data)
-                total_loss += loss.item()
-                total_batches += 1
-
-        self.val_loss = total_loss / max(total_batches, 1)
-        return self.val_loss
+        return self.model
