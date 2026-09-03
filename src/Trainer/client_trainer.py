@@ -11,22 +11,28 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 class ClientTrainer:
     def __init__(
         self,
-        client_id: int,
         model: nn.Module,
-        train_loader: DataLoader,
+        client_id: int = 0,
+        train_loader: DataLoader = None,
         epochs: int = 5,
+        epoch: int = None,            # Compatibility alias for epoch
         lr: float = 0.001,
+        lr_rate: float = None,        # Compatibility alias for lr_rate
         algorithm: str = "fedavg",
+        update_type: str = None,      # Compatibility alias for update_type
         fedprox_mu: float = 0.01,
         device: str = "cpu",
         save_dir: str = "./checkpoints"
     ):
         self.client_id = client_id
-        self.model = model.to(device)
+        self.model = copy.deepcopy(model).to(device)
         self.train_loader = train_loader
-        self.epochs = epochs
-        self.lr = lr
-        self.algorithm = algorithm.lower()
+        self.epochs = epoch if epoch is not None else epochs
+        self.lr = lr_rate if lr_rate is not None else lr
+        
+        algo_choice = update_type if update_type is not None else algorithm
+        self.algorithm = algo_choice.lower()
+        
         self.fedprox_mu = fedprox_mu
         self.device = device
         self.save_dir = save_dir
@@ -34,12 +40,20 @@ class ClientTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         self.criterion = nn.MSELoss()
         self.previous_global_model = None
+        
+        # Tracked loss metrics
+        self.train_loss = 0.0
+        self.val_loss = 0.0
+
+        if self.algorithm == "fedprox":
+            self.previous_global_model = copy.deepcopy(self.model)
+            for param in self.previous_global_model.parameters():
+                param.requires_grad = False
 
     def set_parameters(self, global_parameters: dict):
         """Loads global model weights into local model."""
         self.model.load_state_dict(global_parameters)
         if self.algorithm == "fedprox":
-            # Save reference copy of global parameters for proximal regularization
             self.previous_global_model = copy.deepcopy(self.model)
             for param in self.previous_global_model.parameters():
                 param.requires_grad = False
@@ -48,15 +62,18 @@ class ClientTrainer:
         """Returns local model state dict."""
         return self.model.state_dict()
 
-    def train(self) -> float:
+    def train(self, train_loader: DataLoader = None) -> float:
         """Executes local training loop over configured epochs."""
+        loader = train_loader if train_loader is not None else self.train_loader
+        if loader is None:
+            raise ValueError("No train_loader provided to ClientTrainer.")
+
         self.model.train()
         running_loss = 0.0
         total_batches = 0
 
-        for epoch in range(self.epochs):
-            for batch in self.train_loader:
-                # Handle single Tensor vs (X, y) batch shapes
+        for ep in range(self.epochs):
+            for batch in loader:
                 data = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else batch.to(self.device)
 
                 self.optimizer.zero_grad()
@@ -65,7 +82,7 @@ class ClientTrainer:
 
                 total_loss = reconstruction_loss
 
-                # FedProx Proximal Term Addition (Before backward pass)
+                # FedProx Proximal Term
                 if self.algorithm == "fedprox" and self.previous_global_model is not None:
                     prox_term = 0.0
                     for param, global_param in zip(self.model.parameters(), self.previous_global_model.parameters()):
@@ -79,8 +96,36 @@ class ClientTrainer:
                 running_loss += reconstruction_loss.item()
                 total_batches += 1
 
-        epoch_loss = running_loss / max(total_batches, 1)
-        return epoch_loss
+        self.train_loss = running_loss / max(total_batches, 1)
+        return self.train_loss
+
+    def evaluate(self, valid_loader: DataLoader) -> float:
+        """Evaluates local model on validation set."""
+        if valid_loader is None:
+            self.val_loss = self.train_loss
+            return self.val_loss
+
+        self.model.eval()
+        running_loss = 0.0
+        total_batches = 0
+
+        with torch.no_grad():
+            for batch in valid_loader:
+                data = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else batch.to(self.device)
+                reconstruction = self.model(data)
+                loss = self.criterion(reconstruction, data)
+                running_loss += loss.item()
+                total_batches += 1
+
+        self.val_loss = running_loss / max(total_batches, 1)
+        return self.val_loss
+
+    def run(self, train_loader: DataLoader, valid_loader: DataLoader = None) -> float:
+        """Pipeline runner: executes training, validation, and auto-saves model."""
+        self.train(train_loader)
+        val_loss = self.evaluate(valid_loader) if valid_loader is not None else self.train_loss
+        self.save_model()
+        return val_loss
 
     def save_model(self):
         """Saves local client model to disk safely."""
