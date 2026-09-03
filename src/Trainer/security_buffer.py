@@ -75,15 +75,19 @@ class SecurityBuffer:
         return self.latency_threshold
 
     def _flatten_state_dict(self, state_dict):
-        """Flattens PyTorch state_dict parameters into a 1D vector."""
+        """
+        Flattens PyTorch state_dict parameters into a 1D vector on CPU 
+        to guarantee uniform device placement during vector operations.
+        """
         tensors = []
         for key in sorted(state_dict.keys()):
             if isinstance(state_dict[key], torch.Tensor):
-                tensors.append(state_dict[key].float().flatten())
+                # Detach and force movement to CPU
+                tensors.append(state_dict[key].detach().cpu().float().flatten())
         return torch.cat(tensors)
 
     def calculate_cosine_similarity(self, local_state, global_state):
-        """Calculates cosine similarity between local weights and global weights."""
+        """Calculates cosine similarity between local weights and global weights on CPU."""
         vec_local = self._flatten_state_dict(local_state)
         vec_global = self._flatten_state_dict(global_state)
         
