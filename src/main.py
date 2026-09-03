@@ -19,7 +19,6 @@ from Trainer import ClientTrainer, GlobalAggregator
 from Evaluator import Evaluator
 
 # Import your Shrink_Autoencoder definition directly
-# (Assuming it is saved in a local file or imported accordingly)
 from Model import Shrink_Autoencoder, Autoencoder
 
 # Import security buffer
@@ -201,6 +200,7 @@ if __name__ == "__main__":
                         latent_dim=shrink_dim
                     )
 
+                # Initialize aggregator with the explicit update_type
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
 
                 # Instantiate Security Buffer
@@ -218,7 +218,10 @@ if __name__ == "__main__":
                     dev_dataset_sampled.append(sample_data)
 
                 dev_dataset_sampled = np.concatenate(dev_dataset_sampled, axis=0)
-                global_aggregator.create_dev_dataset({"dataset": dev_dataset_sampled})
+                
+                # Setup dev dataset if GlobalAggregator supports it
+                if hasattr(global_aggregator, "create_dev_dataset"):
+                    global_aggregator.create_dev_dataset({"dataset": dev_dataset_sampled})
 
                 results = []
                 client_latent = {}
@@ -244,6 +247,7 @@ if __name__ == "__main__":
                     sec_buffer_tracker.update_dynamic_latency_threshold(round_arrival_times)
 
                     direct_path_weights = []
+                    direct_path_losses = []
                     time_buffer_weights = []
 
                     for i, client in enumerate(selected_clients):
@@ -255,7 +259,16 @@ if __name__ == "__main__":
                             lr_rate=lr_rate,
                             update_type=update_type
                         )
-                        device_trainer.run(client["train_loader"], client["valid_loader"])
+                        
+                        # Train local client model
+                        trainer_result = device_trainer.run(client["train_loader"], client["valid_loader"])
+
+                        # Extract validation loss for MSE weighting (fallback to 1.0 if not stored)
+                        client_val_loss = getattr(device_trainer, "val_loss", None)
+                        if client_val_loss is None and isinstance(trainer_result, (float, int)):
+                            client_val_loss = trainer_result
+                        elif client_val_loss is None:
+                            client_val_loss = 1.0
 
                         raw_weights = copy.deepcopy(device_trainer.model.state_dict())
                         sample_count = len(client["train_loader"].dataset)
@@ -269,23 +282,29 @@ if __name__ == "__main__":
                             n_avg=n_avg
                         )
 
-                        weight_entry = (raw_weights, total_training_samples, sample_count)
-
                         if route_status == "DIRECT_PATH":
-                            direct_path_weights.append(weight_entry)
+                            direct_path_weights.append(raw_weights)
+                            direct_path_losses.append(client_val_loss)
                         elif route_status == "TIME_BUFFER":
-                            time_buffer_weights.append(weight_entry)
+                            time_buffer_weights.append(raw_weights)
                         elif route_status == "QUARANTINE":
                             logging.info(f"Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
 
                         logging.info(f"Client {client['device']} training & evaluation completed.")
 
+                    # --- Aggregation Calls ---
                     if direct_path_weights:
-                        global_aggregator.update(local_models=direct_path_weights)
+                        global_aggregator.aggregate(
+                            client_models=direct_path_weights,
+                            client_losses=direct_path_losses if update_type == "mse_avg" else None
+                        )
 
                     if time_buffer_weights:
                         logging.info(f"Merging {len(time_buffer_weights)} clean updates from TIME BUFFER.")
-                        global_aggregator.update(local_models=time_buffer_weights)
+                        global_aggregator.aggregate(
+                            client_models=time_buffer_weights,
+                            client_losses=None
+                        )
 
                     released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
                         evaluator_fn=dummy_evaluator_fn,
@@ -294,11 +313,10 @@ if __name__ == "__main__":
 
                     if released_quarantine_updates:
                         logging.info(f"Merging {len(released_quarantine_updates)} verified updates from QUARANTINE.")
-                        quarantine_entries = [
-                            (up, total_training_samples, int(total_training_samples / len(released_quarantine_updates)))
-                            for up in released_quarantine_updates
-                        ]
-                        global_aggregator.update(local_models=quarantine_entries)
+                        global_aggregator.aggregate(
+                            client_models=released_quarantine_updates,
+                            client_losses=None
+                        )
 
                     logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {global_aggregator.val_loss}")
 
