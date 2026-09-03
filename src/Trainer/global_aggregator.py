@@ -14,7 +14,7 @@ class GlobalAggregator:
         
         :param client_models: List of state_dict objects or model instances from clients.
         :param client_losses: List of MSE validation/training losses corresponding to each client.
-                               Required when update_type is 'mse_avg'.
+                              Required when update_type is 'mse_avg'.
         """
         if not client_models:
             return self.model
@@ -45,8 +45,9 @@ class GlobalAggregator:
                     for i in range(len(client_states))
                 )
 
-        elif self.update_type == "avg":
-            # Standard FedAvg (unweighted average across all clients)
+        # FedProx uses the exact same parameter averaging scheme as standard FedAvg on the server side
+        elif self.update_type in ["avg", "fedprox"]:
+            # Standard FedAvg / FedProx parameter averaging across all clients
             num_clients = len(client_states)
             for key in global_dict.keys():
                 global_dict[key] = sum(
