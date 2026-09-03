@@ -14,15 +14,22 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class Evaluator(object):
     def __init__(self, model, model_type="autoencoder", metric="AUC", device=None) -> None:
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # Ensure the model parameters are moved to GPU/CPU along with the inputs
         self.model = model.to(self.device)
         self.model_type = model_type
         self.metric = metric
 
+    def _unpack_model_output(self, output_tuple):
+        """Helper to extract latent and reconstructed output safely regardless of tuple length."""
+        if isinstance(output_tuple, (tuple, list)):
+            latent = output_tuple[0]
+            output = output_tuple[1] if len(output_tuple) > 1 else output_tuple[0]
+            return latent, output
+        return output_tuple, output_tuple
+
     def calculate_auc(self, y_true, score):
         if not np.all(np.isfinite(score)):
             print("Anomaly score contains infinite or too large values.")
-            score = np.nan_to_num(score)  # replace infinities with a large finite number
+            score = np.nan_to_num(score)
 
         fpr, tpr, threshold = roc_curve(y_true, score)
         auc_score = auc(fpr, tpr)
@@ -55,7 +62,8 @@ class Evaluator(object):
             with torch.no_grad():
                 for i, batch_input in zip(tqdm(range(len(test_loader)), desc='Testing batch: ...'), test_loader):
                     batch_data = batch_input[0].to(self.device)
-                    _, output, _ = self.model(batch_data)
+                    model_out = self.model(batch_data)
+                    _, output = self._unpack_model_output(model_out)
                     recon_loss = torch.nn.MSELoss(reduction="none")(batch_data, output)
                     anomaly_score.append(torch.mean(recon_loss, dim=1))
                     test_label.append(batch_input[1])
@@ -75,13 +83,13 @@ class Evaluator(object):
                     return f1
 
         if self.model_type == "hybrid":
-            anomaly_score = []
             train_latent = []
             with torch.no_grad():
                 for i, batch_input in zip(tqdm(range(len(train_loader)), 
                                                desc='Calculate output for training data batch: ...'), train_loader):
                     batch_data = batch_input[0].to(self.device)
-                    latent, _, _ = self.model(batch_data)
+                    model_out = self.model(batch_data)
+                    latent, _ = self._unpack_model_output(model_out)
                     train_latent.append(latent)
                 train_latent = torch.cat(train_latent, dim=0).cpu().numpy()
 
@@ -89,7 +97,8 @@ class Evaluator(object):
                 testing_label = []
                 for i, batch_input in zip(tqdm(range(len(test_loader)), desc='Testing batch: ...'), test_loader):
                     batch_data = batch_input[0].to(self.device)
-                    latent, _, _ = self.model(batch_data)
+                    model_out = self.model(batch_data)
+                    latent, _ = self._unpack_model_output(model_out)
                     test_latent.append(latent)
                     testing_label.append(batch_input[1])
 
