@@ -16,10 +16,10 @@ class SecurityBuffer:
         self, 
         global_model, 
         window_size=5, 
-        time_buffer_seconds=10.0,
-        base_similarity_threshold=0.85, 
-        max_variance_threshold=0.05,
-        trust_penalty=0.2, 
+        time_buffer_seconds=30.0,
+        base_similarity_threshold=0.65, 
+        max_variance_threshold=2.0,
+        trust_penalty=0.02, 
         trust_reward=0.05
     ):
         """
