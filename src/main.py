@@ -64,12 +64,34 @@ def set_seeds(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def dummy_evaluator_fn(state_dict, validation_loader):
+def real_evaluator_fn(candidate_model, val_loader, device="cpu"):
     """
-    Placeholder server-side evaluation function for quarantined updates.
-    Calculates dynamic reconstruction error (MSE) on server validation dataset.
+    
     """
-    return 0.02
+    candidate_model.eval()
+    total_mse = 0.0
+    total_samples = 0
+    criterion = torch.nn.MSELoss()
+
+    with torch.no_grad():
+        for batch in val_loader:
+            
+            if isinstance(batch, (list, tuple)):
+                inputs = batch[0].to(device)
+            else:
+                inputs = batch.to(device)
+
+           
+            outputs = candidate_model(inputs)
+            
+            
+            loss = criterion(outputs, inputs)
+            
+            total_mse += loss.item() * inputs.size(0)
+            total_samples += inputs.size(0)
+
+    
+    return total_mse / max(total_samples, 1)
 
 
 if __name__ == "__main__":
