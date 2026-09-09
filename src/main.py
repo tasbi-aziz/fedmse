@@ -1,5 +1,5 @@
 """
-Training endpoint updated with dataset-aware dual-pathway gateway routing.
+Training endpoint updated with dataset-aware dual-pathway gateway routing (Async FL mode).
 """
 
 import os
@@ -232,7 +232,7 @@ if __name__ == "__main__":
                 results = []
                 client_latent = {}
 
-                # Training Loop
+                # --- Asynchronous FL Training Loop ---
                 for round_idx in range(num_rounds):
                     if model_type == "hybrid":
                         client_latent[round_idx] = {}
@@ -246,11 +246,10 @@ if __name__ == "__main__":
                     total_training_samples = sum([len(client['train_loader'].dataset) for client in selected_clients])
                     n_avg = total_training_samples / len(selected_clients) if selected_clients else 1.0
 
-                    direct_path_weights = []
-                    direct_path_losses = []
-
                     for i, client in enumerate(selected_clients):
-                        logging.info(f"Training local model on client: {client['device']}...")
+                        logging.info(f"Async training local model on client: {client['device']}...")
+                        
+                        # Client pulls current global model asynchronously
                         device_trainer = ClientTrainer(
                             model=global_aggregator.model,
                             save_dir=client['save_dir'],
@@ -276,7 +275,7 @@ if __name__ == "__main__":
                         sample_count = len(client["train_loader"].dataset)
                         arrival_time = client['sim_train_time'] + client['sim_comm_time']
 
-                        # --- UPDATED SECURITY GATE CALL ---
+                        # --- SECURITY GATE EVALUATION ---
                         route_status, current_sim, tau_sim = sec_buffer_tracker.evaluate_and_route_update(
                             client_id=client['device'],
                             local_model_state=raw_weights,
@@ -286,41 +285,37 @@ if __name__ == "__main__":
                             val_loss_variance=client_val_variance
                         )
 
+                        # Instant Asynchronous Aggregation
                         if route_status == "DIRECT_PATH":
-                            direct_path_weights.append(raw_weights)
-                            direct_path_losses.append(client_val_loss)
+                            global_aggregator.aggregate(
+                                client_models=[raw_weights],
+                                client_losses=[client_val_loss] if update_type == "mse_avg" else None
+                            )
+                            logging.info(f"Client {client['device']} update instantly aggregated via DIRECT_PATH.")
                         elif route_status == "QUARANTINE":
                             logging.info(f"Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
 
-                        logging.info(f"Client {client['device']} training & evaluation completed.")
-
-                    # --- Aggregation Calls ---
-                    if direct_path_weights:
-                        global_aggregator.aggregate(
-                            client_models=direct_path_weights,
-                            client_losses=direct_path_losses if update_type == "mse_avg" else None
+                        # Process Quarantine updates as soon as available
+                        released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
+                            evaluator_fn=dummy_evaluator_fn,
+                            validation_loader=None
                         )
 
-                    released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
-                        evaluator_fn=dummy_evaluator_fn,
-                        validation_loader=None
-                    )
+                        if released_quarantine_updates:
+                            logging.info(f"Merging {len(released_quarantine_updates)} verified updates from QUARANTINE.")
+                            global_aggregator.aggregate(
+                                client_models=released_quarantine_updates,
+                                client_losses=None
+                            )
 
-                    if released_quarantine_updates:
-                        logging.info(f"Merging {len(released_quarantine_updates)} verified updates from QUARANTINE.")
-                        global_aggregator.aggregate(
-                            client_models=released_quarantine_updates,
-                            client_losses=None
-                        )
-
-                    # Handle val_loss fallback if no models were aggregated
+                    # Handle val_loss fallback if needed
                     current_global_loss = getattr(global_aggregator, "val_loss", None)
                     if current_global_loss is None:
                         current_global_loss = 0.0
 
-                    logging.info(f"Round {round_idx+1}/{num_rounds} - Updated global model - Global loss: {current_global_loss}")
+                    logging.info(f"Cycle {round_idx+1}/{num_rounds} - Updated global model - Global loss: {current_global_loss}")
 
-                    logging.info("Training round finished! Evaluating performance...")
+                    logging.info("Async cycle finished! Evaluating performance...")
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                     global_aggregator.model.to(device) # Ensure aggregator model is on GPU
                     evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type, device=device)
