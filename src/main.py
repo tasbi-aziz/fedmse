@@ -339,14 +339,14 @@ if __name__ == "__main__":
                         f.write(json.dumps(round_results) + '\n')
 
                     # Early stopping logic
-                    if current_global_loss < min_val_loss:
-                        min_val_loss = current_global_loss
-                        global_worse = 0
-                    else:
-                        global_worse += 1
-                        if global_worse > global_patience:
-                            logging.info("Early stopping triggered in global round!")
-                            break
+                    # if current_global_loss < min_val_loss:
+                    #     min_val_loss = current_global_loss
+                    #     global_worse = 0
+                    # else:
+                    #     global_worse += 1
+                    #     if global_worse > global_patience:
+                    #         logging.info("Early stopping triggered in global round!")
+                    #         break
 
                 if model_type == "hybrid":
                     file_path = f'Checkpoint/LatentData/{network_size}/{no_Exp}/Run_{run}/latent_{model_type}_{update_type}.pkl'
