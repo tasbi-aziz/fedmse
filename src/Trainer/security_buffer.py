@@ -1,88 +1,105 @@
 """
-Dataset-Aware Security Buffer for FedMSE.
-Integrates Workload-Scaled Cosine Similarity (Security Gate) 
-and Robust Dynamic Latency Thresholding (Synchronization Gate).
+Security Gate & Time Buffer Module for FedMSE (Sync/Async Compatible).
+Integrates Workload-Scaled Cosine Similarity, Sub-Sample Loss Variance,
+and Dynamic Latency Thresholding alongside Time-Based Staging Buffers.
 """
 
 import copy
 import logging
+import time
 import numpy as np
 import torch
+
 
 class SecurityBuffer:
     def __init__(
         self, 
         global_model, 
         window_size=5, 
+        time_buffer_seconds=10.0,
         base_similarity_threshold=0.85, 
-        latency_threshold=10.0,
+        max_variance_threshold=0.05,
         trust_penalty=0.2, 
         trust_reward=0.05
     ):
         """
-        Multi-Signal Security Buffer.
+        Security Gate with Hybrid Async/Sync Support & Time Buffer.
         
         Args:
-            global_model: Main model reference on the server.
+            global_model: Reference global model on the server.
             window_size: Max history rounds kept in quarantine.
-            base_similarity_threshold: Base similarity threshold (tau_0).
-            latency_threshold: Initial max seconds allowed for Direct Path.
+            time_buffer_seconds: Time window for holding updates in Async mode.
+            base_similarity_threshold: Base cosine similarity threshold (tau_0).
+            max_variance_threshold: Limit for client 4-fold validation variance.
             trust_penalty: Trust score reduction on anomalous update.
             trust_reward: Trust score increase on aligned update.
         """
         self.global_model = global_model
         self.window_size = window_size
+        self.time_buffer_seconds = time_buffer_seconds
         self.base_similarity_threshold = base_similarity_threshold
-        self.latency_threshold = latency_threshold
+        self.max_variance_threshold = max_variance_threshold
         self.trust_penalty = trust_penalty
         self.trust_reward = trust_reward
+        
+        # -------------------------------------------------------------
+        # TIME BUFFER & STAGING POOL (Preserved for Async FL)
+        # -------------------------------------------------------------
+        # Staging buffer format: { client_id: { 'state': model_state, 'timestamp': float, ... } }
+        self.staging_buffer = {}
         
         # Quarantine holding pool: { client_id: [state_dict_1, state_dict_2, ...] }
         self.quarantine_buffer = {}
         
-        # Stored similarity history for trajectory tracking: { client_id: [sim_1, ...] }
+        # Trajectory tracking & dynamic trust scores
         self.similarity_history = {}
-        
-        # Dynamic trust scores: { client_id: score }
         self.trust_scores = {}
 
-    def update_dynamic_latency_threshold(self, arrival_times, k=1.5):
+    # =========================================================================
+    # TIME BUFFER MANAGEMENT (ASYNC FL READY)
+    # =========================================================================
+    
+    def add_to_time_buffer(self, client_id, local_model_state, dataset_size, val_loss_variance=0.0):
         """
-        Calculates dynamic latency threshold using: Median(T) + K * IQR(T).
-        
-        Args:
-            arrival_times (list or np.ndarray): Arrival times of clients in current round.
-            k (float): Outlier sensitivity multiplier (typically 1.5 to 2.0).
+        Holds update in Time Buffer for Async FL processing.
         """
-        if not arrival_times or len(arrival_times) == 0:
-            return self.latency_threshold
+        current_time = time.time()
+        self.staging_buffer[client_id] = {
+            'state': copy.deepcopy(local_model_state),
+            'timestamp': current_time,
+            'dataset_size': dataset_size,
+            'val_loss_variance': val_loss_variance
+        }
+        logging.info(f"[Time Buffer] Update from Client {client_id} stored at {current_time:.2f}.")
 
-        times = np.array(arrival_times)
-        median_t = np.median(times)
-        q75, q25 = np.percentile(times, [75, 25])
-        iqr_t = q75 - q25
+    def flush_ready_time_buffer_updates(self):
+        """
+        Extracts updates that have waited beyond time_buffer_seconds.
+        Used when Async FL mode is enabled.
+        """
+        current_time = time.time()
+        ready_updates = {}
+        expired_clients = []
 
-        # Dynamic formula calculation
-        calculated_threshold = median_t + (k * iqr_t)
-        
-        # Keep threshold at a safe positive non-zero floor
-        self.latency_threshold = max(1.0, float(calculated_threshold))
-        
-        logging.info(
-            f"[Synchronization Gate] Dynamic Latency Threshold updated to: "
-            f"{self.latency_threshold:.2f}s (Median={median_t:.2f}s, IQR={iqr_t:.2f}s, k={k})"
-        )
-        return self.latency_threshold
+        for client_id, data in self.staging_buffer.items():
+            if (current_time - data['timestamp']) >= self.time_buffer_seconds:
+                ready_updates[client_id] = data
+                expired_clients.append(client_id)
+
+        for client_id in expired_clients:
+            del self.staging_buffer[client_id]
+
+        return ready_updates
+
+    # =========================================================================
+    # 3-LAYER SECURITY GATE (COSINE SIM, VARIANCE, LATENCY)
+    # =========================================================================
 
     def _flatten_state_dict(self, state_dict):
-        """
-        Flattens PyTorch state_dict parameters into a 1D vector on CPU 
-        to guarantee uniform device placement during vector operations.
-        """
+        """Flattens PyTorch state_dict parameters into a 1D vector on CPU."""
         tensors = []
         for key in sorted(state_dict.keys()):
             if isinstance(state_dict[key], torch.Tensor):
-                # Detach and force movement to CPU
                 tensors.append(state_dict[key].detach().cpu().float().flatten())
         return torch.cat(tensors)
 
@@ -100,13 +117,25 @@ class SecurityBuffer:
         cosine_sim = torch.dot(vec_local, vec_global) / (norm_local * norm_global)
         return float(cosine_sim.item())
 
-    def evaluate_and_route_update(self, client_id, local_model_state, dataset_size, arrival_time, n_avg):
+    def evaluate_and_route_update(
+        self, 
+        client_id, 
+        local_model_state, 
+        dataset_size, 
+        arrival_time, 
+        n_avg, 
+        val_loss_variance=0.0
+    ):
         """
-        Primary Admission Gate.
+        Primary Admission Gate:
+        1. Cosine Similarity Check (Workload-scaled threshold).
+        2. Sub-Sample Loss Variance Check (4-fold validation).
+        3. Latency Check (Time window comparison).
         
-        1. Scales Cosine Similarity threshold by workload ratio (n_k / n_avg).
-        2. Phase 1 (Security): Checks weight drift against dynamic threshold.
-        3. Phase 2 (Synchronization): Bypasses Quarantine for clean updates and routes by latency.
+        Returns:
+            route (str): "DIRECT_PATH" or "QUARANTINE"
+            current_sim (float): Measured Cosine Similarity
+            tau_sim (float): Scaled Cosine Similarity Threshold
         """
         global_state = self.global_model.state_dict()
         
@@ -115,59 +144,45 @@ class SecurityBuffer:
             self.quarantine_buffer[client_id] = []
             self.similarity_history[client_id] = []
 
-        # -------------------------------------------------------------
-        # STEP 1: Compute Cosine Similarity
-        # -------------------------------------------------------------
+        # Step 1: Compute Cosine Similarity
         current_sim = self.calculate_cosine_similarity(local_model_state, global_state)
 
-        # -------------------------------------------------------------
-        # STEP 2: Workload-Aware Similarity Threshold Scaling
-        # Dynamic Formula: tau_k = tau_0 / sqrt(n_k / n_avg)
-        # -------------------------------------------------------------
+        # Step 2: Dynamic Threshold Scaling: tau_k = tau_0 / sqrt(n_k / n_avg)
         r_k = dataset_size / n_avg if n_avg > 0 else 1.0
         tau_sim = self.base_similarity_threshold / (r_k ** 0.5)
         tau_sim = max(0.60, min(0.95, tau_sim))
 
-        # -------------------------------------------------------------
-        # STEP 3: PHASE 1 — Security Gate (Drift Evaluation)
-        # -------------------------------------------------------------
+        # Step 3: 3-Layer Security Checks
         is_excessive_drift = current_sim < tau_sim
+        is_unstable_variance = val_loss_variance > self.max_variance_threshold
+        is_excessive_latency = arrival_time > self.time_buffer_seconds
 
-        if is_excessive_drift:
+        if is_excessive_drift or is_unstable_variance or is_excessive_latency:
+            # Route to Quarantine Path
             self.trust_scores[client_id] = max(0.0, self.trust_scores[client_id] - self.trust_penalty)
             self.quarantine_buffer[client_id].append(copy.deepcopy(local_model_state))
             
             if len(self.quarantine_buffer[client_id]) > self.window_size:
                 self.quarantine_buffer[client_id].pop(0)
 
+            reason_str = f"Sim_Fail={is_excessive_drift}, Var_Fail={is_unstable_variance}, Latency_Fail={is_excessive_latency}"
             logging.warning(
-                f"[Security Gate] Excessive Drift Detected for Client {client_id}! "
-                f"Sim: {current_sim:.4f} < Tau: {tau_sim:.4f} (Workload ratio: {r_k:.2f}). "
-                f"Trust reduced to: {self.trust_scores[client_id]:.2f} -> Sent to QUARANTINE."
+                f"[Security Gate] Anomaly/Delay Detected for Client {client_id}! ({reason_str}) "
+                f"Sim: {current_sim:.4f} (Tau: {tau_sim:.4f}), Var: {val_loss_variance:.4f}, Latency: {arrival_time:.1f}s. "
+                f"Trust: {self.trust_scores[client_id]:.2f} -> Routed to QUARANTINE."
             )
             return "QUARANTINE", current_sim, tau_sim
 
-        # Reward clean client
+        # Passed all checks -> Route to Direct Path
         self.trust_scores[client_id] = min(1.0, self.trust_scores[client_id] + self.trust_reward)
         self.similarity_history[client_id].append(current_sim)
 
-        # -------------------------------------------------------------
-        # STEP 4: PHASE 2 — Synchronization Gate (Latency Routing)
-        # -------------------------------------------------------------
-        if arrival_time <= self.latency_threshold:
-            logging.info(
-                f"[Security Gate] Client {client_id} CLEAN & FAST "
-                f"(Sim: {current_sim:.4f} >= Tau: {tau_sim:.4f}, Delay: {arrival_time:.1f}s <= Threshold: {self.latency_threshold:.1f}s) "
-                f"-> Routed to DIRECT PATH."
-            )
-            return "DIRECT_PATH", current_sim, tau_sim
-        else:
-            logging.info(
-                f"[Security Gate] Client {client_id} CLEAN but SLOW "
-                f"(Sim: {current_sim:.4f} >= Tau: {tau_sim:.4f}, Delay: {arrival_time:.1f}s > Threshold: {self.latency_threshold:.1f}s) "
-                f"-> Routed to TIME BUFFER."
-            )
-            return "TIME_BUFFER", current_sim, tau_sim
+        logging.info(
+            f"[Security Gate] Client {client_id} CLEAN & FAST "
+            f"(Sim: {current_sim:.4f} >= Tau: {tau_sim:.4f}, Var: {val_loss_variance:.4f}, Latency: {arrival_time:.1f}s) "
+            f"-> Routed to DIRECT PATH."
+        )
+        return "DIRECT_PATH", current_sim, tau_sim
 
     def process_quarantine_validation(self, evaluator_fn, validation_loader):
         """
