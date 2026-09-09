@@ -30,7 +30,8 @@ class GlobalAggregator:
             for key in current_global_state.keys():
                 if current_global_state[key].is_floating_point():
                     # Async moving average update: W_global = (1 - alpha) * W_global + alpha * W_client
-                    updated_dict[key] = (1 - self.alpha) * current_global_state[key].float() + self.alpha * client_state[key].float()
+                   device = current_global_state[key].device
+                   updated_dict[key] = (1 - self.alpha) * current_global_state[key].float() + self.alpha * client_state[key].to(device).float()
                 else:
                     updated_dict[key] = client_state[key]
 
