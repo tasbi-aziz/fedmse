@@ -135,7 +135,7 @@ if __name__ == "__main__":
         processed_test_data, test_label = data_processor.transform(test_normal_data)
         processed_abnormal_data, abnormal_label = data_processor.transform(abnormal_data, type="abnormal")
 
-        # Fix 1: Properly construct base test dataset without overwriting
+        # Construct base test dataset
         if new_device:
             processed_new_normal_data, new_normal_label = data_processor.transform(new_normal_data)
             processed_test_data = np.concatenate([processed_test_data, processed_new_normal_data], axis=0)
@@ -210,11 +210,12 @@ if __name__ == "__main__":
                 sec_buffer_tracker = SecurityBuffer(
                     global_model=global_model,
                     window_size=5,
+                    time_buffer_seconds=args.latency_threshold,
                     base_similarity_threshold=args.base_similarity_threshold,
-                    latency_threshold=args.latency_threshold
+                    max_variance_threshold=0.05
                 )
 
-                # Fix 2: Concatenate dev DataFrames and transform using client processor
+                # Concatenate dev DataFrames and transform using client processor
                 min_len = min([len(client['dev_normal_dataset']) for client in client_info])
                 dev_dataset_sampled_list = []
                 for client in client_info:
@@ -245,15 +246,8 @@ if __name__ == "__main__":
                     total_training_samples = sum([len(client['train_loader'].dataset) for client in selected_clients])
                     n_avg = total_training_samples / len(selected_clients) if selected_clients else 1.0
 
-                    round_arrival_times = [
-                        client['sim_train_time'] + client['sim_comm_time']
-                        for client in selected_clients
-                    ]
-                    sec_buffer_tracker.update_dynamic_latency_threshold(round_arrival_times)
-
                     direct_path_weights = []
                     direct_path_losses = []
-                    time_buffer_weights = []
 
                     for i, client in enumerate(selected_clients):
                         logging.info(f"Training local model on client: {client['device']}...")
@@ -268,30 +262,33 @@ if __name__ == "__main__":
                         # Train local client model
                         trainer_result = device_trainer.run(client["train_loader"], client["valid_loader"])
 
-                        # Extract validation loss for MSE weighting (fallback to 1.0 if not stored)
+                        # Extract validation loss for MSE weighting
                         client_val_loss = getattr(device_trainer, "val_loss", None)
                         if client_val_loss is None and isinstance(trainer_result, (float, int)):
                             client_val_loss = trainer_result
                         elif client_val_loss is None:
                             client_val_loss = 1.0
 
+                        # Extract validation variance if computed by trainer
+                        client_val_variance = getattr(device_trainer, "val_loss_variance", 0.0)
+
                         raw_weights = copy.deepcopy(device_trainer.model.state_dict())
                         sample_count = len(client["train_loader"].dataset)
                         arrival_time = client['sim_train_time'] + client['sim_comm_time']
 
+                        # --- UPDATED SECURITY GATE CALL ---
                         route_status, current_sim, tau_sim = sec_buffer_tracker.evaluate_and_route_update(
                             client_id=client['device'],
                             local_model_state=raw_weights,
                             dataset_size=sample_count,
                             arrival_time=arrival_time,
-                            n_avg=n_avg
+                            n_avg=n_avg,
+                            val_loss_variance=client_val_variance
                         )
 
                         if route_status == "DIRECT_PATH":
                             direct_path_weights.append(raw_weights)
                             direct_path_losses.append(client_val_loss)
-                        elif route_status == "TIME_BUFFER":
-                            time_buffer_weights.append(raw_weights)
                         elif route_status == "QUARANTINE":
                             logging.info(f"Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
 
@@ -302,13 +299,6 @@ if __name__ == "__main__":
                         global_aggregator.aggregate(
                             client_models=direct_path_weights,
                             client_losses=direct_path_losses if update_type == "mse_avg" else None
-                        )
-
-                    if time_buffer_weights:
-                        logging.info(f"Merging {len(time_buffer_weights)} clean updates from TIME BUFFER.")
-                        global_aggregator.aggregate(
-                            client_models=time_buffer_weights,
-                            client_losses=None
                         )
 
                     released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
@@ -323,7 +313,7 @@ if __name__ == "__main__":
                             client_losses=None
                         )
 
-                    # Fix 3: Handle val_loss fallback if no models were aggregated
+                    # Handle val_loss fallback if no models were aggregated
                     current_global_loss = getattr(global_aggregator, "val_loss", None)
                     if current_global_loss is None:
                         current_global_loss = 0.0
