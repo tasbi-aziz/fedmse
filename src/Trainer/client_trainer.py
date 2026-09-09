@@ -3,7 +3,7 @@ import logging
 import copy
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -44,6 +44,8 @@ class ClientTrainer:
         # Tracked loss metrics
         self.train_loss = 0.0
         self.val_loss = 0.0
+        self.val_loss_variance = 0.0
+        self.sub_sample_losses = []
 
         if self.algorithm == "fedprox":
             self.previous_global_model = copy.deepcopy(self.model)
@@ -107,35 +109,77 @@ class ClientTrainer:
         self.train_loss = running_loss / max(total_batches, 1)
         return self.train_loss
 
-    def evaluate(self, valid_loader: DataLoader) -> float:
-        """Evaluates local model on validation set."""
-        if valid_loader is None:
+    def evaluate(self, valid_loader: DataLoader, num_folds: int = 4) -> tuple:
+        """
+        Evaluates local model on validation set using a 4-fold sub-sampling approach.
+        Returns:
+            mean_val_loss (float): Mean MSE loss across 4 sub-samples
+            val_loss_variance (float): Variance of MSE losses across 4 sub-samples
+        """
+        if valid_loader is None or valid_loader.dataset is None or len(valid_loader.dataset) == 0:
             self.val_loss = self.train_loss
-            return self.val_loss
+            self.val_loss_variance = 0.0
+            return self.val_loss, self.val_loss_variance
 
         self.model.eval()
-        running_loss = 0.0
-        total_batches = 0
+        dataset = valid_loader.dataset
+        total_size = len(dataset)
+        
+        # Ensure num_folds does not exceed total dataset size
+        folds = min(num_folds, total_size)
+        fold_size = total_size // folds
+        
+        sub_losses = []
 
         with torch.no_grad():
-            for batch in valid_loader:
-                data = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else batch.to(self.device)
-                output_obj = self.model(data)
-                reconstruction = self._get_reconstruction(output_obj)
+            for i in range(folds):
+                start_idx = i * fold_size
+                end_idx = total_size if i == folds - 1 else (i + 1) * fold_size
+                indices = list(range(start_idx, end_idx))
                 
-                loss = self.criterion(reconstruction, data)
-                running_loss += loss.item()
-                total_batches += 1
+                sub_dataset = Subset(dataset, indices)
+                sub_loader = DataLoader(
+                    sub_dataset,
+                    batch_size=valid_loader.batch_size or 32,
+                    shuffle=False
+                )
 
-        self.val_loss = running_loss / max(total_batches, 1)
-        return self.val_loss
+                fold_loss = 0.0
+                total_batches = 0
 
-    def run(self, train_loader: DataLoader, valid_loader: DataLoader = None) -> float:
-        """Pipeline runner: executes training, validation, and auto-saves model."""
+                for batch in sub_loader:
+                    data = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else batch.to(self.device)
+                    output_obj = self.model(data)
+                    reconstruction = self._get_reconstruction(output_obj)
+                    
+                    loss = self.criterion(reconstruction, data)
+                    fold_loss += loss.item()
+                    total_batches += 1
+
+                avg_fold_loss = fold_loss / max(total_batches, 1)
+                sub_losses.append(avg_fold_loss)
+
+        # Statistical Metrics Calculation
+        loss_tensor = torch.tensor(sub_losses, dtype=torch.float32)
+        self.sub_sample_losses = sub_losses
+        self.val_loss = torch.mean(loss_tensor).item()
+        self.val_loss_variance = torch.var(loss_tensor, unbiased=False).item() if len(sub_losses) > 1 else 0.0
+
+        return self.val_loss, self.val_loss_variance
+
+    def run(self, train_loader: DataLoader, valid_loader: DataLoader = None) -> tuple:
+        """
+        Pipeline runner: executes training, 4-fold sub-sample validation, and auto-saves model.
+        Returns (mean_val_loss, val_loss_variance) tuple for server security gate routing.
+        """
         self.train(train_loader)
-        val_loss = self.evaluate(valid_loader) if valid_loader is not None else self.train_loss
+        if valid_loader is not None:
+            val_loss, val_variance = self.evaluate(valid_loader)
+        else:
+            val_loss, val_variance = self.train_loss, 0.0
+
         self.save_model()
-        return val_loss
+        return val_loss, val_variance
 
     def save_model(self):
         """Saves local client model to disk safely."""
