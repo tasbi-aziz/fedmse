@@ -78,14 +78,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--base_similarity_threshold",
         type=float,
-        default=0.85,
-        help="Base similarity threshold (tau_0) for dataset-aware similarity scaling (default: 0.85)"
+        default=0.65,
+        help="Base similarity threshold (tau_0) for dataset-aware similarity scaling (default: 0.65)"
     )
     parser.add_argument(
         "--latency_threshold",
         type=float,
-        default=10.0,
-        help="Initial maximum seconds allowed for direct aggregation path (default: 10.0)"
+        default=30.0,
+        help="Initial maximum seconds allowed for direct aggregation path (default: 30.0)"
     )
     args = parser.parse_args()
 
