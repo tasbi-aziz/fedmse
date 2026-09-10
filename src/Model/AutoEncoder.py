@@ -23,7 +23,7 @@ class Encoder(nn.Module):
     """
     A class that represents an encoder module for an AutoEncoder network.
     """
-    def __init__(self, input_dim=115, hidden_neus=27, latent_dim=7):
+    def __init__(self, input_dim=115, hidden_neus=64, latent_dim=32):
         super(Encoder, self).__init__()
         encoder_network = [
             nn.Linear(input_dim, hidden_neus, bias=True),
@@ -48,12 +48,13 @@ class Decoder(nn.Module):
     """
     A decoder module that takes a latent vector as input and produces an output vector.
     """
-    def __init__(self, latent_dim=7, hidden_neus=27, output_dim=115):
+    def __init__(self, latent_dim=32, hidden_neus=64, output_dim=115):
         super(Decoder, self).__init__()
         decoder_network = [
             nn.Linear(latent_dim, hidden_neus, bias=True),
             nn.ReLU(),
-            nn.Linear(hidden_neus, output_dim, bias=True)
+            nn.Linear(hidden_neus, output_dim, bias=True),
+            nn.Sigmoid()  # Output values range: [0, 1]
         ]
         self.decoder_network = nn.Sequential(*decoder_network)
         self.init_params()
@@ -73,7 +74,7 @@ class Autoencoder(nn.Module):
     """
     Autoencoder class
     """
-    def __init__(self, input_dim=115, output_dim=115, hidden_neus=27, latent_dim=7):
+    def __init__(self, input_dim=115, output_dim=115, hidden_neus=64, latent_dim=32):
         super(Autoencoder, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
