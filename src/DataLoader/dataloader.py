@@ -59,18 +59,20 @@ def load_data(path, header=None):
 
 class IoTDataProccessor(object):
     def __init__(self, scaler="standard"):
+        self.scaler_type = scaler
         if scaler == "standard":
             self.scaler = StandardScaler()
-        
-        if scaler == "minmax":
+        elif scaler == "minmax":
             self.scaler = MinMaxScaler((0, 1))
+        else:
+            raise ValueError(f"Unknown scaler type: {scaler}. Use 'standard' or 'minmax'.")
 
     def transform(self, dataframe, type="normal"):
         processed_data = self.scaler.transform(dataframe)
         if type == "normal":
-            label = [0 for i in range(len(dataframe))]
+            label = [0 for _ in range(len(dataframe))]
         else:
-            label = [1 for i in range(len(dataframe))]
+            label = [1 for _ in range(len(dataframe))]
         return processed_data, np.array(label)
     
     def fit_transform(self, dataframe):
@@ -79,10 +81,19 @@ class IoTDataProccessor(object):
         return processed_data, label
         
     def get_metadata(self):
-        metadata = {
-            "mean": self.scaler.mean_,
-            "std": self.scaler.scale_
-        }
+        # Dynamically handle metadata extraction based on scaler type
+        if isinstance(self.scaler, StandardScaler):
+            metadata = {
+                "mean": self.scaler.mean_,
+                "std": self.scaler.scale_
+            }
+        elif isinstance(self.scaler, MinMaxScaler):
+            metadata = {
+                "min": self.scaler.data_min_,
+                "max": self.scaler.data_max_
+            }
+        else:
+            metadata = {}
         return metadata
         
         
