@@ -15,11 +15,11 @@ class ClientTrainer:
         client_id: int = 0,
         train_loader: DataLoader = None,
         epochs: int = 5,
-        epoch: int = None,            # Compatibility alias for epoch
+        epoch: int = None,            # Compatibility alias
         lr: float = 0.001,
-        lr_rate: float = None,        # Compatibility alias for lr_rate
+        lr_rate: float = None,        # Compatibility alias
         algorithm: str = "fedavg",
-        update_type: str = None,      # Compatibility alias for update_type
+        update_type: str = None,      # Compatibility alias
         fedprox_mu: float = 0.01,
         device: str = "cpu",
         save_dir: str = "./checkpoints"
@@ -64,10 +64,14 @@ class ClientTrainer:
         """Returns local model state dict."""
         return self.model.state_dict()
 
-    def _get_reconstruction(self, output_obj):
-        """Helper to extract reconstruction tensor if model output is a tuple."""
+    def _get_reconstruction(self, output_obj, data=None):
+        """Helper to extract reconstruction tensor reliably based on input shape."""
         if isinstance(output_obj, (tuple, list)):
-            return output_obj[1]  # Extract output from (latent, output, loss)
+            if data is not None:
+                for item in output_obj:
+                    if isinstance(item, torch.Tensor) and item.shape == data.shape:
+                        return item
+            return output_obj[0]
         return output_obj
 
     def train(self, train_loader: DataLoader = None) -> float:
@@ -86,10 +90,9 @@ class ClientTrainer:
 
                 self.optimizer.zero_grad()
                 output_obj = self.model(data)
-                reconstruction = self._get_reconstruction(output_obj)
+                reconstruction = self._get_reconstruction(output_obj, data)
                 
                 reconstruction_loss = self.criterion(reconstruction, data)
-
                 total_loss = reconstruction_loss
 
                 # FedProx Proximal Term
@@ -110,12 +113,7 @@ class ClientTrainer:
         return self.train_loss
 
     def evaluate(self, valid_loader: DataLoader, num_folds: int = 4) -> tuple:
-        """
-        Evaluates local model on validation set using a 4-fold sub-sampling approach.
-        Returns:
-            mean_val_loss (float): Mean MSE loss across 4 sub-samples
-            val_loss_variance (float): Variance of MSE losses across 4 sub-samples
-        """
+        """Evaluates local model on validation set using a 4-fold sub-sampling approach."""
         if valid_loader is None or valid_loader.dataset is None or len(valid_loader.dataset) == 0:
             self.val_loss = self.train_loss
             self.val_loss_variance = 0.0
@@ -125,7 +123,6 @@ class ClientTrainer:
         dataset = valid_loader.dataset
         total_size = len(dataset)
         
-        # Ensure num_folds does not exceed total dataset size
         folds = min(num_folds, total_size)
         fold_size = total_size // folds
         
@@ -150,7 +147,7 @@ class ClientTrainer:
                 for batch in sub_loader:
                     data = batch[0].to(self.device) if isinstance(batch, (list, tuple)) else batch.to(self.device)
                     output_obj = self.model(data)
-                    reconstruction = self._get_reconstruction(output_obj)
+                    reconstruction = self._get_reconstruction(output_obj, data)
                     
                     loss = self.criterion(reconstruction, data)
                     fold_loss += loss.item()
@@ -159,7 +156,6 @@ class ClientTrainer:
                 avg_fold_loss = fold_loss / max(total_batches, 1)
                 sub_losses.append(avg_fold_loss)
 
-        # Statistical Metrics Calculation
         loss_tensor = torch.tensor(sub_losses, dtype=torch.float32)
         self.sub_sample_losses = sub_losses
         self.val_loss = torch.mean(loss_tensor).item()
@@ -168,10 +164,7 @@ class ClientTrainer:
         return self.val_loss, self.val_loss_variance
 
     def run(self, train_loader: DataLoader, valid_loader: DataLoader = None) -> tuple:
-        """
-        Pipeline runner: executes training, 4-fold sub-sample validation, and auto-saves model.
-        Returns (mean_val_loss, val_loss_variance) tuple for server security gate routing.
-        """
+        """Pipeline runner: executes training, 4-fold sub-sample validation, and auto-saves model."""
         self.train(train_loader)
         if valid_loader is not None:
             val_loss, val_variance = self.evaluate(valid_loader)
