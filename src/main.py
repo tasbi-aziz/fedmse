@@ -64,33 +64,45 @@ def set_seeds(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def real_evaluator_fn(candidate_model, val_loader, device="cpu"):
+def real_evaluator_fn(candidate_model, val_loader, device="cpu", model_template=None):
     """
+    Autoencoder-এর আসল Reconstruction MSE Loss বের করার সঠিক Evaluator Function।
+    candidate_model যদি state_dict হয়, তবে model_template দিয়ে তা লোড করে মাপা হবে।
+    """
+    if candidate_model is None or val_loader is None:
+        return float("inf")
+
+    # State Dict অথবা Model Object হ্যান্ডেল করা
+    if isinstance(candidate_model, dict):
+        if model_template is None:
+            return float("inf")
+        eval_model = copy.deepcopy(model_template)
+        eval_model.load_state_dict(candidate_model)
+    else:
+        eval_model = candidate_model
+
+    eval_model.to(device)
+    eval_model.eval()
     
-    """
-    candidate_model.eval()
     total_mse = 0.0
     total_samples = 0
     criterion = torch.nn.MSELoss()
 
     with torch.no_grad():
         for batch in val_loader:
-            
             if isinstance(batch, (list, tuple)):
                 inputs = batch[0].to(device)
             else:
                 inputs = batch.to(device)
 
-           
-            outputs = candidate_model(inputs)
-            
-            
+            outputs = eval_model(inputs)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+
             loss = criterion(outputs, inputs)
-            
             total_mse += loss.item() * inputs.size(0)
             total_samples += inputs.size(0)
 
-    
     return total_mse / max(total_samples, 1)
 
 
@@ -113,6 +125,10 @@ if __name__ == "__main__":
 
     set_seeds(data_seed)
 
+    # Device setup early
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using compute device: {device}")
+
     try:
         logging.info("Loading configuration...")
         with open(config_file, "r") as config_f:
@@ -125,13 +141,13 @@ if __name__ == "__main__":
     client_info = []
 
     # --- Data Preparation for Clients ---
-    for device in devices_list:
+    for dev in devices_list:
         logging.info("Creating metadata for client...")
-        normal_data_path = os.path.join(config['data_path'], device["normal_data_path"])
-        abnormal_data_path = os.path.join(config['data_path'], device["normal_data_path"].replace("normal", "test_normal"))
-        test_new_normal_data_path = os.path.join(config['data_path'], device["test_normal_data_path"])
+        normal_data_path = os.path.join(config['data_path'], dev["normal_data_path"])
+        abnormal_data_path = os.path.join(config['data_path'], dev["normal_data_path"].replace("normal", "test_normal"))
+        test_new_normal_data_path = os.path.join(config['data_path'], dev["test_normal_data_path"])
 
-        logging.info(f"Loading data from {device['name']}...")
+        logging.info(f"Loading data from {dev['name']}...")
 
         normal_data = load_data(normal_data_path).sample(frac=1).reset_index(drop=True)
         abnormal_data = load_data(abnormal_data_path).sample(frac=1).reset_index(drop=True)
@@ -139,7 +155,7 @@ if __name__ == "__main__":
         if new_device:
             new_normal_data = load_data(test_new_normal_data_path)
 
-        device_name = device['name']
+        device_name = dev['name']
         print(f"{device_name} has {len(normal_data)} normal data and {len(abnormal_data)} abnormal data")
 
         train_normal_size = int(0.4 * len(normal_data))
@@ -178,7 +194,7 @@ if __name__ == "__main__":
         test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, pin_memory=True)
 
         client_info.append({
-            "device": device['name'],
+            "device": dev['name'],
             "save_dir": "",
             "train_loader": train_loader,
             "valid_loader": valid_loader,
@@ -186,9 +202,13 @@ if __name__ == "__main__":
             "test_dataset": (processed_test_data, test_label),
             "dev_normal_dataset": dev_normal_data,
             "data_processor": data_processor,
-            "sim_train_time": device.get("simulated_training_time", 1.5),
-            "sim_comm_time": device.get("simulated_comm_time", 0.5)
+            "sim_train_time": dev.get("simulated_training_time", 1.5),
+            "sim_comm_time": dev.get("simulated_comm_time", 0.5)
         })
+
+    # Server Global Validation Set তৈরি (সব ক্লায়েন্টের valid_loader একসাথে কনক্যাট করে)
+    server_val_dataset = ConcatDataset([client['valid_loader'].dataset for client in client_info])
+    server_val_loader = DataLoader(dataset=server_val_dataset, batch_size=batch_size, shuffle=False)
 
     # --- Training & Experimentation Pipeline ---
     for update_type in ["avg", "fedprox", "mse_avg"]:
@@ -224,6 +244,8 @@ if __name__ == "__main__":
                         input_dim=dim_features,
                         latent_dim=shrink_dim
                     )
+
+                global_model.to(device)
 
                 # Initialize aggregator with explicit update_type
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
@@ -314,13 +336,14 @@ if __name__ == "__main__":
                                 client_losses=[client_val_loss] if update_type == "mse_avg" else None
                             )
                             logging.info(f"Client {client['device']} update instantly aggregated via DIRECT_PATH.")
+                            
                         elif route_status == "QUARANTINE":
                             logging.info(f"Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
 
-                        # Process Quarantine updates as soon as available
+                        # Quarantine Validation with real MSE Evaluator
                         released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
-                            evaluator_fn=dummy_evaluator_fn,
-                            validation_loader=None
+                            evaluator_fn=lambda m: real_evaluator_fn(m, server_val_loader, device, model_template=global_model),
+                            validation_loader=server_val_loader
                         )
 
                         if released_quarantine_updates:
@@ -330,16 +353,22 @@ if __name__ == "__main__":
                                 client_losses=None
                             )
 
-                    # Handle val_loss fallback if needed
-                    current_global_loss = getattr(global_aggregator, "val_loss", None)
+                    # Compute real Global Loss after round updates
+                    current_global_loss = real_evaluator_fn(
+                        global_aggregator.model,
+                        server_val_loader,
+                        device,
+                        model_template=global_model
+                    )
+
                     if current_global_loss is None:
                         current_global_loss = 0.0
 
-                    logging.info(f"Cycle {round_idx+1}/{num_rounds} - Updated global model - Global loss: {current_global_loss}")
+                    global_aggregator.val_loss = current_global_loss
+                    logging.info(f"Cycle {round_idx+1}/{num_rounds} - Updated global model - Global loss: {current_global_loss:.6f}")
 
                     logging.info("Async cycle finished! Evaluating performance...")
-                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    global_aggregator.model.to(device) # Ensure aggregator model is on GPU
+                    global_aggregator.model.to(device)
                     evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type, device=device)
                     round_results = {}
 
@@ -359,16 +388,6 @@ if __name__ == "__main__":
 
                     with open(filename, 'a') as f:
                         f.write(json.dumps(round_results) + '\n')
-
-                    # Early stopping logic
-                    # if current_global_loss < min_val_loss:
-                    #     min_val_loss = current_global_loss
-                    #     global_worse = 0
-                    # else:
-                    #     global_worse += 1
-                    #     if global_worse > global_patience:
-                    #         logging.info("Early stopping triggered in global round!")
-                    #         break
 
                 if model_type == "hybrid":
                     file_path = f'Checkpoint/LatentData/{network_size}/{no_Exp}/Run_{run}/latent_{model_type}_{update_type}.pkl'
