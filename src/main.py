@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 num_participants = 1.0
 epoch = 5
 num_rounds = 12
-lr_rate = 1e-3
+lr_rate = 5e-5
 shrink_dim = 11      # Maps to latent bottleneck dimension
 threshold_val = 0.2  # Threshold for shrinkage_operator
 network_size = 10
@@ -118,7 +118,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--latency_threshold",
         type=float,
-        default=30.0,
+        default=20.0,
         help="Initial maximum seconds allowed for direct aggregation path (default: 30.0)"
     )
     args = parser.parse_args()
