@@ -19,12 +19,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class SecurityBuffer:
     def __init__(
         self, 
-        latency_threshold=0.5, 
-        similarity_threshold_T=0.8, 
-        alpha=0.5, 
-        beta=0.25, 
-        mse_diff_threshold=0.05
+        global_model=None, 
+        window_size=5, 
+        time_buffer_seconds=20.0, 
+        base_similarity_threshold=0.65, 
+        max_variance_threshold=0.05
     ):
+        self.global_model = global_model
+        self.window_size = window_size
+        self.time_buffer_seconds = time_buffer_seconds
+        self.base_similarity_threshold = base_similarity_threshold
+        self.max_variance_threshold = max_variance_threshold
+        
+        # Apnar security buffer-er baki variables thakle oigulo niche thakbe...
         """
         :param latency_threshold: Fixed latency cutoff (e.g., 0.5s or 0.27s)
         :param similarity_threshold_T: Minimum Cosine Similarity threshold (T)
