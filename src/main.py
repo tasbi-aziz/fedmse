@@ -253,7 +253,7 @@ if __name__ == "__main__":
                 sec_buffer_tracker = SecurityBuffer(
                     global_model=global_model,
                     window_size=5,
-                    time_buffer_seconds=args.latency_threshold,
+                    latency_threshold=args.latency_threshold,
                     base_similarity_threshold=args.base_similarity_threshold,
                     max_variance_threshold=0.05
                 )
