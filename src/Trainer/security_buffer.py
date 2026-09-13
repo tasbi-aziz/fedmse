@@ -168,11 +168,33 @@ class SecurityBuffer:
             self.quarantine_pass_queue.append(update_obj)
             return True, avg_mse_i, avg_mse_g
 
-    def process_quarantine_validation(self, global_model, val_loader, criterion, device="cpu", quarantine_list=None):
+    def process_quarantine_validation(
+        self, 
+        global_model=None, 
+        val_loader=None, 
+        criterion=None, 
+        device="cpu", 
+        quarantine_list=None,
+        evaluator_fn=None,
+        validation_loader=None,
+        **kwargs
+    ):
         """
-        Validates updates sitting in quarantine.
-        Returns a list of updates that passed inspection.
+        Validates updates sitting in quarantine queue.
+        Supports both direct parameters and main.py keyword parameters.
         """
+        # Map validation_loader to val_loader
+        if val_loader is None and validation_loader is not None:
+            val_loader = validation_loader
+
+        # Fallback for global_model
+        if global_model is None:
+            global_model = self.global_model
+
+        # Fallback for criterion
+        if criterion is None:
+            criterion = torch.nn.MSELoss()
+
         released_updates = []
         targets = quarantine_list if quarantine_list is not None else self.quarantine_queue
 
@@ -191,7 +213,6 @@ class SecurityBuffer:
             self.quarantine_queue.clear()
 
         return released_updates
-
     def collect_current_round_updates(self, incoming_updates, global_model, val_loader, criterion, device="cpu"):
         """
         Executes routing, quarantine inspection, and returns ready updates for current round aggregation.
