@@ -119,7 +119,7 @@ if __name__ == "__main__":
         "--latency_threshold",
         type=float,
         default=20.0,
-        help="Initial maximum seconds allowed for direct aggregation path (default: 30.0)"
+        help="Initial maximum seconds allowed for direct aggregation path (default: 20.0)"
     )
     args = parser.parse_args()
 
@@ -366,6 +366,20 @@ if __name__ == "__main__":
                     global_aggregator.val_loss = current_global_loss
                     logging.info(f"Cycle {round_idx+1}/{num_rounds} - Updated global model - Global loss: {current_global_loss:.6f}")
 
+                    # --- Early Stopping & Best Model Checkpointing ---
+                    best_model_dir = f'Checkpoint/BestModel/{network_size}/{no_Exp}/Run_{run}/{model_type}_{update_type}'
+                    os.makedirs(best_model_dir, exist_ok=True)
+                    best_model_path = os.path.join(best_model_dir, f"{scen_name}_best_model.pth")
+
+                    if current_global_loss < min_val_loss:
+                        min_val_loss = current_global_loss
+                        global_worse = 0
+                        torch.save(global_aggregator.model.state_dict(), best_model_path)
+                        logging.info(f"Global validation loss improved to {min_val_loss:.6f}. Saved best model checkpoint.")
+                    else:
+                        global_worse += 1
+                        logging.info(f"Global validation loss did not improve. Patience: {global_worse}/{global_patience}")
+
                     logging.info("Async cycle finished! Evaluating performance...")
                     global_aggregator.model.to(device)
                     evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type, device=device)
@@ -387,6 +401,10 @@ if __name__ == "__main__":
 
                     with open(filename, 'a') as f:
                         f.write(json.dumps(round_results) + '\n')
+
+                    if global_worse >= global_patience:
+                        logging.info(f"Early stopping triggered at round {round_idx + 1}.")
+                        break
 
                 if model_type == "hybrid":
                     file_path = f'Checkpoint/LatentData/{network_size}/{no_Exp}/Run_{run}/latent_{model_type}_{update_type}.pkl'
