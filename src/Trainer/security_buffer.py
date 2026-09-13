@@ -99,20 +99,20 @@ class SecurityBuffer:
         if sim >= tau_sim and arrival_time <= self.latency_threshold and val_loss_variance <= self.max_variance_threshold:
             update_obj["weight_factor"] = 1.0
             logging.info(f"[Security Gate] Client {client_id} -> DIRECT (Sim: {sim:.4f} >= {tau_sim:.4f}, Latency: {arrival_time:.2f}s <= {self.latency_threshold}s)")
-            return "DIRECT", sim, update_obj
+            return "DIRECT", sim, tau_sim, update_obj  # <-- tau_sim add kora holo
 
-        # Rule 2: Sim >= tau_sim and Arrival time > Latency -> Time Buffer
+        # Rule 2: TIME BUFFER
         elif sim >= tau_sim and arrival_time > self.latency_threshold:
             update_obj["weight_factor"] = self.alpha
             self.time_buffer_queue.append(update_obj)
             logging.info(f"[Security Gate] Client {client_id} -> TIME BUFFER (Sim: {sim:.4f} >= {tau_sim:.4f}, Latency: {arrival_time:.2f}s > {self.latency_threshold}s)")
-            return "TIME_BUFFER", sim, update_obj
+            return "TIME_BUFFER", sim, tau_sim, update_obj  # <-- tau_sim add kora holo
 
-        # Rule 3: Sim < tau_sim or High Variance -> Quarantine
+        # Rule 3: QUARANTINE
         else:
             update_obj["weight_factor"] = self.beta
             logging.warning(f"[Security Gate] Client {client_id} -> QUARANTINE (Sim: {sim:.4f} < {tau_sim:.4f} or Variance High: {val_loss_variance:.4f})")
-            return "QUARANTINE", sim, update_obj
+            return "QUARANTINE", sim, tau_sim, update_obj
 
     def evaluate_quarantine_update(self, update_obj, global_model, val_loader, criterion, device="cpu"):
         """
