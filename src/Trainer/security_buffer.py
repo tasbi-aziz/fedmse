@@ -40,7 +40,7 @@ class SecurityBuffer:
         :param mse_diff_threshold: Maximum allowed |MSE_i - MSE_g| in Quarantine
         """
         self.latency_threshold = latency_threshold
-        self.T = similarity_threshold_T
+        self.T = base_similarity_threshold
         self.alpha = alpha
         self.beta = beta
         self.mse_diff_threshold = mse_diff_threshold
