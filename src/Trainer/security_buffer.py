@@ -21,13 +21,13 @@ class SecurityBuffer:
         self, 
         global_model=None, 
         window_size=5, 
-        time_buffer_seconds=20.0, 
+        latency_threshold=20.0, 
         base_similarity_threshold=0.65, 
         max_variance_threshold=0.05
     ):
         self.global_model = global_model
         self.window_size = window_size
-        self.time_buffer_seconds = time_buffer_seconds
+        self.latency_threshold = latency_threshold
         self.base_similarity_threshold = base_similarity_threshold
         self.max_variance_threshold = max_variance_threshold
         
