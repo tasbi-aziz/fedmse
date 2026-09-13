@@ -38,9 +38,10 @@ class SecurityBuffer:
         self.beta = beta
         self.mse_diff_threshold = mse_diff_threshold
         
-        # Staging Queues for Next Round Aggregation
+        # Staging Queues for Aggregation
         self.time_buffer_queue = []
-        self.quarantine_pass_queue = []
+        self.quarantine_queue = []       # Staging queue for raw quarantine items
+        self.quarantine_pass_queue = []  # Staging queue for items that passed quarantine validation
 
     def _flatten_state_dict(self, state_dict):
         """Flattens PyTorch state dict into a 1D Tensor."""
@@ -95,22 +96,23 @@ class SecurityBuffer:
             "tau_sim": tau_sim
         }
 
-        # Rule 1: Sim >= tau_sim, Arrival time <= Latency, and Variance <= Threshold -> Direct Aggregation
+        # Rule 1: Direct Aggregation
         if sim >= tau_sim and arrival_time <= self.latency_threshold and val_loss_variance <= self.max_variance_threshold:
             update_obj["weight_factor"] = 1.0
             logging.info(f"[Security Gate] Client {client_id} -> DIRECT (Sim: {sim:.4f} >= {tau_sim:.4f}, Latency: {arrival_time:.2f}s <= {self.latency_threshold}s)")
-            return "DIRECT", sim, tau_sim, update_obj  # <-- tau_sim add kora holo
+            return "DIRECT", sim, tau_sim, update_obj
 
         # Rule 2: TIME BUFFER
         elif sim >= tau_sim and arrival_time > self.latency_threshold:
             update_obj["weight_factor"] = self.alpha
             self.time_buffer_queue.append(update_obj)
             logging.info(f"[Security Gate] Client {client_id} -> TIME BUFFER (Sim: {sim:.4f} >= {tau_sim:.4f}, Latency: {arrival_time:.2f}s > {self.latency_threshold}s)")
-            return "TIME_BUFFER", sim, tau_sim, update_obj  # <-- tau_sim add kora holo
+            return "TIME_BUFFER", sim, tau_sim, update_obj
 
         # Rule 3: QUARANTINE
         else:
             update_obj["weight_factor"] = self.beta
+            self.quarantine_queue.append(update_obj)
             logging.warning(f"[Security Gate] Client {client_id} -> QUARANTINE (Sim: {sim:.4f} < {tau_sim:.4f} or Variance High: {val_loss_variance:.4f})")
             return "QUARANTINE", sim, tau_sim, update_obj
 
@@ -166,6 +168,30 @@ class SecurityBuffer:
             self.quarantine_pass_queue.append(update_obj)
             return True, avg_mse_i, avg_mse_g
 
+    def process_quarantine_validation(self, global_model, val_loader, criterion, device="cpu", quarantine_list=None):
+        """
+        Validates updates sitting in quarantine.
+        Returns a list of updates that passed inspection.
+        """
+        released_updates = []
+        targets = quarantine_list if quarantine_list is not None else self.quarantine_queue
+
+        for update_obj in list(targets):
+            passed, avg_mse_i, avg_mse_g = self.evaluate_quarantine_update(
+                update_obj=update_obj,
+                global_model=global_model,
+                val_loader=val_loader,
+                criterion=criterion,
+                device=device
+            )
+            if passed:
+                released_updates.append(update_obj)
+
+        if quarantine_list is None:
+            self.quarantine_queue.clear()
+
+        return released_updates
+
     def collect_current_round_updates(self, incoming_updates, global_model, val_loader, criterion, device="cpu"):
         """
         Executes routing, quarantine inspection, and returns ready updates for current round aggregation.
@@ -187,13 +213,19 @@ class SecurityBuffer:
         for update in incoming_updates:
             cid = update["client_id"]
             w = update["weights"]
-            arr_time = update["arrival_time"]
+            arr_time = update.get("arrival_time", 0.0)
+            d_size = update.get("dataset_size", None)
+            n_avg = update.get("n_avg", 1.0)
+            var_loss = update.get("val_loss_variance", 0.0)
 
-            route, sim, update_obj = self.evaluate_and_route_update(
+            route, sim, tau_sim, update_obj = self.evaluate_and_route_update(
                 client_id=cid, 
                 local_model_state=w, 
                 arrival_time=arr_time, 
-                global_model_state=global_state
+                global_model_state=global_state,
+                dataset_size=d_size,
+                n_avg=n_avg,
+                val_loss_variance=var_loss
             )
 
             if route == "DIRECT":
