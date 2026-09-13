@@ -319,14 +319,14 @@ if __name__ == "__main__":
                         arrival_time = client['sim_train_time'] + client['sim_comm_time']
 
                         # --- SECURITY GATE EVALUATION ---
-                        route_status, current_sim, tau_sim = sec_buffer_tracker.evaluate_and_route_update(
-                            client_id=client['device'],
-                            local_model_state=raw_weights,
-                            dataset_size=sample_count,
-                            arrival_time=arrival_time,
-                            n_avg=n_avg,
-                            val_loss_variance=client_val_variance
-                        )
+                        route_status, current_sim, tau_sim, update_obj = sec_buffer_tracker.evaluate_and_route_update(
+                           client_id=client['device'],
+                           local_model_state=raw_weights,
+                           dataset_size=sample_count,
+                           arrival_time=arrival_time,
+                           n_avg=n_avg,
+                           val_loss_variance=client_val_variance
+                           )
 
                         # Instant Asynchronous Aggregation
                         if route_status == "DIRECT_PATH":
