@@ -67,7 +67,7 @@ def set_seeds(seed):
 def real_evaluator_fn(candidate_model, val_loader, device="cpu", model_template=None):
     """
     Autoencoder-এর আসল Reconstruction MSE Loss বের করার সঠিক Evaluator Function।
-    candidate_model যদি state_dict হয়, তবে model_template দিয়ে তা লোড করে মাপা হবে।
+    candidate_model যদি state_dict হয়, তবে model_template দিয়ে তা লোড করে মাপা হবে।
     """
     if candidate_model is None or val_loader is None:
         return float("inf")
@@ -206,7 +206,7 @@ if __name__ == "__main__":
             "sim_comm_time": dev.get("simulated_comm_time", 0.5)
         })
 
-    # Server Global Validation Set তৈরি (সব ক্লায়েন্টের valid_loader একসাথে কনক্যাট করে)
+    # Server Global Validation Set তৈরি
     server_val_dataset = ConcatDataset([client['valid_loader'].dataset for client in client_info])
     server_val_loader = DataLoader(dataset=server_val_dataset, batch_size=batch_size, shuffle=False)
 
@@ -226,8 +226,7 @@ if __name__ == "__main__":
                 min_val_loss = float("inf")
 
                 directory = f'Checkpoint/Results/Update/{network_size}/{no_Exp}/Run_{run}/{metric}'
-                if not os.path.exists(directory):
-                    os.makedirs(directory)
+                os.makedirs(directory, exist_ok=True)
 
                 filename = f'{directory}/{scen_name}_{num_participants}_{model_type}_{update_type}_results.json'
                 open(filename, 'w').close()
@@ -340,18 +339,18 @@ if __name__ == "__main__":
                         elif route_status == "QUARANTINE":
                             logging.info(f"Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
 
-                        # Quarantine Validation with real MSE Evaluator
-                        released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
-                            evaluator_fn=lambda m: real_evaluator_fn(m, server_val_loader, device, model_template=global_model),
-                            validation_loader=server_val_loader
-                        )
+                    # Quarantine Validation (Processed once per round after all client updates)
+                    released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
+                        evaluator_fn=lambda m: real_evaluator_fn(m, server_val_loader, device, model_template=global_model),
+                        validation_loader=server_val_loader
+                    )
 
-                        if released_quarantine_updates:
-                            logging.info(f"Merging {len(released_quarantine_updates)} verified updates from QUARANTINE.")
-                            global_aggregator.aggregate(
-                                client_models=released_quarantine_updates,
-                                client_losses=None
-                            )
+                    if released_quarantine_updates:
+                        logging.info(f"Merging {len(released_quarantine_updates)} verified updates from QUARANTINE.")
+                        global_aggregator.aggregate(
+                            client_models=released_quarantine_updates,
+                            client_losses=None
+                        )
 
                     # Compute real Global Loss after round updates
                     current_global_loss = real_evaluator_fn(
