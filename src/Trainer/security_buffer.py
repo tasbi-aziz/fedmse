@@ -26,23 +26,13 @@ class SecurityBuffer:
         max_variance_threshold=0.05,
         alpha=0.2,
         beta=0.01,
-        mse_diff_threshold= 0.05
+        mse_diff_threshold=0.05
     ):
         self.global_model = global_model
         self.window_size = window_size
         self.latency_threshold = latency_threshold
         self.base_similarity_threshold = base_similarity_threshold
         self.max_variance_threshold = max_variance_threshold
-        
-        # Apnar security buffer-er baki variables thakle oigulo niche thakbe...
-        """
-        :param latency_threshold: Fixed latency cutoff (e.g., 0.5s or 0.27s)
-        :param similarity_threshold_T: Minimum Cosine Similarity threshold (T)
-        :param alpha: Trust weight for Time Buffer updates in the next round
-        :param beta: Trust weight for Quarantine passed updates in the next round
-        :param mse_diff_threshold: Maximum allowed |MSE_i - MSE_g| in Quarantine
-        """
-        self.latency_threshold = latency_threshold
         self.T = base_similarity_threshold
         self.alpha = alpha
         self.beta = beta
@@ -74,34 +64,54 @@ class SecurityBuffer:
         cosine_sim = torch.dot(vec_local, vec_global) / (norm_local * norm_global)
         return float(cosine_sim.item())
 
-    def evaluate_and_route_update(self, client_id, local_model_state, arrival_time, global_model_state):
+    def evaluate_and_route_update(
+        self, 
+        client_id, 
+        local_model_state, 
+        arrival_time=0.0, 
+        global_model_state=None,
+        dataset_size=None,
+        n_avg=1.0,
+        val_loss_variance=0.0
+    ):
         """
-        Evaluates incoming client update based on Cosine Sim and Arrival Latency.
+        Evaluates incoming client update based on Cosine Sim, Arrival Latency, and Variance.
         """
+        if global_model_state is None and self.global_model is not None:
+            global_model_state = self.global_model.state_dict()
+
         sim = self.calculate_cosine_similarity(local_model_state, global_model_state)
+
+        # Dynamic similarity threshold calculation based on dataset size
+        if dataset_size is not None and n_avg > 0:
+            tau_sim = self.T * (dataset_size / n_avg)
+        else:
+            tau_sim = self.T
+
         update_obj = {
             "client_id": client_id,
             "weights": copy.deepcopy(local_model_state),
-            "weight_factor": 1.0
+            "weight_factor": 1.0,
+            "tau_sim": tau_sim
         }
 
-        # Rule 1: Sim >= T and Arrival time <= Latency -> Direct Aggregation (Fast & Clean)
-        if sim >= self.T and arrival_time <= self.latency_threshold:
+        # Rule 1: Sim >= tau_sim, Arrival time <= Latency, and Variance <= Threshold -> Direct Aggregation
+        if sim >= tau_sim and arrival_time <= self.latency_threshold and val_loss_variance <= self.max_variance_threshold:
             update_obj["weight_factor"] = 1.0
-            logging.info(f"[Security Gate] Client {client_id} -> DIRECT (Sim: {sim:.4f} >= {self.T}, Latency: {arrival_time:.2f}s <= {self.latency_threshold}s)")
+            logging.info(f"[Security Gate] Client {client_id} -> DIRECT (Sim: {sim:.4f} >= {tau_sim:.4f}, Latency: {arrival_time:.2f}s <= {self.latency_threshold}s)")
             return "DIRECT", sim, update_obj
 
-        # Rule 2: Sim >= T and Arrival time > Latency -> Time Buffer (Slow & Clean)
-        elif sim >= self.T and arrival_time > self.latency_threshold:
+        # Rule 2: Sim >= tau_sim and Arrival time > Latency -> Time Buffer
+        elif sim >= tau_sim and arrival_time > self.latency_threshold:
             update_obj["weight_factor"] = self.alpha
             self.time_buffer_queue.append(update_obj)
-            logging.info(f"[Security Gate] Client {client_id} -> TIME BUFFER (Sim: {sim:.4f} >= {self.T}, Latency: {arrival_time:.2f}s > {self.latency_threshold}s)")
+            logging.info(f"[Security Gate] Client {client_id} -> TIME BUFFER (Sim: {sim:.4f} >= {tau_sim:.4f}, Latency: {arrival_time:.2f}s > {self.latency_threshold}s)")
             return "TIME_BUFFER", sim, update_obj
 
-        # Rule 3: Sim < T -> Quarantine (Anomaly / Malicious)
+        # Rule 3: Sim < tau_sim or High Variance -> Quarantine
         else:
             update_obj["weight_factor"] = self.beta
-            logging.warning(f"[Security Gate] Client {client_id} -> QUARANTINE (Sim: {sim:.4f} < {self.T})")
+            logging.warning(f"[Security Gate] Client {client_id} -> QUARANTINE (Sim: {sim:.4f} < {tau_sim:.4f} or Variance High: {val_loss_variance:.4f})")
             return "QUARANTINE", sim, update_obj
 
     def evaluate_quarantine_update(self, update_obj, global_model, val_loader, criterion, device="cpu"):
@@ -179,7 +189,12 @@ class SecurityBuffer:
             w = update["weights"]
             arr_time = update["arrival_time"]
 
-            route, sim, update_obj = self.evaluate_and_route_update(cid, w, arr_time, global_state)
+            route, sim, update_obj = self.evaluate_and_route_update(
+                client_id=cid, 
+                local_model_state=w, 
+                arrival_time=arr_time, 
+                global_model_state=global_state
+            )
 
             if route == "DIRECT":
                 current_round_pool.append(update_obj)
