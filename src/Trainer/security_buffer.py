@@ -26,7 +26,7 @@ class SecurityBuffer:
         max_variance_threshold=0.05,
         alpha=0.2,
         beta=0.01,
-        mse_diff_threshold=0.05
+        mse_diff_threshold=0.003
     ):
         self.global_model = global_model
         self.window_size = window_size
