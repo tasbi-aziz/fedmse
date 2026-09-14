@@ -32,9 +32,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 num_participants = 1.0
 epoch = 10
 num_rounds = 10
-lr_rate = 1e-6
-shrink_dim = 16       # Latent bottleneck dimension
-threshold_val = 0.2   # Threshold for shrinkage operator
+lr_rate = 1e-4          # [UPDATE] 1e-6 থেকে বাড়িয়ে 1e-4 করা হয়েছে (দ্রুত লার্নিংয়ের জন্য)
+shrink_dim = 16         # Latent bottleneck dimension
+threshold_val = 0.2     # Threshold for shrinkage operator
 network_size = 10
 data_seed = 1234
 
@@ -51,7 +51,7 @@ min_val_loss = float("inf")
 global_patience = 5
 global_worse = 0
 metric = "AUC"
-dim_features = 115   # nba-iot: 115; cic-2023: 46
+dim_features = 64       # [UPDATE] ফিচার সংখ্যা ৬৪ তে সেট করা হয়েছে (64 -> 32 -> 16 লেয়ারের সাথে মিল রাখতে)
 
 scen_name = 'FL-IoT'
 config_file = "/content/fedmse/Configuration/scen2-nba-iot-10clients.json"
@@ -165,8 +165,15 @@ if __name__ == "__main__":
         dev_normal_data = normal_data[train_normal_size + valid_normal_size:train_normal_size + valid_normal_size + dev_normal_size]
         test_normal_data = normal_data[train_normal_size + valid_normal_size + dev_normal_size:]
 
-        data_processor = IoTDataProccessor(scaler="standard")
-        processed_train_data, train_label = data_processor.fit_transform(train_normal_data)
+        # [UPDATE] Feature Selection সহ DataProcessor ইনিশিয়ালাইজেশন (৬৪টি ফিচার সিলেক্ট করবে)
+        data_processor = IoTDataProccessor(scaler="standard", use_log_transform=True, n_selected_features=64)
+        
+        # [UPDATE] fit_transform এ abnormal_dataframe যুক্ত করা হয়েছে
+        processed_train_data, train_label = data_processor.fit_transform(train_normal_data, abnormal_dataframe=abnormal_data)
+        
+        # ডাইনামিকভাবে ফিচার সাইজ ৬৪ নিশ্চিত করা
+        dim_features = processed_train_data.shape[1]
+
         processed_valid_data, valid_label = data_processor.transform(valid_normal_data)
         processed_test_data, test_label = data_processor.transform(test_normal_data)
         processed_abnormal_data, abnormal_label = data_processor.transform(abnormal_data, type="abnormal")
@@ -227,7 +234,7 @@ if __name__ == "__main__":
                 filename = f'{directory}/{scen_name}_{num_participants}_{model_type}_{update_type}_results.json'
                 open(filename, 'w').close()
 
-                # Model Initialization
+                # Model Initialization (ইনপুট এখন ডাইনামিক ৬৪ ফিচারের হবে)
                 if model_type == "hybrid":
                     global_model = Shrink_Autoencoder(
                         input_dim=dim_features,
