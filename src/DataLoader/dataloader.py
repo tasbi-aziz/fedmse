@@ -1,24 +1,19 @@
 """
-This is a PyTorch dataloader for training and evaluating a model.
-@author
-- Van Tuan Nguyen (vantuan.nguyen@lqdtu.edu.vn)
-- Razvan Beuran (razvan@jaist.ac.jp)
-@create date 2023-12-11 00:28:29
-@modify date 2023-12-11 00:28:29
+PyTorch dataloader for training and evaluating models.
+Updated with safe feature selection bounds and character cleaning.
 """
 
 import os
+import logging
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif
 from torch.utils.data import DataLoader, Dataset
 
-import logging
+# Configure logging module
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Configure the logging module
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 def load_data(path, header=None):
     dataframe = []
@@ -43,7 +38,7 @@ def load_data(path, header=None):
         raise FileNotFoundError(f"🚨 Error: Data folder could not be found or is empty at: {path}")
 
     for file in os.listdir(path):
-        if ".csv" in file:
+        if file.endswith(".csv"):
             filename = os.path.join(path, file)
             logging.info(f"Loading {filename}")
             dataframe.append(pd.read_csv(filename, header=header))
@@ -57,16 +52,11 @@ def load_data(path, header=None):
 
 class IoTDataProccessor(object):
     def __init__(self, scaler="standard", use_log_transform=True, n_selected_features=None, threshold=0.01):
-        """
-        n_selected_features: কাস্টম ফিচার সংখ্যা (যেমন: 40)। যদি দেওয়া না হয়, VarianceThreshold কাজ করবে।
-        threshold: কত কম ভ্যারিয়েন্সের ফিচার বাদ দেওয়া হবে (যেমন: 0.01)।
-        """
         self.scaler_type = scaler
         self.use_log_transform = use_log_transform
         self.n_selected_features = n_selected_features
         self.threshold = threshold
         
-        # Scaling ইনিশিয়ালাইজেশন
         if scaler == "standard":
             self.scaler = StandardScaler()
         elif scaler == "minmax":
@@ -74,11 +64,7 @@ class IoTDataProccessor(object):
         else:
             raise ValueError(f"Unknown scaler type: {scaler}. Use 'standard' or 'minmax'.")
 
-        # Feature Selector ইনিশিয়ালাইজেশন
-        if self.n_selected_features is not None:
-            self.selector = SelectKBest(score_func=f_classif, k=self.n_selected_features)
-        else:
-            self.selector = VarianceThreshold(threshold=self.threshold)
+        self.selector = None
 
     def _apply_log_transform(self, dataframe):
         """Applies log(1 + x) transformation to smooth high-variance features."""
@@ -94,41 +80,43 @@ class IoTDataProccessor(object):
         return np.log1p(clipped_values)
 
     def fit_transform(self, dataframe, abnormal_dataframe=None):
-        """
-        নরমাল ট্রেনিং ডেটা দিয়ে Scaler এবং Feature Selector ফিট করবে।
-        """
+        """Fits Scaler and Feature Selector on normal/abnormal client training data."""
         transformed_input = self._apply_log_transform(dataframe)
         
         # 1. Scaler Fit & Transform
         processed_data = self.scaler.fit_transform(transformed_input)
         
         # 2. Feature Selector Fit
-        if self.n_selected_features is not None and abnormal_dataframe is not None:
-            # SelectKBest এর জন্য নরমাল ও অ্যাবনরমাল ডেটা মিলিয়ে Selector ফিট করা
-            trans_abnormal = self._apply_log_transform(abnormal_dataframe)
-            proc_abnormal = self.scaler.transform(trans_abnormal)
-            
-            x_sample = np.vstack([processed_data, proc_abnormal])
-            y_sample = np.hstack([np.zeros(len(processed_data)), np.ones(len(proc_abnormal))])
-            self.selector.fit(x_sample, y_sample)
+        if self.n_selected_features is not None:
+            total_features = processed_data.shape[1]
+            actual_k = min(self.n_selected_features, total_features)
+            self.selector = SelectKBest(score_func=f_classif, k=actual_k)
+
+            if abnormal_dataframe is not None:
+                trans_abnormal = self._apply_log_transform(abnormal_dataframe)
+                proc_abnormal = self.scaler.transform(trans_abnormal)
+                
+                x_sample = np.vstack([processed_data, proc_abnormal])
+                y_sample = np.hstack([np.zeros(len(processed_data)), np.ones(len(proc_abnormal))])
+                self.selector.fit(x_sample, y_sample)
+            else:
+                dummy_y = np.zeros(len(processed_data))
+                self.selector.fit(processed_data, dummy_y)
         else:
-            # VarianceThreshold এর জন্য শুধু নরমাল ডেটা দিয়ে ফিট
+            self.selector = VarianceThreshold(threshold=self.threshold)
             self.selector.fit(processed_data)
 
-        # 3. Feature Selection প্রয়োগ
+        # 3. Apply Feature Selection
         processed_data = self.selector.transform(processed_data)
         
         label = [0 for _ in range(len(dataframe))]
         return processed_data, np.array(label)
 
     def transform(self, dataframe, type="normal"):
-        """
-        ভ্যালিডেশন বা টেস্ট ডেটাকে একই Scaler ও Selector দিয়ে ট্রান্সফর্ম করবে।
-        """
+        """Transforms validation or test data using fitted Scaler and Selector."""
         transformed_input = self._apply_log_transform(dataframe)
         processed_data = self.scaler.transform(transformed_input)
         
-        # Feature Selection প্রয়োগ
         if self.selector is not None:
             processed_data = self.selector.transform(processed_data)
         
@@ -156,9 +144,7 @@ class IoTDataProccessor(object):
 
 
 class IoTDataset(Dataset):
-    """
-    A custom PyTorch Dataset class for the N-BAIoT dataset.
-    """
+    """Custom PyTorch Dataset class for N-BAIoT data."""
     
     def __init__(self, data, label):
         self.data = data
@@ -175,3 +161,7 @@ class IoTDataset(Dataset):
     @property
     def input_dim_(self):
         return self.data.shape[1]
+
+
+# Alias for clean spelling compatibility
+IoTDataProcessor = IoTDataProccessor
