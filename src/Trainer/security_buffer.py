@@ -24,8 +24,8 @@ class SecurityBuffer:
         base_similarity_threshold=0.65,
         max_variance_threshold=0.05,
         alpha=0.2,
-        beta=0.01,
-        mse_diff_threshold=0.003,
+        beta=0.1,
+        mse_diff_threshold=0.01,
         variance_weight=0.5,
         **kwargs
     ):
