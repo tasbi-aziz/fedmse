@@ -1,15 +1,14 @@
 """
-Security Buffer & Quarantine Module for FedMSE.
+Security Buffer & Quarantine Module for FedMSE (Updated - Loss & Variance Based Routing).
 Implements 3-Way Routing:
-1. Direct Aggregation: Sim >= T and Arrival <= Latency (Fast & Clean)
-2. Time Buffer: Sim >= T and Arrival > Latency (Slow & Clean, aggregated in next round with alpha)
-3. Quarantine: Sim < T (Anomaly check via |MSE_i - MSE_g|, aggregated in next round with beta if passed)
+1. Direct Aggregation: |MSE_i - MSE_g| <= T, Variance <= Max_Var, Arrival <= Latency (Fast & Clean, weight_factor = 1.0)
+2. Time Buffer: |MSE_i - MSE_g| <= T, Variance <= Max_Var, Arrival > Latency (Slow & Clean, aggregated in next round with alpha)
+3. Quarantine: |MSE_i - MSE_g| > T or Variance > Max_Var (Suspicious Update -> Secondary Validation on Server Dev Set)
 """
 
 import copy
 import logging
 import torch
-import torch.nn.functional as F
 import numpy as np
 
 # Configure logging module
@@ -20,112 +19,105 @@ class SecurityBuffer:
     def __init__(
         self, 
         global_model=None, 
-        window_size=5, 
         latency_threshold=20.0, 
-        base_similarity_threshold=0.65, 
         max_variance_threshold=0.05,
         alpha=0.2,
         beta=0.01,
-        mse_diff_threshold=0.003
+        mse_diff_threshold=0.003,
+        variance_weight=0.5
     ):
         self.global_model = global_model
-        self.window_size = window_size
         self.latency_threshold = latency_threshold
-        self.base_similarity_threshold = base_similarity_threshold
         self.max_variance_threshold = max_variance_threshold
-        self.T = base_similarity_threshold
         self.alpha = alpha
         self.beta = beta
         self.mse_diff_threshold = mse_diff_threshold
+        self.variance_weight = variance_weight
         
         # Staging Queues for Aggregation
         self.time_buffer_queue = []
         self.quarantine_queue = []       # Staging queue for raw quarantine items
         self.quarantine_pass_queue = []  # Staging queue for items that passed quarantine validation
 
-    def _flatten_state_dict(self, state_dict):
-        """Flattens PyTorch state dict into a 1D Tensor."""
-        tensors = []
-        for key in sorted(state_dict.keys()):
-            if isinstance(state_dict[key], torch.Tensor):
-                tensors.append(state_dict[key].detach().cpu().float().flatten())
-        return torch.cat(tensors)
-
-    def calculate_cosine_similarity(self, local_state, global_state):
-        """Calculates cosine similarity between local weights and global weights (W0)."""
-        vec_local = self._flatten_state_dict(local_state)
-        vec_global = self._flatten_state_dict(global_state)
-        
-        norm_local = torch.norm(vec_local)
-        norm_global = torch.norm(vec_global)
-        
-        if norm_local == 0 or norm_global == 0:
-            return 0.0
-            
-        cosine_sim = torch.dot(vec_local, vec_global) / (norm_local * norm_global)
-        return float(cosine_sim.item())
+    def calculate_client_score(self, val_loss: float, val_variance: float) -> float:
+        """Client Stability Score: Loss + (variance_weight * Variance). Lower is better."""
+        return val_loss + (self.variance_weight * val_variance)
 
     def evaluate_and_route_update(
         self, 
         client_id, 
         local_model_state, 
         arrival_time=0.0, 
-        global_model_state=None,
-        dataset_size=None,
-        n_avg=1.0,
-        val_loss_variance=0.0
+        val_loss=0.0,
+        val_loss_variance=0.0,
+        global_mse=0.0,
+        **kwargs
     ):
         """
-        Evaluates incoming client update based on Cosine Sim, Arrival Latency, and Variance.
+        Evaluates incoming client update based on MSE Difference from Global Loss, 
+        Arrival Latency, and Local Loss Variance.
         """
-        if global_model_state is None and self.global_model is not None:
-            global_model_state = self.global_model.state_dict()
-
-        sim = self.calculate_cosine_similarity(local_model_state, global_model_state)
-
-        # Dynamic similarity threshold calculation based on dataset size
-        if dataset_size is not None and n_avg > 0:
-            tau_sim = self.T * (dataset_size / n_avg)
-        else:
-            tau_sim = self.T
+        loss_diff = abs(val_loss - global_mse)
+        score = self.calculate_client_score(val_loss, val_loss_variance)
 
         update_obj = {
             "client_id": client_id,
             "weights": copy.deepcopy(local_model_state),
             "weight_factor": 1.0,
-            "tau_sim": tau_sim
+            "val_loss": val_loss,
+            "val_loss_variance": val_loss_variance,
+            "loss_diff": loss_diff,
+            "score": score
         }
 
-        # Rule 1: Direct Aggregation
-        if sim >= tau_sim and arrival_time <= self.latency_threshold and val_loss_variance <= self.max_variance_threshold:
+        # Rule 1: DIRECT AGGREGATION
+        # MSE Diff <= threshold, Variance <= max_variance, and Arrived on time
+        if (loss_diff <= self.mse_diff_threshold and 
+            val_loss_variance <= self.max_variance_threshold and 
+            arrival_time <= self.latency_threshold):
+            
             update_obj["weight_factor"] = 1.0
-            logging.info(f"[Security Gate] Client {client_id} -> DIRECT (Sim: {sim:.4f} >= {tau_sim:.4f}, Latency: {arrival_time:.2f}s <= {self.latency_threshold}s)")
-            return "DIRECT", sim, tau_sim, update_obj
+            logging.info(
+                f"[Security Gate] Client {client_id} -> DIRECT "
+                f"(Diff: {loss_diff:.4f} <= {self.mse_diff_threshold}, Var: {val_loss_variance:.4f}, Latency: {arrival_time:.2f}s)"
+            )
+            return "DIRECT", loss_diff, update_obj
 
         # Rule 2: TIME BUFFER
-        elif sim >= tau_sim and arrival_time > self.latency_threshold:
+        # MSE Diff <= threshold & Low Variance, BUT Arrived Late
+        elif (loss_diff <= self.mse_diff_threshold and 
+              val_loss_variance <= self.max_variance_threshold and 
+              arrival_time > self.latency_threshold):
+            
             update_obj["weight_factor"] = self.alpha
             self.time_buffer_queue.append(update_obj)
-            logging.info(f"[Security Gate] Client {client_id} -> TIME BUFFER (Sim: {sim:.4f} >= {tau_sim:.4f}, Latency: {arrival_time:.2f}s > {self.latency_threshold}s)")
-            return "TIME_BUFFER", sim, tau_sim, update_obj
+            logging.info(
+                f"[Security Gate] Client {client_id} -> TIME BUFFER "
+                f"(Diff: {loss_diff:.4f} <= {self.mse_diff_threshold}, Latency: {arrival_time:.2f}s > {self.latency_threshold}s)"
+            )
+            return "TIME_BUFFER", loss_diff, update_obj
 
         # Rule 3: QUARANTINE
+        # MSE Diff too high or High Variance (Suspicious Model Update)
         else:
             update_obj["weight_factor"] = self.beta
             self.quarantine_queue.append(update_obj)
-            logging.warning(f"[Security Gate] Client {client_id} -> QUARANTINE (Sim: {sim:.4f} < {tau_sim:.4f} or Variance High: {val_loss_variance:.4f})")
-            return "QUARANTINE", sim, tau_sim, update_obj
+            logging.warning(
+                f"[Security Gate] Client {client_id} -> QUARANTINE "
+                f"(Diff: {loss_diff:.4f} > {self.mse_diff_threshold} or High Var: {val_loss_variance:.4f})"
+            )
+            return "QUARANTINE", loss_diff, update_obj
 
     def evaluate_quarantine_update(self, update_obj, global_model, val_loader, criterion, device="cpu"):
         """
         Quarantine Inspection:
-        Calculates MSE(i) for local weights and MSE(g) for global weights on val_sample_dataset.
-        Drops update if |MSE(i) - MSE(g)| > threshold, otherwise stores for next round aggregation.
+        Calculates MSE(i) for quarantined weights and MSE(g) for global weights on central dev set.
+        Drops update if |MSE(i) - MSE(g)| > threshold, otherwise stashes for next round with beta weight factor.
         """
         client_id = update_obj["client_id"]
         weights = update_obj["weights"]
 
-        # Temporary model for local weight evaluation
+        # Temporary model for local weight evaluation on server validation loader
         local_model = copy.deepcopy(global_model)
         local_model.load_state_dict(weights)
         
@@ -138,11 +130,17 @@ class SecurityBuffer:
         mse_g_list = []
 
         with torch.no_grad():
-            for batch_x, _ in val_loader:
-                batch_x = batch_x.to(device)
+            for batch in val_loader:
+                batch_x = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
                 
                 out_i = local_model(batch_x)
                 out_g = global_model(batch_x)
+
+                # Autoencoder output handling (if tuple returned)
+                if isinstance(out_i, (tuple, list)):
+                    out_i = out_i[0]
+                if isinstance(out_g, (tuple, list)):
+                    out_g = out_g[0]
 
                 mse_i = criterion(out_i, batch_x).item()
                 mse_g = criterion(out_g, batch_x).item()
@@ -163,7 +161,7 @@ class SecurityBuffer:
         else:
             logging.info(
                 f"[Quarantine Check] Client {client_id} PASSED! "
-                f"|MSE_i ({avg_mse_i:.4f}) - MSE_g ({avg_mse_g:.4f})| = {mse_diff:.4f} <= {self.mse_diff_threshold}. Stash for next round with beta={self.beta}."
+                f"|MSE_i ({avg_mse_i:.4f}) - MSE_g ({avg_mse_g:.4f})| = {mse_diff:.4f} <= {self.mse_diff_threshold}. Stashed with beta={self.beta}."
             )
             self.quarantine_pass_queue.append(update_obj)
             return True, avg_mse_i, avg_mse_g
@@ -175,23 +173,16 @@ class SecurityBuffer:
         criterion=None, 
         device="cpu", 
         quarantine_list=None,
-        evaluator_fn=None,
         validation_loader=None,
         **kwargs
     ):
-        """
-        Validates updates sitting in quarantine queue.
-        Supports both direct parameters and main.py keyword parameters.
-        """
-        # Map validation_loader to val_loader
+        """Validates updates sitting in quarantine queue using server dev set."""
         if val_loader is None and validation_loader is not None:
             val_loader = validation_loader
 
-        # Fallback for global_model
         if global_model is None:
             global_model = self.global_model
 
-        # Fallback for criterion
         if criterion is None:
             criterion = torch.nn.MSELoss()
 
@@ -213,7 +204,8 @@ class SecurityBuffer:
             self.quarantine_queue.clear()
 
         return released_updates
-    def collect_current_round_updates(self, incoming_updates, global_model, val_loader, criterion, device="cpu"):
+
+    def collect_current_round_updates(self, incoming_updates, global_model, val_loader, criterion, global_mse=0.0, device="cpu"):
         """
         Executes routing, quarantine inspection, and returns ready updates for current round aggregation.
         """
@@ -225,28 +217,25 @@ class SecurityBuffer:
         for item in self.quarantine_pass_queue:
             current_round_pool.append(item)
 
-        # Clear queues for next round populating
+        # Clear queues for current round populating
         self.time_buffer_queue.clear()
         self.quarantine_pass_queue.clear()
 
         # 2. Process incoming updates from current round
-        global_state = global_model.state_dict()
         for update in incoming_updates:
             cid = update["client_id"]
             w = update["weights"]
             arr_time = update.get("arrival_time", 0.0)
-            d_size = update.get("dataset_size", None)
-            n_avg = update.get("n_avg", 1.0)
-            var_loss = update.get("val_loss_variance", 0.0)
+            val_loss = update.get("val_loss", 0.0)
+            val_loss_var = update.get("val_loss_variance", 0.0)
 
-            route, sim, tau_sim, update_obj = self.evaluate_and_route_update(
+            route, loss_diff, update_obj = self.evaluate_and_route_update(
                 client_id=cid, 
                 local_model_state=w, 
                 arrival_time=arr_time, 
-                global_model_state=global_state,
-                dataset_size=d_size,
-                n_avg=n_avg,
-                val_loss_variance=var_loss
+                val_loss=val_loss,
+                val_loss_variance=val_loss_var,
+                global_mse=global_mse
             )
 
             if route == "DIRECT":
