@@ -104,6 +104,11 @@ class ClientTrainer:
                     total_loss = reconstruction_loss + (self.fedprox_mu / 2.0) * prox_term
 
                 total_loss.backward()
+
+                # --- STEP 1 FIX: GRADIENT CLIPPING ---
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                # -------------------------------------
+
                 self.optimizer.step()
 
                 running_loss += reconstruction_loss.item()
