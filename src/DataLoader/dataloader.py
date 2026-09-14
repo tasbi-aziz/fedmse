@@ -11,6 +11,7 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif
 from torch.utils.data import DataLoader, Dataset
 
 import logging
@@ -55,16 +56,29 @@ def load_data(path, header=None):
 
 
 class IoTDataProccessor(object):
-    def __init__(self, scaler="standard", use_log_transform=True):
+    def __init__(self, scaler="standard", use_log_transform=True, n_selected_features=None, threshold=0.01):
+        """
+        n_selected_features: কাস্টম ফিচার সংখ্যা (যেমন: 40)। যদি দেওয়া না হয়, VarianceThreshold কাজ করবে।
+        threshold: কত কম ভ্যারিয়েন্সের ফিচার বাদ দেওয়া হবে (যেমন: 0.01)।
+        """
         self.scaler_type = scaler
         self.use_log_transform = use_log_transform
+        self.n_selected_features = n_selected_features
+        self.threshold = threshold
         
+        # Scaling ইনিশিয়ালাইজেশন
         if scaler == "standard":
             self.scaler = StandardScaler()
         elif scaler == "minmax":
             self.scaler = MinMaxScaler((0, 1))
         else:
             raise ValueError(f"Unknown scaler type: {scaler}. Use 'standard' or 'minmax'.")
+
+        # Feature Selector ইনিশিয়ালাইজেশন
+        if self.n_selected_features is not None:
+            self.selector = SelectKBest(score_func=f_classif, k=self.n_selected_features)
+        else:
+            self.selector = VarianceThreshold(threshold=self.threshold)
 
     def _apply_log_transform(self, dataframe):
         """Applies log(1 + x) transformation to smooth high-variance features."""
@@ -76,13 +90,47 @@ class IoTDataProccessor(object):
         else:
             values = np.array(dataframe)
 
-        # Negative noise prevent korar jonno np.maximum(0, values) and log1p -> log(1 + x)
         clipped_values = np.maximum(0, values)
         return np.log1p(clipped_values)
 
+    def fit_transform(self, dataframe, abnormal_dataframe=None):
+        """
+        নরমাল ট্রেনিং ডেটা দিয়ে Scaler এবং Feature Selector ফিট করবে।
+        """
+        transformed_input = self._apply_log_transform(dataframe)
+        
+        # 1. Scaler Fit & Transform
+        processed_data = self.scaler.fit_transform(transformed_input)
+        
+        # 2. Feature Selector Fit
+        if self.n_selected_features is not None and abnormal_dataframe is not None:
+            # SelectKBest এর জন্য নরমাল ও অ্যাবনরমাল ডেটা মিলিয়ে Selector ফিট করা
+            trans_abnormal = self._apply_log_transform(abnormal_dataframe)
+            proc_abnormal = self.scaler.transform(trans_abnormal)
+            
+            x_sample = np.vstack([processed_data, proc_abnormal])
+            y_sample = np.hstack([np.zeros(len(processed_data)), np.ones(len(proc_abnormal))])
+            self.selector.fit(x_sample, y_sample)
+        else:
+            # VarianceThreshold এর জন্য শুধু নরমাল ডেটা দিয়ে ফিট
+            self.selector.fit(processed_data)
+
+        # 3. Feature Selection প্রয়োগ
+        processed_data = self.selector.transform(processed_data)
+        
+        label = [0 for _ in range(len(dataframe))]
+        return processed_data, np.array(label)
+
     def transform(self, dataframe, type="normal"):
+        """
+        ভ্যালিডেশন বা টেস্ট ডেটাকে একই Scaler ও Selector দিয়ে ট্রান্সফর্ম করবে।
+        """
         transformed_input = self._apply_log_transform(dataframe)
         processed_data = self.scaler.transform(transformed_input)
+        
+        # Feature Selection প্রয়োগ
+        if self.selector is not None:
+            processed_data = self.selector.transform(processed_data)
         
         if type == "normal":
             label = [0 for _ in range(len(dataframe))]
@@ -91,12 +139,6 @@ class IoTDataProccessor(object):
             
         return processed_data, np.array(label)
     
-    def fit_transform(self, dataframe):
-        transformed_input = self._apply_log_transform(dataframe)
-        self.scaler = self.scaler.fit(transformed_input)
-        processed_data, label = self.transform(dataframe=dataframe, type="normal")
-        return processed_data, label
-        
     def get_metadata(self):
         if isinstance(self.scaler, StandardScaler):
             metadata = {
