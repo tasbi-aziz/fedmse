@@ -23,16 +23,26 @@ class GlobalAggregator:
         self.model = model
         self.update_type = update_type
 
-    def aggregate(self, client_updates, client_losses=None):
+    def aggregate(self, client_updates=None, client_losses=None, client_models=None, updates=None, **kwargs):
         """
         Aggregates client model updates into the global model.
+        Supports flexible keyword arguments ('client_updates', 'client_models', or 'updates').
         
         :param client_updates: List of client objects from SecurityBuffer 
                                [{"client_id": ..., "weights": state_dict, "weight_factor": factor}, ...]
                                or list of raw PyTorch models/state_dicts.
         :param client_losses: Optional list of validation losses for inverse-loss weighting.
+        :param client_models: Alias for client_updates (for compatibility with main.py calls).
+        :param updates: Alias for client_updates.
         """
-        if not client_updates:
+        # Resolve inputs from all possible keyword arguments
+        target_updates = client_updates
+        if target_updates is None:
+            target_updates = client_models
+        if target_updates is None:
+            target_updates = updates
+
+        if not target_updates:
             logging.warning("[GlobalAggregator] No client updates available for aggregation.")
             return self.model
 
@@ -40,7 +50,7 @@ class GlobalAggregator:
         weight_factors = []
 
         # 1. Unpack weights and trust factors (alpha, beta, 1.0)
-        for item in client_updates:
+        for item in target_updates:
             if isinstance(item, dict) and "weights" in item:
                 # Payload format from SecurityBuffer
                 extracted_states.append(item["weights"])
