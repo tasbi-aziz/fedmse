@@ -74,8 +74,12 @@ class Autoencoder(nn.Module):
     """
     Autoencoder class
     """
-    def __init__(self, input_dim=115, output_dim=115, hidden_neus=64, latent_dim=32):
+    def __init__(self, input_dim=115, output_dim=None, hidden_neus=64, latent_dim=32):
         super(Autoencoder, self).__init__()
+        # output_dim না দিলে তা input_dim এর সমান হবে
+        if output_dim is None:
+            output_dim = input_dim
+
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.encoder = Encoder(input_dim, hidden_neus, latent_dim)
