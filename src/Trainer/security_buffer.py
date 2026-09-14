@@ -19,15 +19,20 @@ class SecurityBuffer:
     def __init__(
         self, 
         global_model=None, 
+        window_size=5,
         latency_threshold=20.0, 
+        base_similarity_threshold=0.65,
         max_variance_threshold=0.05,
         alpha=0.2,
         beta=0.01,
         mse_diff_threshold=0.003,
-        variance_weight=0.5
+        variance_weight=0.5,
+        **kwargs
     ):
         self.global_model = global_model
+        self.window_size = window_size
         self.latency_threshold = latency_threshold
+        self.base_similarity_threshold = base_similarity_threshold
         self.max_variance_threshold = max_variance_threshold
         self.alpha = alpha
         self.beta = beta
@@ -38,6 +43,28 @@ class SecurityBuffer:
         self.time_buffer_queue = []
         self.quarantine_queue = []       # Staging queue for raw quarantine items
         self.quarantine_pass_queue = []  # Staging queue for items that passed quarantine validation
+
+    def _flatten_state_dict(self, state_dict):
+        """Flattens PyTorch state dict into a 1D Tensor."""
+        tensors = []
+        for key in sorted(state_dict.keys()):
+            if isinstance(state_dict[key], torch.Tensor):
+                tensors.append(state_dict[key].detach().cpu().float().flatten())
+        return torch.cat(tensors)
+
+    def calculate_cosine_similarity(self, local_state, global_state):
+        """Calculates cosine similarity between local weights and global weights (kept for compatibility)."""
+        vec_local = self._flatten_state_dict(local_state)
+        vec_global = self._flatten_state_dict(global_state)
+        
+        norm_local = torch.norm(vec_local)
+        norm_global = torch.norm(vec_global)
+        
+        if norm_local == 0 or norm_global == 0:
+            return 0.0
+            
+        cosine_sim = torch.dot(vec_local, vec_global) / (norm_local * norm_global)
+        return float(cosine_sim.item())
 
     def calculate_client_score(self, val_loss: float, val_variance: float) -> float:
         """Client Stability Score: Loss + (variance_weight * Variance). Lower is better."""
@@ -71,7 +98,6 @@ class SecurityBuffer:
         }
 
         # Rule 1: DIRECT AGGREGATION
-        # MSE Diff <= threshold, Variance <= max_variance, and Arrived on time
         if (loss_diff <= self.mse_diff_threshold and 
             val_loss_variance <= self.max_variance_threshold and 
             arrival_time <= self.latency_threshold):
@@ -84,7 +110,6 @@ class SecurityBuffer:
             return "DIRECT", loss_diff, update_obj
 
         # Rule 2: TIME BUFFER
-        # MSE Diff <= threshold & Low Variance, BUT Arrived Late
         elif (loss_diff <= self.mse_diff_threshold and 
               val_loss_variance <= self.max_variance_threshold and 
               arrival_time > self.latency_threshold):
@@ -98,7 +123,6 @@ class SecurityBuffer:
             return "TIME_BUFFER", loss_diff, update_obj
 
         # Rule 3: QUARANTINE
-        # MSE Diff too high or High Variance (Suspicious Model Update)
         else:
             update_obj["weight_factor"] = self.beta
             self.quarantine_queue.append(update_obj)
