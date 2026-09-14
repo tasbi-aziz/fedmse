@@ -1,5 +1,6 @@
 """
 Training endpoint updated with dataset-aware dual-pathway gateway routing (Async FL mode).
+Updated to align cleanly with SecurityBuffer state management and remove hidden formatting characters.
 """
 
 import os
@@ -18,10 +19,10 @@ from DataLoader import load_data, IoTDataset, IoTDataProccessor
 from Trainer import ClientTrainer, GlobalAggregator
 from Evaluator import Evaluator
 
-# Import your Shrink_Autoencoder definition directly
+# Import Model definitions
 from Model import Shrink_Autoencoder, Autoencoder
 
-# Import security buffer
+# Import dynamic security buffer
 from Trainer.security_buffer import SecurityBuffer
 
 # Configure logging module
@@ -32,8 +33,8 @@ num_participants = 1.0
 epoch = 5
 num_rounds = 10
 lr_rate = 5e-6
-shrink_dim = 16      # Maps to latent bottleneck dimension
-threshold_val = 0.2  # Threshold for shrinkage_operator
+shrink_dim = 16       # Latent bottleneck dimension
+threshold_val = 0.2   # Threshold for shrinkage operator
 network_size = 10
 data_seed = 1234
 
@@ -66,13 +67,12 @@ def set_seeds(seed):
 
 def real_evaluator_fn(candidate_model, val_loader, device="cpu", model_template=None):
     """
-    Autoencoder-এর আসল Reconstruction MSE Loss বের করার সঠিক Evaluator Function।
-    candidate_model যদি state_dict হয়, তবে model_template দিয়ে তা লোড করে মাপা হবে।
+    Evaluator function to calculate Reconstruction MSE Loss for Autoencoder/Shrink_Autoencoder.
+    Handles both state_dict and instantiated model objects.
     """
     if candidate_model is None or val_loader is None:
         return float("inf")
 
-    # State Dict অথবা Model Object হ্যান্ডেল করা
     if isinstance(candidate_model, dict):
         if model_template is None:
             return float("inf")
@@ -83,7 +83,7 @@ def real_evaluator_fn(candidate_model, val_loader, device="cpu", model_template=
 
     eval_model.to(device)
     eval_model.eval()
-    
+
     total_mse = 0.0
     total_samples = 0
     criterion = torch.nn.MSELoss()
@@ -107,7 +107,6 @@ def real_evaluator_fn(candidate_model, val_loader, device="cpu", model_template=
 
 
 if __name__ == "__main__":
-    # --- Command Line Arguments ---
     parser = argparse.ArgumentParser(description="Federated Learning with Dynamic Security Buffer")
     parser.add_argument(
         "--base_similarity_threshold",
@@ -125,7 +124,6 @@ if __name__ == "__main__":
 
     set_seeds(data_seed)
 
-    # Device setup early
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using compute device: {device}")
 
@@ -173,7 +171,6 @@ if __name__ == "__main__":
         processed_test_data, test_label = data_processor.transform(test_normal_data)
         processed_abnormal_data, abnormal_label = data_processor.transform(abnormal_data, type="abnormal")
 
-        # Construct base test dataset
         if new_device:
             processed_new_normal_data, new_normal_label = data_processor.transform(new_normal_data)
             processed_test_data = np.concatenate([processed_test_data, processed_new_normal_data], axis=0)
@@ -186,7 +183,6 @@ if __name__ == "__main__":
         valid_dataset = IoTDataset(processed_valid_data, valid_label)
         abnormal_dataset = IoTDataset(processed_abnormal_data, abnormal_label)
 
-        # Concatenate base test set with abnormal set
         test_dataset = ConcatDataset([base_test_dataset, abnormal_dataset])
 
         train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, pin_memory=True)
@@ -206,7 +202,7 @@ if __name__ == "__main__":
             "sim_comm_time": dev.get("simulated_comm_time", 0.5)
         })
 
-    # Server Global Validation Set তৈরি
+    # Global Validation Set
     server_val_dataset = ConcatDataset([client['valid_loader'].dataset for client in client_info])
     server_val_loader = DataLoader(dataset=server_val_dataset, batch_size=batch_size, shuffle=False)
 
@@ -231,7 +227,7 @@ if __name__ == "__main__":
                 filename = f'{directory}/{scen_name}_{num_participants}_{model_type}_{update_type}_results.json'
                 open(filename, 'w').close()
 
-                # Model Initialization matching your class parameters precisely
+                # Model Initialization
                 if model_type == "hybrid":
                     global_model = Shrink_Autoencoder(
                         input_dim=dim_features,
@@ -246,10 +242,10 @@ if __name__ == "__main__":
 
                 global_model.to(device)
 
-                # Initialize aggregator with explicit update_type
+                # Initialize Aggregator
                 global_aggregator = GlobalAggregator(global_model, update_type=update_type)
 
-                # Instantiate Security Buffer
+                # Initialize Security Buffer for current run
                 sec_buffer_tracker = SecurityBuffer(
                     global_model=global_model,
                     window_size=5,
@@ -258,7 +254,6 @@ if __name__ == "__main__":
                     max_variance_threshold=0.05
                 )
 
-                # Concatenate dev DataFrames and transform using client processor
                 min_len = min([len(client['dev_normal_dataset']) for client in client_info])
                 dev_dataset_sampled_list = []
                 for client in client_info:
@@ -268,7 +263,6 @@ if __name__ == "__main__":
 
                 dev_dataset_sampled = np.concatenate(dev_dataset_sampled_list, axis=0)
 
-                # Setup dev dataset if GlobalAggregator supports it
                 if hasattr(global_aggregator, "create_dev_dataset"):
                     global_aggregator.create_dev_dataset({"dataset": dev_dataset_sampled})
 
@@ -291,8 +285,7 @@ if __name__ == "__main__":
 
                     for i, client in enumerate(selected_clients):
                         logging.info(f"Async training local model on client: {client['device']}...")
-                        
-                        # Client pulls current global model asynchronously
+
                         device_trainer = ClientTrainer(
                             model=global_aggregator.model,
                             save_dir=client['save_dir'],
@@ -301,45 +294,45 @@ if __name__ == "__main__":
                             update_type=update_type
                         )
 
-                        # Train local client model
                         trainer_result = device_trainer.run(client["train_loader"], client["valid_loader"])
 
-                        # Extract validation loss for MSE weighting
                         client_val_loss = getattr(device_trainer, "val_loss", None)
                         if client_val_loss is None and isinstance(trainer_result, (float, int)):
                             client_val_loss = trainer_result
                         elif client_val_loss is None:
                             client_val_loss = 1.0
 
-                        # Extract validation variance if computed by trainer
                         client_val_variance = getattr(device_trainer, "val_loss_variance", 0.0)
 
                         raw_weights = copy.deepcopy(device_trainer.model.state_dict())
                         sample_count = len(client["train_loader"].dataset)
                         arrival_time = client['sim_train_time'] + client['sim_comm_time']
 
+                        # Synchronize reference model state with SecurityBuffer before routing
+                        if hasattr(sec_buffer_tracker, "global_model"):
+                            sec_buffer_tracker.global_model = global_aggregator.model
+
                         # --- SECURITY GATE EVALUATION ---
                         route_status, current_sim, tau_sim, update_obj = sec_buffer_tracker.evaluate_and_route_update(
-                           client_id=client['device'],
-                           local_model_state=raw_weights,
-                           dataset_size=sample_count,
-                           arrival_time=arrival_time,
-                           n_avg=n_avg,
-                           val_loss_variance=client_val_variance
-                           )
+                            client_id=client['device'],
+                            local_model_state=raw_weights,
+                            dataset_size=sample_count,
+                            arrival_time=arrival_time,
+                            n_avg=n_avg,
+                            val_loss_variance=client_val_variance
+                        )
 
-                        # Instant Asynchronous Aggregation
                         if route_status == "DIRECT_PATH":
                             global_aggregator.aggregate(
                                 client_models=[raw_weights],
                                 client_losses=[client_val_loss] if update_type == "mse_avg" else None
                             )
                             logging.info(f"Client {client['device']} update instantly aggregated via DIRECT_PATH.")
-                            
+
                         elif route_status == "QUARANTINE":
                             logging.info(f"Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
 
-                    # Quarantine Validation (Processed once per round after all client updates)
+                    # Process Quarantine Buffer
                     released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
                         evaluator_fn=lambda m: real_evaluator_fn(m, server_val_loader, device, model_template=global_model),
                         validation_loader=server_val_loader
@@ -352,7 +345,6 @@ if __name__ == "__main__":
                             client_losses=None
                         )
 
-                    # Compute real Global Loss after round updates
                     current_global_loss = real_evaluator_fn(
                         global_aggregator.model,
                         server_val_loader,
