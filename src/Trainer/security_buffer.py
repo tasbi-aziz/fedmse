@@ -70,7 +70,7 @@ class SecurityBuffer:
         """Client Stability Score: Loss + (variance_weight * Variance). Lower is better."""
         return val_loss + (self.variance_weight * val_variance)
 
-   def evaluate_and_route_update(
+    def evaluate_and_route_update(
         self, 
         client_id, 
         local_model_state, 
@@ -83,6 +83,8 @@ class SecurityBuffer:
         """
         Evaluates incoming client update based on MSE Difference from Global Loss, 
         Arrival Latency, and Local Loss Variance.
+        Returns 4 values to maintain compatibility with main.py:
+        (route_status, loss_diff, mse_diff_threshold, update_obj)
         """
         loss_diff = abs(val_loss - global_mse)
         score = self.calculate_client_score(val_loss, val_loss_variance)
@@ -131,7 +133,7 @@ class SecurityBuffer:
                 f"(Diff: {loss_diff:.4f} > {self.mse_diff_threshold} or High Var: {val_loss_variance:.4f})"
             )
             return "QUARANTINE", loss_diff, self.mse_diff_threshold, update_obj
-            
+
     def evaluate_quarantine_update(self, update_obj, global_model, val_loader, criterion, device="cpu"):
         """
         Quarantine Inspection:
@@ -253,7 +255,7 @@ class SecurityBuffer:
             val_loss = update.get("val_loss", 0.0)
             val_loss_var = update.get("val_loss_variance", 0.0)
 
-            route, loss_diff, update_obj = self.evaluate_and_route_update(
+            route, loss_diff, tau_threshold, update_obj = self.evaluate_and_route_update(
                 client_id=cid, 
                 local_model_state=w, 
                 arrival_time=arr_time, 
