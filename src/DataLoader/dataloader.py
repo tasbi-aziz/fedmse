@@ -23,11 +23,9 @@ def load_data(path, header=None):
     dataframe = []
     
     # --- PERMANENT COLAB FIX ---
-    # If the provided path doesn't exist, automatically redirect to the absolute Colab path
     if not os.path.exists(path):
         logging.warning(f"Path {path} not found. Redirecting to absolute Colab directory...")
         
-        # Extract the last part of the path (e.g., 'client_1') to look inside the unzipped dataset folder
         folder_name = os.path.basename(os.path.normpath(path))
         colab_fallback_path = f"/content/fedmse/Data/noniid-10-Client_Data/{folder_name}"
         
@@ -35,12 +33,10 @@ def load_data(path, header=None):
             path = colab_fallback_path
             logging.info(f"Successfully redirected to absolute path: {path}")
         else:
-            # If that fails, look into the base local data folder directly
             alternative_path = f"/content/fedmse/Data/{folder_name}"
             if os.path.exists(alternative_path):
                 path = alternative_path
                 logging.info(f"Successfully redirected to alternative absolute path: {path}")
-    # ----------------------------
 
     if not os.path.exists(path) or not os.listdir(path):
         raise FileNotFoundError(f"🚨 Error: Data folder could not be found or is empty at: {path}")
@@ -57,9 +53,12 @@ def load_data(path, header=None):
     dataframe = pd.concat(dataframe, ignore_index=True)
     return dataframe
 
+
 class IoTDataProccessor(object):
-    def __init__(self, scaler="standard"):
+    def __init__(self, scaler="standard", use_log_transform=True):
         self.scaler_type = scaler
+        self.use_log_transform = use_log_transform
+        
         if scaler == "standard":
             self.scaler = StandardScaler()
         elif scaler == "minmax":
@@ -67,21 +66,38 @@ class IoTDataProccessor(object):
         else:
             raise ValueError(f"Unknown scaler type: {scaler}. Use 'standard' or 'minmax'.")
 
+    def _apply_log_transform(self, dataframe):
+        """Applies log(1 + x) transformation to smooth high-variance features."""
+        if not self.use_log_transform:
+            return dataframe
+
+        if isinstance(dataframe, pd.DataFrame):
+            values = dataframe.values
+        else:
+            values = np.array(dataframe)
+
+        # Negative noise prevent korar jonno np.maximum(0, values) and log1p -> log(1 + x)
+        clipped_values = np.maximum(0, values)
+        return np.log1p(clipped_values)
+
     def transform(self, dataframe, type="normal"):
-        processed_data = self.scaler.transform(dataframe)
+        transformed_input = self._apply_log_transform(dataframe)
+        processed_data = self.scaler.transform(transformed_input)
+        
         if type == "normal":
             label = [0 for _ in range(len(dataframe))]
         else:
             label = [1 for _ in range(len(dataframe))]
+            
         return processed_data, np.array(label)
     
     def fit_transform(self, dataframe):
-        self.scaler = self.scaler.fit(dataframe)
+        transformed_input = self._apply_log_transform(dataframe)
+        self.scaler = self.scaler.fit(transformed_input)
         processed_data, label = self.transform(dataframe=dataframe, type="normal")
         return processed_data, label
         
     def get_metadata(self):
-        # Dynamically handle metadata extraction based on scaler type
         if isinstance(self.scaler, StandardScaler):
             metadata = {
                 "mean": self.scaler.mean_,
@@ -95,11 +111,11 @@ class IoTDataProccessor(object):
         else:
             metadata = {}
         return metadata
-        
-        
+
+
 class IoTDataset(Dataset):
     """
-    A custom Pytorch Dataset class for the N-BAIoT dataset.
+    A custom PyTorch Dataset class for the N-BAIoT dataset.
     """
     
     def __init__(self, data, label):
