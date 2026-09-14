@@ -70,7 +70,7 @@ class SecurityBuffer:
         """Client Stability Score: Loss + (variance_weight * Variance). Lower is better."""
         return val_loss + (self.variance_weight * val_variance)
 
-    def evaluate_and_route_update(
+   def evaluate_and_route_update(
         self, 
         client_id, 
         local_model_state, 
@@ -107,7 +107,7 @@ class SecurityBuffer:
                 f"[Security Gate] Client {client_id} -> DIRECT "
                 f"(Diff: {loss_diff:.4f} <= {self.mse_diff_threshold}, Var: {val_loss_variance:.4f}, Latency: {arrival_time:.2f}s)"
             )
-            return "DIRECT", loss_diff, update_obj
+            return "DIRECT", loss_diff, self.mse_diff_threshold, update_obj
 
         # Rule 2: TIME BUFFER
         elif (loss_diff <= self.mse_diff_threshold and 
@@ -120,7 +120,7 @@ class SecurityBuffer:
                 f"[Security Gate] Client {client_id} -> TIME BUFFER "
                 f"(Diff: {loss_diff:.4f} <= {self.mse_diff_threshold}, Latency: {arrival_time:.2f}s > {self.latency_threshold}s)"
             )
-            return "TIME_BUFFER", loss_diff, update_obj
+            return "TIME_BUFFER", loss_diff, self.mse_diff_threshold, update_obj
 
         # Rule 3: QUARANTINE
         else:
@@ -130,8 +130,8 @@ class SecurityBuffer:
                 f"[Security Gate] Client {client_id} -> QUARANTINE "
                 f"(Diff: {loss_diff:.4f} > {self.mse_diff_threshold} or High Var: {val_loss_variance:.4f})"
             )
-            return "QUARANTINE", loss_diff, update_obj
-
+            return "QUARANTINE", loss_diff, self.mse_diff_threshold, update_obj
+            
     def evaluate_quarantine_update(self, update_obj, global_model, val_loader, criterion, device="cpu"):
         """
         Quarantine Inspection:
