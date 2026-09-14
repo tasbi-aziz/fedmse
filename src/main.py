@@ -6,16 +6,16 @@ Updated to align cleanly with SecurityBuffer state management and remove hidden 
 import os
 import json
 import pickle
-import pandas as pd
-import numpy as np
-import torch
 import argparse
 import copy
 import random
 import logging
+import pandas as pd
+import numpy as np
+import torch
 
-from torch.utils.data import DataLoader, random_split, ConcatDataset
-from DataLoader import load_data, IoTDataset, IoTDataProccessor
+from torch.utils.data import DataLoader, ConcatDataset
+from dataloader import load_data, IoTDataset, IoTDataProccessor
 from Trainer import ClientTrainer, GlobalAggregator
 from Evaluator import Evaluator
 
@@ -32,8 +32,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 num_participants = 1.0
 epoch = 10
 num_rounds = 10
-lr_rate = 1e-4          # [UPDATE] 1e-6 থেকে বাড়িয়ে 1e-4 করা হয়েছে (দ্রুত লার্নিংয়ের জন্য)
-shrink_dim = 16         # Latent bottleneck dimension
+lr_rate = 1e-4           # Learning rate increased to 1e-4 for faster convergence
+shrink_dim = 16          # Latent bottleneck dimension
 threshold_val = 0.2     # Threshold for shrinkage operator
 network_size = 10
 data_seed = 1234
@@ -51,7 +51,7 @@ min_val_loss = float("inf")
 global_patience = 5
 global_worse = 0
 metric = "AUC"
-dim_features = 64       # [UPDATE] ফিচার সংখ্যা ৬৪ তে সেট করা হয়েছে (64 -> 32 -> 16 লেয়ারের সাথে মিল রাখতে)
+dim_features = 64        # Target dimension after feature selection
 
 scen_name = 'FL-IoT'
 config_file = "/content/fedmse/Configuration/scen2-nba-iot-10clients.json"
@@ -66,10 +66,7 @@ def set_seeds(seed):
 
 
 def real_evaluator_fn(candidate_model, val_loader, device="cpu", model_template=None):
-    """
-    Evaluator function to calculate Reconstruction MSE Loss for Autoencoder/Shrink_Autoencoder.
-    Handles both state_dict and instantiated model objects.
-    """
+    """Evaluator function to calculate Reconstruction MSE Loss."""
     if candidate_model is None or val_loader is None:
         return float("inf")
 
@@ -165,13 +162,12 @@ if __name__ == "__main__":
         dev_normal_data = normal_data[train_normal_size + valid_normal_size:train_normal_size + valid_normal_size + dev_normal_size]
         test_normal_data = normal_data[train_normal_size + valid_normal_size + dev_normal_size:]
 
-        # [UPDATE] Feature Selection সহ DataProcessor ইনিশিয়ালাইজেশন (৬৪টি ফিচার সিলেক্ট করবে)
-        data_processor = IoTDataProccessor(scaler="standard", use_log_transform=True, n_selected_features=64)
+        # Initializing DataProcessor with Feature Selection
+        data_processor = IoTDataProccessor(scaler="standard", use_log_transform=True, n_selected_features=dim_features)
         
-        # [UPDATE] fit_transform এ abnormal_dataframe যুক্ত করা হয়েছে
         processed_train_data, train_label = data_processor.fit_transform(train_normal_data, abnormal_dataframe=abnormal_data)
         
-        # ডাইনামিকভাবে ফিচার সাইজ ৬৪ নিশ্চিত করা
+        # Synchronize feature size dynamically
         dim_features = processed_train_data.shape[1]
 
         processed_valid_data, valid_label = data_processor.transform(valid_normal_data)
@@ -234,7 +230,7 @@ if __name__ == "__main__":
                 filename = f'{directory}/{scen_name}_{num_participants}_{model_type}_{update_type}_results.json'
                 open(filename, 'w').close()
 
-                # Model Initialization (ইনপুট এখন ডাইনামিক ৬৪ ফিচারের হবে)
+                # Dynamic Model Initialization with verified dim_features
                 if model_type == "hybrid":
                     global_model = Shrink_Autoencoder(
                         input_dim=dim_features,
@@ -315,7 +311,6 @@ if __name__ == "__main__":
                         sample_count = len(client["train_loader"].dataset)
                         arrival_time = client['sim_train_time'] + client['sim_comm_time']
 
-                        # Synchronize reference model state with SecurityBuffer before routing
                         if hasattr(sec_buffer_tracker, "global_model"):
                             sec_buffer_tracker.global_model = global_aggregator.model
 
@@ -365,7 +360,7 @@ if __name__ == "__main__":
                     global_aggregator.val_loss = current_global_loss
                     logging.info(f"Cycle {round_idx+1}/{num_rounds} - Updated global model - Global loss: {current_global_loss:.6f}")
 
-                    # --- Early Stopping & Best Model Checkpointing ---
+                    # Early Stopping & Best Model Checkpointing
                     best_model_dir = f'Checkpoint/BestModel/{network_size}/{no_Exp}/Run_{run}/{model_type}_{update_type}'
                     os.makedirs(best_model_dir, exist_ok=True)
                     best_model_path = os.path.join(best_model_dir, f"{scen_name}_best_model.pth")
@@ -374,7 +369,7 @@ if __name__ == "__main__":
                         min_val_loss = current_global_loss
                         global_worse = 0
                         torch.save(global_aggregator.model.state_dict(), best_model_path)
-                        logging.info(f"Global validation loss improved to {min_val_loss:.6f}. Saved best model checkpoint.")
+                        logging.info(f"Global validation loss improved to {min_val_loss:.6f}. Saved best checkpoint.")
                     else:
                         global_worse += 1
                         logging.info(f"Global validation loss did not improve. Patience: {global_worse}/{global_patience}")
