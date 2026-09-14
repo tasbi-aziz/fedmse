@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from torch.utils.data import DataLoader, ConcatDataset
-from dataloader import load_data, IoTDataset, IoTDataProccessor
+from DataLoader.dataloader import load_data, IoTDataset, IoTDataProccessor
 from Trainer import ClientTrainer, GlobalAggregator
 from Evaluator import Evaluator
 
