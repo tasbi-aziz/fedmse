@@ -30,9 +30,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- Global Configurations ---
 num_participants = 1.0
-epoch = 5
+epoch = 10
 num_rounds = 10
-lr_rate = 5e-6
+lr_rate = 1e-6
 shrink_dim = 16       # Latent bottleneck dimension
 threshold_val = 0.2   # Threshold for shrinkage operator
 network_size = 10
