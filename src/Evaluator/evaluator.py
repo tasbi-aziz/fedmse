@@ -1,136 +1,201 @@
+"""
+Model Evaluator module for Autoencoder and Hybrid (Centroid-based) anomaly detection models.
+Provides single and joint side-by-side performance evaluation.
+"""
+
+import logging
+import time
 import numpy as np
 import torch
 from tqdm import tqdm
 from sklearn.metrics import roc_curve, auc, f1_score, precision_score, recall_score
 from Model.Centroid import CentroidBasedOneClassClassifier
 
-import logging
-import time
-
 # Configure the logging module
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 class Evaluator(object):
-    def __init__(self, model, model_type="autoencoder", metric="AUC", device=None) -> None:
+    def __init__(self, model, model_type="both", metric="AUC", device=None) -> None:
+        """
+        :param model: Trained PyTorch model (Autoencoder or similar)
+        :param model_type: "autoencoder", "hybrid", or "both" for direct comparison
+        :param metric: "AUC", "classification", or "time"
+        :param device: torch.device instance
+        """
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
-        self.model_type = model_type
+        self.model_type = model_type.lower()
         self.metric = metric
 
-    def _unpack_model_output(self, output_tuple):
-        """Helper to extract latent and reconstructed output safely regardless of tuple length."""
-        if isinstance(output_tuple, (tuple, list)):
-            latent = output_tuple[0]
-            output = output_tuple[1] if len(output_tuple) > 1 else output_tuple[0]
-            return latent, output
-        return output_tuple, output_tuple
+    def _extract_features_and_output(self, batch_data):
+        """Safely extracts latent representations and reconstructed outputs from model."""
+        model_out = self.model(batch_data)
+        
+        # If model outputs tuple (latent, reconstruction)
+        if isinstance(model_out, (tuple, list)):
+            latent = model_out[0]
+            output = model_out[1] if len(model_out) > 1 else model_out[0]
+        else:
+            output = model_out
+            # Check if model has explicit encode() method
+            if hasattr(self.model, "encode"):
+                latent = self.model.encode(batch_data)
+            else:
+                latent = output
+                
+        return latent, output
 
     def calculate_auc(self, y_true, score):
         if not np.all(np.isfinite(score)):
-            print("Anomaly score contains infinite or too large values.")
             score = np.nan_to_num(score)
 
-        fpr, tpr, threshold = roc_curve(y_true, score)
-        auc_score = auc(fpr, tpr)
-        return auc_score
+        fpr, tpr, _ = roc_curve(y_true, score)
+        return auc(fpr, tpr)
 
-    def score_to_label(self, score, threshold):
+    def score_to_label(self, score, threshold=0.5):
         return np.where(np.array(score) > threshold, 1, 0)
 
-    def calculate_f1_score(self, y_true, y_pred):
-        return f1_score(y_true, y_pred)
-
-    def calculate_precision(self, y_true, y_pred):
-        return precision_score(y_true, y_pred)
-
-    def calculate_recall(self, y_true, y_pred):
-        return recall_score(y_true, y_pred)
-
-    def calculate_classification_metric(self, y_true, score, threshold=0.5):
+    def calculate_classification_metrics(self, y_true, score, threshold=0.5):
         y_pred = self.score_to_label(score, threshold)
-        f1 = self.calculate_f1_score(y_true, y_pred)
-        precision = self.calculate_precision(y_true, y_pred)
-        recall = self.calculate_recall(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
         return f1, precision, recall
 
+    def _eval_autoencoder(self, test_loader):
+        """Evaluates model using pure Reconstruction Error (MSE)."""
+        anomaly_scores = []
+        test_labels = []
+
+        with torch.no_grad():
+            for batch_input in tqdm(test_loader, desc='Evaluating Autoencoder...'):
+                batch_data = batch_input[0].to(self.device)
+                _, output = self._extract_features_and_output(batch_data)
+                
+                # Reconstruction MSE Loss per sample
+                recon_loss = torch.mean(torch.nn.MSELoss(reduction="none")(batch_data, output), dim=1)
+                anomaly_scores.append(recon_loss)
+                test_labels.append(batch_input[1])
+
+        anomaly_scores = torch.cat(anomaly_scores, dim=0).cpu().numpy()
+        test_labels = torch.cat(test_labels, dim=0).cpu().numpy()
+
+        auc_val = self.calculate_auc(test_labels, anomaly_scores)
+        f1_val, prec_val, rec_val = self.calculate_classification_metrics(test_labels, anomaly_scores)
+
+        return {
+            "scores": anomaly_scores,
+            "labels": test_labels,
+            "auc": auc_val,
+            "f1": f1_val,
+            "precision": prec_val,
+            "recall": rec_val
+        }
+
+    def _eval_hybrid(self, train_loader, test_loader):
+        """Evaluates model using Latent Representation + Centroid Classifier."""
+        if train_loader is None:
+            raise ValueError("🚨 Error: 'train_loader' is required for Hybrid evaluation to fit Centroid classifier.")
+
+        train_latents = []
+        test_latents = []
+        test_labels = []
+
+        with torch.no_grad():
+            # 1. Extract Train Latent Space
+            for batch_input in tqdm(train_loader, desc='Extracting Train Latents...'):
+                batch_data = batch_input[0].to(self.device)
+                latent, _ = self._extract_features_and_output(batch_data)
+                train_latents.append(latent)
+            
+            # 2. Extract Test Latent Space
+            for batch_input in tqdm(test_loader, desc='Extracting Test Latents...'):
+                batch_data = batch_input[0].to(self.device)
+                latent, _ = self._extract_features_and_output(batch_data)
+                test_latents.append(latent)
+                test_labels.append(batch_input[1])
+
+        train_latents = torch.cat(train_latents, dim=0).cpu().numpy()
+        test_latents = torch.cat(test_latents, dim=0).cpu().numpy()
+        test_labels = torch.cat(test_labels, dim=0).cpu().numpy()
+
+        # Fit Centroid Model
+        cen = CentroidBasedOneClassClassifier()
+        cen.fit(train_latents)
+
+        start_time = time.time()
+        predictions_cen = cen.get_density(test_latents)
+        infer_time = time.time() - start_time
+
+        auc_val = self.calculate_auc(test_labels, predictions_cen)
+        f1_val, prec_val, rec_val = self.calculate_classification_metrics(test_labels, predictions_cen)
+
+        return {
+            "scores": predictions_cen,
+            "labels": test_labels,
+            "train_latents": train_latents,
+            "test_latents": test_latents,
+            "auc": auc_val,
+            "f1": f1_val,
+            "precision": prec_val,
+            "recall": rec_val,
+            "infer_time": infer_time
+        }
+
     def evaluate(self, test_loader, train_loader=None):
+        """
+        Main evaluation controller. Supports 'autoencoder', 'hybrid', or 'both'.
+        """
         self.model.eval()
+        results = {}
+
+        if self.model_type in ["autoencoder", "both"]:
+            results["autoencoder"] = self._eval_autoencoder(test_loader)
+
+        if self.model_type in ["hybrid", "both"]:
+            results["hybrid"] = self._eval_hybrid(train_loader, test_loader)
+
+        # Print Side-by-Side Comparison Log
+        self._log_comparison(results)
+
+        # Return metric requested or full result dictionary
         if self.model_type == "autoencoder":
-            anomaly_score = []
-            test_label = []
-            with torch.no_grad():
-                for i, batch_input in zip(tqdm(range(len(test_loader)), desc='Testing batch: ...'), test_loader):
-                    batch_data = batch_input[0].to(self.device)
-                    model_out = self.model(batch_data)
-                    _, output = self._unpack_model_output(model_out)
-                    recon_loss = torch.nn.MSELoss(reduction="none")(batch_data, output)
-                    anomaly_score.append(torch.mean(recon_loss, dim=1))
-                    test_label.append(batch_input[1])
-                anomaly_score = torch.cat(anomaly_score, dim=0).cpu().numpy()
-                test_label = torch.cat(test_label, dim=0).cpu().numpy()
+            return results["autoencoder"]["auc"] if self.metric == "AUC" else results["autoencoder"]["f1"]
+        elif self.model_type == "hybrid":
+            if self.metric == "time":
+                return results["hybrid"]["infer_time"]
+            return results["hybrid"]["auc"] if self.metric == "AUC" else results["hybrid"]["f1"]
+        else:
+            return results
 
-                if self.metric == "AUC":
-                    auc_score = self.calculate_auc(test_label, anomaly_score)
-                    logging.info(f"AUC for Autoencoder-based: {auc_score}")
-                    return auc_score
+    def _log_comparison(self, results):
+        """Helper to log a neat comparison table in the console."""
+        logging.info("=" * 65)
+        logging.info(f"{'METRIC SUMMARY COMPARISON':^65}")
+        logging.info("=" * 65)
+        
+        has_ae = "autoencoder" in results
+        has_hy = "hybrid" in results
 
-                if self.metric == "classification":
-                    f1, precision, recall = self.calculate_classification_metric(test_label, anomaly_score)
-                    logging.info(f"F1 score for Autoencoder-based: {f1}")
-                    logging.info(f"Precision for Autoencoder-based: {precision}")
-                    logging.info(f"Recall for Autoencoder-based: {recall}")
-                    return f1
+        header = f"{'Metric':<15} |"
+        if has_ae:
+            header += f" {'Autoencoder (MSE)':<20} |"
+        if has_hy:
+            header += f" {'Hybrid (Centroid)':<20} |"
+        
+        logging.info(header)
+        logging.info("-" * 65)
 
-        if self.model_type == "hybrid":
-            train_latent = []
-            with torch.no_grad():
-                for i, batch_input in zip(tqdm(range(len(train_loader)), 
-                                               desc='Calculate output for training data batch: ...'), train_loader):
-                    batch_data = batch_input[0].to(self.device)
-                    model_out = self.model(batch_data)
-                    latent, _ = self._unpack_model_output(model_out)
-                    train_latent.append(latent)
-                train_latent = torch.cat(train_latent, dim=0).cpu().numpy()
+        for metric_key, name in [("auc", "AUC Score"), ("f1", "F1 Score"), ("precision", "Precision"), ("recall", "Recall")]:
+            row = f"{name:<15} |"
+            if has_ae:
+                row += f" {results['autoencoder'][metric_key]:<20.4f} |"
+            if has_hy:
+                row += f" {results['hybrid'][metric_key]:<20.4f} |"
+            logging.info(row)
 
-                test_latent = []
-                testing_label = []
-                for i, batch_input in zip(tqdm(range(len(test_loader)), desc='Testing batch: ...'), test_loader):
-                    batch_data = batch_input[0].to(self.device)
-                    model_out = self.model(batch_data)
-                    latent, _ = self._unpack_model_output(model_out)
-                    test_latent.append(latent)
-                    testing_label.append(batch_input[1])
-
-                test_latent = torch.cat(test_latent, dim=0).cpu().numpy()
-                testing_label = torch.cat(testing_label, dim=0).cpu().numpy()
-
-                CEN = CentroidBasedOneClassClassifier()
-                CEN.fit(train_latent)
-
-                if self.metric == "time":
-                    start_time = time.time()
-                    predictions_cen = CEN.get_density(test_latent)
-                    end_time = time.time()
-                    return end_time - start_time
-
-                if self.metric == "AUC":
-                    predictions_cen = CEN.get_density(test_latent)
-                    if not np.all(np.isfinite(predictions_cen)):
-                        print("Anomaly score contains infinite or too large values.")
-                        predictions_cen = np.nan_to_num(predictions_cen)
-                    FPR_cen, TPR_cen, thresholds_cen = roc_curve(testing_label, predictions_cen)
-                    cen_auc = auc(FPR_cen, TPR_cen)
-                    logging.info(f"AUC for Hybrid model: {cen_auc}")
-                    return cen_auc, test_latent, testing_label
-
-                if self.metric == "classification":
-                    predictions_cen = CEN.get_density(test_latent)
-                    f1, precision, recall = self.calculate_classification_metric(testing_label, predictions_cen)
-                    logging.info(f"F1 score for Hybrid model: {f1}")
-                    logging.info(f"Precision for Hybrid model: {precision}")
-                    logging.info(f"Recall for Hybrid model: {recall}")
-                    return f1, test_latent, testing_label
+        logging.info("=" * 65)
 
     def visualize(self):
         pass
