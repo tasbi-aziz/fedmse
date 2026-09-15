@@ -157,7 +157,7 @@ def evaluate_anomaly_detection(model, test_loader, device="cpu"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Federated Learning Evaluation Pipeline with FedOpt")
-    parser.add_argument("--latency_threshold", type=float, default=20.0, help="Latency limit for direct aggregation")
+    parser.add_argument("--latency_threshold", type=float, default=10.0, help="Latency limit for direct aggregation")
     parser.add_argument("--update_type", type=str, default="fedopt", help="Aggregation type: fedopt or weighted")
     parser.add_argument("--server_lr", type=float, default=1.0, help="Server-side learning rate for FedOpt")
     parser.add_argument("--output_dir", type=str, default="./results", help="Output metrics log directory")
