@@ -6,7 +6,6 @@ This is Autoencoder model definition.
 @create date 2023-12-16 20:07:29
 """
 
-from itertools import chain
 import logging
 import numpy as np
 import torch
@@ -18,6 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
 
 class Encoder(nn.Module):
     """
@@ -48,14 +48,16 @@ class Decoder(nn.Module):
     """
     A decoder module that takes a latent vector as input and produces an output vector.
     """
-    def __init__(self, latent_dim=32, hidden_neus=64, output_dim=115):
+    def __init__(self, latent_dim=32, hidden_neus=64, output_dim=115, use_sigmoid=False):
         super(Decoder, self).__init__()
         decoder_network = [
             nn.Linear(latent_dim, hidden_neus, bias=True),
             nn.ReLU(),
-            nn.Linear(hidden_neus, output_dim, bias=True),
-            nn.Sigmoid()  # Output values range: [0, 1]
+            nn.Linear(hidden_neus, output_dim, bias=True)
         ]
+        if use_sigmoid:
+            decoder_network.append(nn.Sigmoid())  # Only use if input data is scaled to [0, 1]
+
         self.decoder_network = nn.Sequential(*decoder_network)
         self.init_params()
 
@@ -74,26 +76,22 @@ class Autoencoder(nn.Module):
     """
     Autoencoder class
     """
-    def __init__(self, input_dim=115, output_dim=None, hidden_neus=64, latent_dim=32):
+    def __init__(self, input_dim=115, output_dim=None, hidden_neus=64, latent_dim=32, use_sigmoid=False):
         super(Autoencoder, self).__init__()
-        # output_dim না দিলে তা input_dim এর সমান হবে
         if output_dim is None:
             output_dim = input_dim
 
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.encoder = Encoder(input_dim, hidden_neus, latent_dim)
-        self.decoder = Decoder(latent_dim, hidden_neus, output_dim)
-
-    def parameters(self, recurse: bool = True):
-        return chain(self.encoder.parameters(recurse=recurse), self.decoder.parameters(recurse=recurse))
+        self.decoder = Decoder(latent_dim, hidden_neus, output_dim, use_sigmoid=use_sigmoid)
 
     def recon_loss(self, input, output):
         return F.mse_loss(output, input, reduction='mean')
-    
+
     def forward(self, input):
         """
-        Forward pass returning single reconstruction tensor for self.criterion compatibility.
+        Forward pass returning single reconstruction tensor for loss evaluation.
         """
         latent = self.encoder(input)
         output = self.decoder(latent)
