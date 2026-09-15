@@ -18,7 +18,7 @@ import time
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 from torch.utils.data import DataLoader, ConcatDataset
 
-from DataLoader.dataloader import load_data, IoTDataset, IoTDataProccessor
+from DataLoader.dataloader import load_data, IoTDataset, IoTDataProcessor
 from Trainer import ClientTrainer, GlobalAggregator
 from Trainer.security_buffer import SecurityBuffer
 from Model import Shrink_Autoencoder, Autoencoder
@@ -37,7 +37,7 @@ network_size = 10
 data_seed = 1234
 num_runs = 5
 batch_size = 64
-dim_features = 64
+target_num_features = 64
 
 config_file = "/content/fedmse/Configuration/scen2-nba-iot-10clients.json"
 
@@ -49,6 +49,13 @@ def set_seeds(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def extract_reconstructed_output(outputs):
+    """Safely extracts reconstructed tensor from model output (handles tuple/single tensor)."""
+    if isinstance(outputs, (tuple, list)):
+        return outputs[1] if len(outputs) > 1 else outputs[0]
+    return outputs
 
 
 def evaluate_global_mse(global_model, val_loader, device="cpu"):
@@ -63,9 +70,9 @@ def evaluate_global_mse(global_model, val_loader, device="cpu"):
         for batch in val_loader:
             inputs = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
             outputs = global_model(inputs)
-            if isinstance(outputs, (tuple, list)):
-                outputs = outputs[0]
-            loss = criterion(outputs, inputs)
+            reconstructed = extract_reconstructed_output(outputs)
+            
+            loss = criterion(reconstructed, inputs)
             total_loss += loss.item() * inputs.size(0)
             total_samples += inputs.size(0)
 
@@ -82,11 +89,10 @@ def compute_reconstruction_errors(model, data_loader, device="cpu"):
         for batch in data_loader:
             inputs = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
             outputs = model(inputs)
-            if isinstance(outputs, (tuple, list)):
-                outputs = outputs[0]
+            reconstructed = extract_reconstructed_output(outputs)
             
             # Per-sample MSE
-            loss = criterion(outputs, inputs).mean(dim=1)
+            loss = criterion(reconstructed, inputs).mean(dim=1)
             errors.extend(loss.cpu().numpy())
 
     return np.array(errors)
@@ -106,10 +112,9 @@ def evaluate_anomaly_detection(model, test_loader, device="cpu"):
         for batch in test_loader:
             inputs, labels = batch[0].to(device), batch[1].cpu().numpy()
             outputs = model(inputs)
-            if isinstance(outputs, (tuple, list)):
-                outputs = outputs[0]
+            reconstructed = extract_reconstructed_output(outputs)
 
-            loss = criterion(outputs, inputs).mean(dim=1).cpu().numpy()
+            loss = criterion(reconstructed, inputs).mean(dim=1).cpu().numpy()
             reconstruction_errors.extend(loss)
             y_true.extend(labels)
 
@@ -172,13 +177,20 @@ if __name__ == "__main__":
 
     logging.info("Initializing Data Processors and Partitioning Client Datasets...")
 
+    actual_dim_features = target_num_features
+
     # Load Client Data Pipelines
     for dev in devices_list:
         normal_data_path = os.path.join(config['data_path'], dev["normal_data_path"])
         abnormal_data_path = os.path.join(config['data_path'], dev["normal_data_path"].replace("normal", "test_normal"))
 
         normal_data = load_data(normal_data_path).sample(frac=1).reset_index(drop=True)
-        abnormal_data = load_data(abnormal_data_path).sample(frac=1).reset_index(drop=True)
+        
+        try:
+            abnormal_data = load_data(abnormal_data_path).sample(frac=1).reset_index(drop=True)
+        except Exception as e:
+            logging.warning(f"Abnormal data load fallback for {dev['name']}: {e}")
+            abnormal_data = None
 
         train_normal_size = int(0.4 * len(normal_data))
         valid_normal_size = int(0.1 * len(normal_data))
@@ -187,18 +199,21 @@ if __name__ == "__main__":
         valid_normal_data = normal_data[train_normal_size:train_normal_size + valid_normal_size]
         test_normal_data = normal_data[train_normal_size + valid_normal_size:]
 
-        data_processor = IoTDataProccessor(scaler="standard", use_log_transform=True, n_selected_features=dim_features)
+        data_processor = IoTDataProcessor(scaler="standard", use_log_transform=True, n_selected_features=target_num_features)
         
         processed_train_data, train_label = data_processor.fit_transform(train_normal_data, abnormal_dataframe=abnormal_data)
-        dim_features = processed_train_data.shape[1]
+        actual_dim_features = processed_train_data.shape[1]
 
         processed_valid_data, valid_label = data_processor.transform(valid_normal_data)
         processed_test_normal, test_normal_label = data_processor.transform(test_normal_data)
-        processed_test_abnormal, test_abnormal_label = data_processor.transform(abnormal_data)
-
-        # Merge Test Sets (Normal + Abnormal)
-        test_data_combined = np.vstack([processed_test_normal, processed_test_abnormal])
-        test_label_combined = np.hstack([np.zeros(len(processed_test_normal)), np.ones(len(processed_test_abnormal))])
+        
+        if abnormal_data is not None:
+            processed_test_abnormal, test_abnormal_label = data_processor.transform(abnormal_data, type="abnormal")
+            test_data_combined = np.vstack([processed_test_normal, processed_test_abnormal])
+            test_label_combined = np.hstack([np.zeros(len(processed_test_normal)), np.ones(len(processed_test_abnormal))])
+        else:
+            test_data_combined = processed_test_normal
+            test_label_combined = np.zeros(len(processed_test_normal))
 
         train_dataset = IoTDataset(processed_train_data, train_label)
         valid_dataset = IoTDataset(processed_valid_data, valid_label)
@@ -247,9 +262,9 @@ if __name__ == "__main__":
 
             # Model Initialization
             if model_type == "hybrid":
-                global_model = Shrink_Autoencoder(input_dim=dim_features, shrink_dim=shrink_dim, threshold=threshold_val)
+                global_model = Shrink_Autoencoder(input_dim=actual_dim_features, shrink_dim=shrink_dim, threshold=threshold_val)
             else:
-                global_model = Autoencoder(input_dim=dim_features, latent_dim=shrink_dim)
+                global_model = Autoencoder(input_dim=actual_dim_features, latent_dim=shrink_dim)
 
             global_model.to(device)
 
@@ -306,7 +321,7 @@ if __name__ == "__main__":
                         "val_loss_variance": getattr(device_trainer, "val_loss_variance", 0.0)
                     })
 
-                # Route updates via 3-Way Security Buffer
+                # Route updates via Security Buffer
                 ready_updates = sec_buffer_tracker.collect_current_round_updates(
                     incoming_updates=incoming_updates,
                     global_model=global_aggregator.model,
