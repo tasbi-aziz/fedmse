@@ -1,10 +1,9 @@
 """
 Adaptive Client-Relative Security Buffer & Quarantine Module for FedMSE.
-Implements Client-Relative Drift Detection & 3-Way Adaptive Routing:
-1. Warm-up Phase: First N rounds collect baseline history without dropping updates.
-2. 4-Factor Trust Score: S_norm, S_loss, S_hist, S_latency.
-3. Adaptive Decision Boundary: Threshold_i = mu_trust - k * sigma_trust.
-4. 3-Way Routing: Direct Aggregation, Time Buffer, or Quarantine Inspection.
+Evaluates local updates dynamically and handles 3-Way Adaptive Routing:
+- DIRECT: High Trust, Low Latency (weight_factor = 1.0)
+- TIME BUFFER: High Trust, High Latency (weight_factor = alpha)
+- QUARANTINE: Low Trust -> Secondary Inspection -> Release (weight_factor = beta) or Drop.
 """
 
 import copy
@@ -14,7 +13,6 @@ import numpy as np
 import torch
 from collections import defaultdict
 
-# Configure logging module
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
@@ -39,20 +37,19 @@ class SecurityBuffer:
         self.w_norm, self.w_loss, self.w_hist, self.w_lat = weights
         self.alpha = alpha
         self.beta = beta
-        
+
         # Per-Client Historical Memory
-        # Format: {client_id: {"norm": [], "loss_imp": [], "latency": [], "trust": []}}
         self.client_history = defaultdict(lambda: {
             "norm": [], 
             "loss_imp": [], 
             "latency": [], 
             "trust": []
         })
-        
+
         # Staging Queues for Aggregation
         self.time_buffer_queue = []
-        self.quarantine_queue = []       # Staging queue for raw quarantine items
-        self.quarantine_pass_queue = []  # Staging queue for items that passed quarantine validation
+        self.quarantine_queue = []
+        self.quarantine_pass_queue = []
 
     def _flatten_state_dict(self, state_dict):
         """Flattens PyTorch state dict into a 1D Tensor."""
@@ -70,33 +67,19 @@ class SecurityBuffer:
         return torch.norm(delta_vec).item()
 
     def calculate_trust_score(self, client_id, update_norm, loss_imp, arrival_time):
-        """
-        Calculates 4-Factor Adaptive Trust Score S_i for client update.
-        Factors are normalized between 0.0 and 1.0.
-        """
+        """Calculates 4-Factor Adaptive Trust Score S_i for client update."""
         hist = self.client_history[client_id]
-        
-        # Historical Baselines (Mean & Std)
+
         norm_mean = np.mean(hist["norm"]) if len(hist["norm"]) > 0 else update_norm
         norm_std = np.std(hist["norm"]) if len(hist["norm"]) > 1 else 1.0
-        
         loss_std = np.std(hist["loss_imp"]) if len(hist["loss_imp"]) > 1 else 1.0
-
         eps = 1e-8
 
-        # Factor 1: Update Magnitude Consistency
         s_norm = math.exp(-update_norm / (norm_mean + eps))
-        
-        # Factor 2: Local Loss Improvement Effectiveness
         s_loss = 1.0 / (1.0 + math.exp(-loss_imp / (loss_std + eps)))
-        
-        # Factor 3: Historical Deviation Consistency
         s_hist = math.exp(-abs(update_norm - norm_mean) / (norm_std + eps))
-        
-        # Factor 4: Arrival Latency Score
         s_latency = max(0.0, 1.0 - (arrival_time / self.latency_threshold))
 
-        # Weighted Trust Score Combination
         trust_score = (
             self.w_norm * s_norm +
             self.w_loss * s_loss +
@@ -116,19 +99,13 @@ class SecurityBuffer:
         global_model_state=None,
         **kwargs
     ):
-        """
-        Evaluates incoming update using Client-Relative Adaptive Dynamics.
-        Returns 4 values to maintain full compatibility with main.py:
-        (route_status, trust_score, dynamic_threshold, update_obj)
-        """
+        """Evaluates incoming update and routes to DIRECT, TIME BUFFER, or QUARANTINE."""
         ref_global_state = global_model_state if global_model_state is not None else self.global_model.state_dict()
-        
-        # Metric Computations
+
         update_norm = self._compute_update_norm(local_model_state, ref_global_state)
-        loss_imp = global_mse - val_loss  # Positive means local update improved global loss
+        loss_imp = global_mse - val_loss
         loss_diff = abs(val_loss - global_mse)
-        
-        # Calculate Trust Score
+
         trust_score = self.calculate_trust_score(client_id, update_norm, loss_imp, arrival_time)
 
         update_obj = {
@@ -145,13 +122,13 @@ class SecurityBuffer:
         hist = self.client_history[client_id]
         rounds_seen = len(hist["trust"])
 
-        # Phase 1: WARM-UP PHASE (First N rounds populate baseline history)
+        # Phase 1: WARM-UP PHASE
         if rounds_seen < self.warmup_rounds:
             hist["norm"].append(update_norm)
             hist["loss_imp"].append(loss_imp)
             hist["latency"].append(arrival_time)
             hist["trust"].append(trust_score)
-            
+
             if arrival_time <= self.latency_threshold:
                 update_obj["weight_factor"] = 1.0
                 route = "DIRECT"
@@ -166,17 +143,13 @@ class SecurityBuffer:
             )
             return route, trust_score, 0.0, update_obj
 
-        # Phase 2: ADAPTIVE DYNAMIC ROUTING (Post Warm-up)
+        # Phase 2: ADAPTIVE DYNAMIC ROUTING
         mu_trust = np.mean(hist["trust"])
         sigma_trust = np.std(hist["trust"]) if len(hist["trust"]) > 1 else 0.05
-        
-        # Client-Specific Dynamic Decision Threshold
         adaptive_threshold = max(0.1, mu_trust - (self.k_factor * sigma_trust))
 
-        # Decision Gate Evaluation
         if trust_score >= adaptive_threshold:
             if arrival_time <= self.latency_threshold:
-                # Rule 1: DIRECT AGGREGATION
                 update_obj["weight_factor"] = 1.0
                 route = "DIRECT"
                 logging.info(
@@ -184,7 +157,6 @@ class SecurityBuffer:
                     f"(Trust: {trust_score:.4f} >= {adaptive_threshold:.4f}, Latency: {arrival_time:.2f}s)"
                 )
             else:
-                # Rule 2: TIME BUFFER
                 update_obj["weight_factor"] = self.alpha
                 self.time_buffer_queue.append(update_obj)
                 route = "TIME_BUFFER"
@@ -193,16 +165,14 @@ class SecurityBuffer:
                     f"(Trust: {trust_score:.4f} >= {adaptive_threshold:.4f}, Latency: {arrival_time:.2f}s > {self.latency_threshold}s)"
                 )
         else:
-            # Rule 3: QUARANTINE
             update_obj["weight_factor"] = self.beta
             self.quarantine_queue.append(update_obj)
             route = "QUARANTINE"
             logging.warning(
                 f"[Security Gate] Client {client_id} -> QUARANTINE "
-                f"(Trust: {trust_score:.4f} < {adaptive_threshold:.4f} [mu={mu_trust:.4f}, sigma={sigma_trust:.4f}])"
+                f"(Trust: {trust_score:.4f} < {adaptive_threshold:.4f})"
             )
 
-        # Append to History (Keep sliding window size)
         hist["norm"].append(update_norm)
         hist["loss_imp"].append(loss_imp)
         hist["latency"].append(arrival_time)
@@ -217,117 +187,57 @@ class SecurityBuffer:
         return route, trust_score, adaptive_threshold, update_obj
 
     def evaluate_quarantine_update(self, update_obj, global_model, val_loader, criterion, device="cpu"):
-        """
-        Quarantine Secondary Inspection:
-        Calculates MSE(i) on central dev set relative to client dynamic history.
-        """
+        """Inspects Quarantine items on server val set."""
         client_id = update_obj["client_id"]
         weights = update_obj["weights"]
 
         local_model = copy.deepcopy(global_model)
         local_model.load_state_dict(weights)
-        
         local_model.to(device)
         global_model.to(device)
         local_model.eval()
         global_model.eval()
 
-        mse_i_list = []
-        mse_g_list = []
+        mse_i_list, mse_g_list = [], []
 
         with torch.no_grad():
             for batch in val_loader:
                 batch_x = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
-                
                 out_i = local_model(batch_x)
                 out_g = global_model(batch_x)
 
-                if isinstance(out_i, (tuple, list)):
-                    out_i = out_i[0]
-                if isinstance(out_g, (tuple, list)):
-                    out_g = out_g[0]
+                if isinstance(out_i, (tuple, list)): out_i = out_i[0]
+                if isinstance(out_g, (tuple, list)): out_g = out_g[0]
 
-                mse_i = criterion(out_i, batch_x).item()
-                mse_g = criterion(out_g, batch_x).item()
-
-                mse_i_list.append(mse_i)
-                mse_g_list.append(mse_g)
+                mse_i_list.append(criterion(out_i, batch_x).item())
+                mse_g_list.append(criterion(out_g, batch_x).item())
 
         avg_mse_i = np.mean(mse_i_list)
         avg_mse_g = np.mean(mse_g_list)
         dev_loss_imp = avg_mse_g - avg_mse_i
 
-        # If model improves or stays very close on Server Dev Set, release to Quarantine Pass
         if dev_loss_imp >= -0.05:
-            logging.info(
-                f"[Quarantine Check] Client {client_id} PASSED! "
-                f"Server Dev Loss Diff: {dev_loss_imp:.4f}. Stashed with beta={self.beta}."
-            )
+            logging.info(f"[Quarantine Check] Client {client_id} PASSED! Stashed with beta={self.beta}.")
             self.quarantine_pass_queue.append(update_obj)
             return True, avg_mse_i, avg_mse_g
         else:
-            logging.warning(
-                f"[Quarantine Check] Client {client_id} REJECTED & DROPPED! "
-                f"Degraded Server Dev Loss Diff: {dev_loss_imp:.4f}."
-            )
+            logging.warning(f"[Quarantine Check] Client {client_id} REJECTED & DROPPED!")
             return False, avg_mse_i, avg_mse_g
 
-    def process_quarantine_validation(
-        self, 
-        global_model=None, 
-        val_loader=None, 
-        criterion=None, 
-        device="cpu", 
-        quarantine_list=None,
-        validation_loader=None,
-        **kwargs
-    ):
-        """Validates updates sitting in quarantine queue using server dev set."""
-        if val_loader is None and validation_loader is not None:
-            val_loader = validation_loader
-
-        if global_model is None:
-            global_model = self.global_model
-
-        if criterion is None:
-            criterion = torch.nn.MSELoss()
-
-        released_updates = []
-        targets = quarantine_list if quarantine_list is not None else self.quarantine_queue
-
-        for update_obj in list(targets):
-            passed, avg_mse_i, avg_mse_g = self.evaluate_quarantine_update(
-                update_obj=update_obj,
-                global_model=global_model,
-                val_loader=val_loader,
-                criterion=criterion,
-                device=device
-            )
-            if passed:
-                released_updates.append(update_obj)
-
-        if quarantine_list is None:
-            self.quarantine_queue.clear()
-
-        return released_updates
-
     def collect_current_round_updates(self, incoming_updates, global_model, val_loader, criterion, global_mse=0.0, device="cpu"):
-        """
-        Executes routing, quarantine inspection, and returns ready updates for current round aggregation.
-        """
+        """Collects DIRECT updates, plus pending Time Buffer and Quarantine Pass updates from previous rounds."""
         current_round_pool = []
 
-        # 1. Retrieve stored updates from previous round's Time Buffer and Quarantine Pass queues
+        # 1. Drain slow clean updates from previous round's staging queues
         for item in self.time_buffer_queue:
             current_round_pool.append(item)
         for item in self.quarantine_pass_queue:
             current_round_pool.append(item)
 
-        # Clear queues for current round populating
         self.time_buffer_queue.clear()
         self.quarantine_pass_queue.clear()
 
-        # 2. Process incoming updates from current round
+        # 2. Process incoming updates for current round
         for update in incoming_updates:
             cid = update["client_id"]
             w = update["weights"]
