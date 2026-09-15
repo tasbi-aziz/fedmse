@@ -79,12 +79,15 @@ class SecurityBuffer:
         return score
 
     def collect_current_round_updates(
-        self,
-        incoming_updates: List[Dict[str, Any]],
-        global_model: nn.Module,
-        global_mse: float = None,
-        device: str = "cpu"
-    ) -> List[Dict[str, Any]]:
+       self, 
+       incoming_updates, 
+       global_model=None, 
+       val_loader=None, 
+       criterion=None, 
+       global_mse=None, 
+       device="cpu",
+       **kwargs
+    ):
         """
         Processes incoming client payloads and routes them via 3-way logic:
         1. Direct Accept: Low latency & passes security evaluation.
