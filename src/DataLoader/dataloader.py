@@ -1,13 +1,14 @@
 """
 PyTorch dataloader for training and evaluating models.
-Updated with safe feature selection bounds and character cleaning.
+Updated for purely numerical datasets using Min-Max Scaling (0 to 1).
 """
 
 import os
 import logging
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import torch
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif
 from torch.utils.data import DataLoader, Dataset
 
@@ -18,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 def load_data(path, header=None):
     dataframe = []
     
-    # --- PERMANENT COLAB FIX ---
+    # --- COLAB FALLBACK PATHS ---
     if not os.path.exists(path):
         logging.warning(f"Path {path} not found. Redirecting to absolute Colab directory...")
         
@@ -68,39 +69,44 @@ class VarianceKBestSelector:
 
 
 class IoTDataProcessor(object):
-    def __init__(self, scaler="standard", use_log_transform=True, n_selected_features=None, threshold=0.01):
+    def __init__(self, scaler="minmax", use_log_transform=False, n_selected_features=None, threshold=0.01):
+        """
+        Default scaler set to 'minmax' [0, 1] for purely numerical data.
+        """
         self.scaler_type = scaler
         self.use_log_transform = use_log_transform
         self.n_selected_features = n_selected_features
         self.threshold = threshold
         
-        if scaler == "standard":
+        if scaler == "minmax":
+            self.scaler = MinMaxScaler(feature_range=(0, 1))
+        elif scaler == "standard":
             self.scaler = StandardScaler()
-        elif scaler == "minmax":
-            self.scaler = MinMaxScaler((0, 1))
         else:
-            raise ValueError(f"Unknown scaler type: {scaler}. Use 'standard' or 'minmax'.")
+            raise ValueError(f"Unknown scaler type: {scaler}. Use 'minmax' or 'standard'.")
 
         self.selector = None
 
-    def _apply_log_transform(self, dataframe):
-        """Applies log(1 + x) transformation to smooth high-variance features."""
-        if not self.use_log_transform:
-            return dataframe
-
+    def _to_numpy(self, dataframe):
+        """Converts numerical dataframe or array directly to float32 numpy array."""
         if isinstance(dataframe, pd.DataFrame):
-            values = dataframe.values
-        else:
-            values = np.array(dataframe)
+            return dataframe.values.astype(np.float32)
+        return np.array(dataframe, dtype=np.float32)
+
+    def _apply_log_transform(self, dataframe):
+        """Applies log(1 + x) transformation if enabled."""
+        values = self._to_numpy(dataframe)
+        if not self.use_log_transform:
+            return values
 
         clipped_values = np.maximum(0, values)
         return np.log1p(clipped_values)
 
     def fit_transform(self, dataframe, abnormal_dataframe=None):
-        """Fits Scaler and Feature Selector on normal/abnormal client training data."""
+        """Fits MinMaxScaler and Feature Selector on normal/abnormal client training data."""
         transformed_input = self._apply_log_transform(dataframe)
         
-        # 1. Scaler Fit & Transform
+        # 1. MinMaxScaler Fit & Transform
         processed_data = self.scaler.fit_transform(transformed_input)
         
         # 2. Feature Selector Fit
@@ -118,7 +124,6 @@ class IoTDataProcessor(object):
                 self.selector = SelectKBest(score_func=f_classif, k=actual_k)
                 self.selector.fit(x_sample, y_sample)
             else:
-                # Fallback: Select Top-K features with highest variance when only normal data is available
                 self.selector = VarianceKBestSelector(k=actual_k)
                 self.selector.fit(processed_data)
         else:
@@ -128,11 +133,11 @@ class IoTDataProcessor(object):
         # 3. Apply Feature Selection
         processed_data = self.selector.transform(processed_data)
         
-        label = [0 for _ in range(len(dataframe))]
-        return processed_data, np.array(label)
+        label = np.zeros(len(processed_data), dtype=np.float32)
+        return processed_data, label
 
     def transform(self, dataframe, type="normal"):
-        """Transforms validation or test data using fitted Scaler and Selector."""
+        """Transforms validation or test data using fitted MinMaxScaler and Selector."""
         transformed_input = self._apply_log_transform(dataframe)
         processed_data = self.scaler.transform(transformed_input)
         
@@ -140,22 +145,22 @@ class IoTDataProcessor(object):
             processed_data = self.selector.transform(processed_data)
         
         if type == "normal":
-            label = [0 for _ in range(len(dataframe))]
+            label = np.zeros(len(dataframe), dtype=np.float32)
         else:
-            label = [1 for _ in range(len(dataframe))]
+            label = np.ones(len(dataframe), dtype=np.float32)
             
-        return processed_data, np.array(label)
+        return processed_data, label
     
     def get_metadata(self):
-        if isinstance(self.scaler, StandardScaler):
-            metadata = {
-                "mean": self.scaler.mean_,
-                "std": self.scaler.scale_
-            }
-        elif isinstance(self.scaler, MinMaxScaler):
+        if isinstance(self.scaler, MinMaxScaler):
             metadata = {
                 "min": self.scaler.data_min_,
                 "max": self.scaler.data_max_
+            }
+        elif isinstance(self.scaler, StandardScaler):
+            metadata = {
+                "mean": self.scaler.mean_,
+                "std": self.scaler.scale_
             }
         else:
             metadata = {}
@@ -166,15 +171,15 @@ class IoTDataset(Dataset):
     """Custom PyTorch Dataset class for N-BAIoT data."""
     
     def __init__(self, data, label):
-        self.data = data
-        self.label = label
+        self.data = data.astype(np.float32)
+        self.label = label.astype(np.float32)
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        X = self.data[idx].astype(np.float32)
-        y = self.label[idx].astype(np.float32)
+        X = torch.tensor(self.data[idx], dtype=torch.float32)
+        y = torch.tensor(self.label[idx], dtype=torch.float32)
         return X, y
     
     @property
@@ -182,5 +187,5 @@ class IoTDataset(Dataset):
         return self.data.shape[1]
 
 
-# Alias for backward compatibility
+# Helper Alias for backward compatibility
 IoTDataProccessor = IoTDataProcessor
