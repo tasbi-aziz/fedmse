@@ -50,7 +50,24 @@ def load_data(path, header=None):
     return dataframe
 
 
-class IoTDataProccessor(object):
+class VarianceKBestSelector:
+    """Helper selector to choose Top-K features based on variance when only normal data is present."""
+    def __init__(self, k):
+        self.k = k
+        self.selected_indices = None
+
+    def fit(self, X):
+        variances = np.var(X, axis=0)
+        self.selected_indices = np.argsort(variances)[-self.k:]
+        return self
+
+    def transform(self, X):
+        if self.selected_indices is None:
+            return X
+        return X[:, self.selected_indices]
+
+
+class IoTDataProcessor(object):
     def __init__(self, scaler="standard", use_log_transform=True, n_selected_features=None, threshold=0.01):
         self.scaler_type = scaler
         self.use_log_transform = use_log_transform
@@ -90,18 +107,20 @@ class IoTDataProccessor(object):
         if self.n_selected_features is not None:
             total_features = processed_data.shape[1]
             actual_k = min(self.n_selected_features, total_features)
-            self.selector = SelectKBest(score_func=f_classif, k=actual_k)
 
-            if abnormal_dataframe is not None:
+            if abnormal_dataframe is not None and len(abnormal_dataframe) > 0:
                 trans_abnormal = self._apply_log_transform(abnormal_dataframe)
                 proc_abnormal = self.scaler.transform(trans_abnormal)
                 
                 x_sample = np.vstack([processed_data, proc_abnormal])
                 y_sample = np.hstack([np.zeros(len(processed_data)), np.ones(len(proc_abnormal))])
+                
+                self.selector = SelectKBest(score_func=f_classif, k=actual_k)
                 self.selector.fit(x_sample, y_sample)
             else:
-                dummy_y = np.zeros(len(processed_data))
-                self.selector.fit(processed_data, dummy_y)
+                # Fallback: Select Top-K features with highest variance when only normal data is available
+                self.selector = VarianceKBestSelector(k=actual_k)
+                self.selector.fit(processed_data)
         else:
             self.selector = VarianceThreshold(threshold=self.threshold)
             self.selector.fit(processed_data)
@@ -163,5 +182,5 @@ class IoTDataset(Dataset):
         return self.data.shape[1]
 
 
-# Alias for clean spelling compatibility
-IoTDataProcessor = IoTDataProccessor
+# Alias for backward compatibility
+IoTDataProccessor = IoTDataProcessor
