@@ -107,11 +107,11 @@ logging.basicConfig(
 
 num_participants = 1.0
 
-epoch = 10
+epoch = 15
 
-num_rounds = 10
+num_rounds = 15
 
-lr_rate = 1e-4
+lr_rate = 1e-5
 
 # VAE latent dimension
 shrink_dim = 16
