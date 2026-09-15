@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import copy
 import torch
@@ -41,11 +42,14 @@ class ClientTrainer:
         self.criterion = nn.MSELoss()
         self.previous_global_model = None
         
-        # Tracked loss metrics
+        # Tracked metrics for Security Buffer & Aggregator
         self.train_loss = 0.0
         self.val_loss = 0.0
         self.val_loss_variance = 0.0
-        self.sub_sample_losses = []
+        self.sub_sample_losses = []   # Raw sub-sample losses
+        self.val_mse_list = []        # 5-fold MSE Behavioral Signature list
+        self.train_time = 0.0         # Measured local training execution time (seconds)
+        self.dataset_size = 0         # Local training dataset size (n_i)
 
         if self.algorithm == "fedprox":
             self.previous_global_model = copy.deepcopy(self.model)
@@ -75,7 +79,7 @@ class ClientTrainer:
         return output_obj
 
     def train(self, train_loader: DataLoader = None) -> float:
-        """Executes local training loop over configured epochs."""
+        """Executes local training loop over configured epochs and records timing & dataset size."""
         loader = train_loader if train_loader is not None else self.train_loader
         if loader is None:
             raise ValueError("No train_loader provided to ClientTrainer.")
@@ -83,6 +87,10 @@ class ClientTrainer:
         self.model.train()
         running_loss = 0.0
         total_batches = 0
+
+        # Track dataset size (n_i)
+        self.dataset_size = len(loader.dataset) if loader.dataset is not None else 0
+        start_time = time.time()
 
         for ep in range(self.epochs):
             for batch in loader:
@@ -105,23 +113,25 @@ class ClientTrainer:
 
                 total_loss.backward()
 
-                # --- STEP 1 FIX: GRADIENT CLIPPING ---
+                # Gradient Clipping to prevent gradient explosion
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                # -------------------------------------
 
                 self.optimizer.step()
 
                 running_loss += reconstruction_loss.item()
                 total_batches += 1
 
+        self.train_time = time.time() - start_time
         self.train_loss = running_loss / max(total_batches, 1)
         return self.train_loss
 
-    def evaluate(self, valid_loader: DataLoader, num_folds: int = 4) -> tuple:
-        """Evaluates local model on validation set using a 4-fold sub-sampling approach."""
+    def evaluate(self, valid_loader: DataLoader, num_folds: int = 5) -> tuple:
+        """Evaluates local model on validation set using a 5-fold sub-sampling approach."""
         if valid_loader is None or valid_loader.dataset is None or len(valid_loader.dataset) == 0:
             self.val_loss = self.train_loss
             self.val_loss_variance = 0.0
+            self.val_mse_list = [self.train_loss] * num_folds
+            self.sub_sample_losses = self.val_mse_list
             return self.val_loss, self.val_loss_variance
 
         self.model.eval()
@@ -161,23 +171,41 @@ class ClientTrainer:
                 avg_fold_loss = fold_loss / max(total_batches, 1)
                 sub_losses.append(avg_fold_loss)
 
+        # Ensure exactly num_folds (5) entries in the MSE list
+        while len(sub_losses) < num_folds:
+            sub_losses.append(sub_losses[-1] if sub_losses else 0.0)
+
         loss_tensor = torch.tensor(sub_losses, dtype=torch.float32)
-        self.sub_sample_losses = sub_losses
+        self.sub_sample_losses = sub_losses[:num_folds]
+        self.val_mse_list = self.sub_sample_losses
         self.val_loss = torch.mean(loss_tensor).item()
         self.val_loss_variance = torch.var(loss_tensor, unbiased=False).item() if len(sub_losses) > 1 else 0.0
 
         return self.val_loss, self.val_loss_variance
 
     def run(self, train_loader: DataLoader, valid_loader: DataLoader = None) -> tuple:
-        """Pipeline runner: executes training, 4-fold sub-sample validation, and auto-saves model."""
+        """Pipeline runner: executes training, 5-fold sub-sample validation, and auto-saves model."""
         self.train(train_loader)
         if valid_loader is not None:
-            val_loss, val_variance = self.evaluate(valid_loader)
+            val_loss, val_variance = self.evaluate(valid_loader, num_folds=5)
         else:
             val_loss, val_variance = self.train_loss, 0.0
 
         self.save_model()
         return val_loss, val_variance
+
+    def get_update_payload() -> dict:
+        """Helper to collect client update payload for Security Buffer."""
+        return {
+            "client_id": self.client_id,
+            "weights": self.get_parameters(),
+            "val_mse_list": self.val_mse_list,
+            "dataset_size": self.dataset_size,
+            "train_time": self.train_time,
+            "val_loss": self.val_loss,
+            "val_variance": self.val_loss_variance,
+            "train_loss": self.train_loss
+        }
 
     def save_model(self):
         """Saves local client model to disk safely."""
