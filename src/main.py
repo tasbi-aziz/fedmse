@@ -1,63 +1,49 @@
 """
-Training endpoint updated with dataset-aware dual-pathway gateway routing (Async FL mode).
-Updated to align cleanly with SecurityBuffer state management and remove hidden formatting characters.
+Main Execution Script for Federated Learning with FedOpt & Security Buffer Routing.
+Includes complete data processing, anomaly detection evaluation (Precision, Recall, F1, AUC),
+Security Buffer tracking, multi-run experiment execution, and JSON reporting.
 """
 
 import os
 import json
-import pickle
 import argparse
 import copy
 import random
 import logging
-import pandas as pd
+import math
 import numpy as np
 import torch
-
+import torch.nn as nn
+import time
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 from torch.utils.data import DataLoader, ConcatDataset
+
 from DataLoader.dataloader import load_data, IoTDataset, IoTDataProccessor
 from Trainer import ClientTrainer, GlobalAggregator
-from Evaluator import Evaluator
-
-# Import Model definitions
+from Trainer.security_buffer import SecurityBuffer
 from Model import Shrink_Autoencoder, Autoencoder
 
-# Import dynamic security buffer
-from Trainer.security_buffer import SecurityBuffer
-
-# Configure logging module
+# Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Global Configurations ---
+# Global Hyperparameters & Configurations
 num_participants = 1.0
 epoch = 10
 num_rounds = 10
-lr_rate = 1e-4           # Learning rate increased to 1e-4 for faster convergence
-shrink_dim = 16          # Latent bottleneck dimension
-threshold_val = 0.2     # Threshold for shrinkage operator
+lr_rate = 1e-4
+shrink_dim = 16
+threshold_val = 0.2
 network_size = 10
 data_seed = 1234
-
-no_Exp = (
-    f"IID-Update_Exp6_scale_{epoch}epoch_{network_size}client_{num_rounds}rounds_"
-    f"lr{lr_rate}_ratio{num_participants*100}_dataseed{data_seed}"
-)
-
 num_runs = 5
 batch_size = 64
+dim_features = 64
 
-new_device = True
-min_val_loss = float("inf")
-global_patience = 5
-global_worse = 0
-metric = "AUC"
-dim_features = 64        # Target dimension after feature selection
-
-scen_name = 'FL-IoT'
 config_file = "/content/fedmse/Configuration/scen2-nba-iot-10clients.json"
 
 
 def set_seeds(seed):
+    """Sets deterministic random seeds across all libraries."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -65,343 +51,332 @@ def set_seeds(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def real_evaluator_fn(candidate_model, val_loader, device="cpu", model_template=None):
-    """Evaluator function to calculate Reconstruction MSE Loss."""
-    if candidate_model is None or val_loader is None:
-        return float("inf")
-
-    if isinstance(candidate_model, dict):
-        if model_template is None:
-            return float("inf")
-        eval_model = copy.deepcopy(model_template)
-        eval_model.load_state_dict(candidate_model)
-    else:
-        eval_model = candidate_model
-
-    eval_model.to(device)
-    eval_model.eval()
-
-    total_mse = 0.0
-    total_samples = 0
-    criterion = torch.nn.MSELoss()
+def evaluate_global_mse(global_model, val_loader, device="cpu"):
+    """Computes baseline Reconstruction Loss (MSE) of global model on validation dataset."""
+    if global_model is None or val_loader is None:
+        return 0.0
+    global_model.eval()
+    total_loss, total_samples = 0.0, 0
+    criterion = nn.MSELoss()
 
     with torch.no_grad():
         for batch in val_loader:
-            if isinstance(batch, (list, tuple)):
-                inputs = batch[0].to(device)
-            else:
-                inputs = batch.to(device)
-
-            outputs = eval_model(inputs)
-            if isinstance(outputs, tuple):
+            inputs = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
+            outputs = global_model(inputs)
+            if isinstance(outputs, (tuple, list)):
                 outputs = outputs[0]
-
             loss = criterion(outputs, inputs)
-            total_mse += loss.item() * inputs.size(0)
+            total_loss += loss.item() * inputs.size(0)
             total_samples += inputs.size(0)
 
-    return total_mse / max(total_samples, 1)
+    return total_loss / max(total_samples, 1)
+
+
+def compute_reconstruction_errors(model, data_loader, device="cpu"):
+    """Calculates sample-wise MSE reconstruction errors."""
+    model.eval()
+    errors = []
+    criterion = nn.MSELoss(reduction='none')
+
+    with torch.no_grad():
+        for batch in data_loader:
+            inputs = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
+            outputs = model(inputs)
+            if isinstance(outputs, (tuple, list)):
+                outputs = outputs[0]
+            
+            # Per-sample MSE
+            loss = criterion(outputs, inputs).mean(dim=1)
+            errors.extend(loss.cpu().numpy())
+
+    return np.array(errors)
+
+
+def evaluate_anomaly_detection(model, test_loader, device="cpu"):
+    """
+    Evaluates model performance on anomaly detection test set.
+    Returns Precision, Recall, F1-Score, ROC-AUC, and Confusion Matrix.
+    """
+    model.eval()
+    y_true = []
+    reconstruction_errors = []
+    criterion = nn.MSELoss(reduction='none')
+
+    with torch.no_grad():
+        for batch in test_loader:
+            inputs, labels = batch[0].to(device), batch[1].cpu().numpy()
+            outputs = model(inputs)
+            if isinstance(outputs, (tuple, list)):
+                outputs = outputs[0]
+
+            loss = criterion(outputs, inputs).mean(dim=1).cpu().numpy()
+            reconstruction_errors.extend(loss)
+            y_true.extend(labels)
+
+    y_true = np.array(y_true)
+    reconstruction_errors = np.array(reconstruction_errors)
+
+    # Dynamic Threshold Selection based on Normal Data Percentile
+    normal_errors = reconstruction_errors[y_true == 0]
+    if len(normal_errors) > 0:
+        threshold = np.percentile(normal_errors, 95)
+    else:
+        threshold = np.mean(reconstruction_errors) + np.std(reconstruction_errors)
+
+    y_pred = (reconstruction_errors > threshold).astype(int)
+
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+
+    try:
+        auc = roc_auc_score(y_true, reconstruction_errors)
+    except ValueError:
+        auc = 0.5
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+
+    metrics = {
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1_score": float(f1),
+        "auc_roc": float(auc),
+        "threshold": float(threshold),
+        "tp": int(tp),
+        "fp": int(fp),
+        "tn": int(tn),
+        "fn": int(fn)
+    }
+    return metrics
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Federated Learning with Dynamic Security Buffer")
-    parser.add_argument(
-        "--base_similarity_threshold",
-        type=float,
-        default=0.65,
-        help="Base similarity threshold (tau_0) for dataset-aware similarity scaling (default: 0.65)"
-    )
-    parser.add_argument(
-        "--latency_threshold",
-        type=float,
-        default=20.0,
-        help="Initial maximum seconds allowed for direct aggregation path (default: 20.0)"
-    )
+    parser = argparse.ArgumentParser(description="Federated Learning Evaluation Pipeline with FedOpt")
+    parser.add_argument("--latency_threshold", type=float, default=20.0, help="Latency limit for direct aggregation")
+    parser.add_argument("--update_type", type=str, default="fedopt", help="Aggregation type: fedopt or weighted")
+    parser.add_argument("--server_lr", type=float, default=1.0, help="Server-side learning rate for FedOpt")
+    parser.add_argument("--output_dir", type=str, default="./results", help="Output metrics log directory")
     args = parser.parse_args()
 
+    os.makedirs(args.output_dir, exist_ok=True)
     set_seeds(data_seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Using compute device: {device}")
+    logging.info(f"Execution started on target device: {device}")
 
-    try:
-        logging.info("Loading configuration...")
-        with open(config_file, "r") as config_f:
-            config = json.load(config_f)
-    except Exception as e:
-        logging.error("Failed to load configuration file.", exc_info=True)
-        raise e
+    # Load Configuration JSON
+    with open(config_file, "r") as config_f:
+        config = json.load(config_f)
 
     devices_list = random.sample(config['devices_list'], network_size)
     client_info = []
 
-    # --- Data Preparation for Clients ---
+    logging.info("Initializing Data Processors and Partitioning Client Datasets...")
+
+    # Load Client Data Pipelines
     for dev in devices_list:
-        logging.info("Creating metadata for client...")
         normal_data_path = os.path.join(config['data_path'], dev["normal_data_path"])
         abnormal_data_path = os.path.join(config['data_path'], dev["normal_data_path"].replace("normal", "test_normal"))
-        test_new_normal_data_path = os.path.join(config['data_path'], dev["test_normal_data_path"])
-
-        logging.info(f"Loading data from {dev['name']}...")
 
         normal_data = load_data(normal_data_path).sample(frac=1).reset_index(drop=True)
         abnormal_data = load_data(abnormal_data_path).sample(frac=1).reset_index(drop=True)
 
-        if new_device:
-            new_normal_data = load_data(test_new_normal_data_path)
-
-        device_name = dev['name']
-        print(f"{device_name} has {len(normal_data)} normal data and {len(abnormal_data)} abnormal data")
-
         train_normal_size = int(0.4 * len(normal_data))
         valid_normal_size = int(0.1 * len(normal_data))
-        dev_normal_size = int(0.4 * len(normal_data))
 
         train_normal_data = normal_data[:train_normal_size]
         valid_normal_data = normal_data[train_normal_size:train_normal_size + valid_normal_size]
-        dev_normal_data = normal_data[train_normal_size + valid_normal_size:train_normal_size + valid_normal_size + dev_normal_size]
-        test_normal_data = normal_data[train_normal_size + valid_normal_size + dev_normal_size:]
+        test_normal_data = normal_data[train_normal_size + valid_normal_size:]
 
-        # Initializing DataProcessor with Feature Selection
         data_processor = IoTDataProccessor(scaler="standard", use_log_transform=True, n_selected_features=dim_features)
         
         processed_train_data, train_label = data_processor.fit_transform(train_normal_data, abnormal_dataframe=abnormal_data)
-        
-        # Synchronize feature size dynamically
         dim_features = processed_train_data.shape[1]
 
         processed_valid_data, valid_label = data_processor.transform(valid_normal_data)
-        processed_test_data, test_label = data_processor.transform(test_normal_data)
-        processed_abnormal_data, abnormal_label = data_processor.transform(abnormal_data, type="abnormal")
+        processed_test_normal, test_normal_label = data_processor.transform(test_normal_data)
+        processed_test_abnormal, test_abnormal_label = data_processor.transform(abnormal_data)
 
-        if new_device:
-            processed_new_normal_data, new_normal_label = data_processor.transform(new_normal_data)
-            processed_test_data = np.concatenate([processed_test_data, processed_new_normal_data], axis=0)
-            processed_test_label = np.concatenate([test_label, new_normal_label], axis=0)
-            base_test_dataset = IoTDataset(processed_test_data, processed_test_label)
-        else:
-            base_test_dataset = IoTDataset(processed_test_data, test_label)
+        # Merge Test Sets (Normal + Abnormal)
+        test_data_combined = np.vstack([processed_test_normal, processed_test_abnormal])
+        test_label_combined = np.hstack([np.zeros(len(processed_test_normal)), np.ones(len(processed_test_abnormal))])
 
         train_dataset = IoTDataset(processed_train_data, train_label)
         valid_dataset = IoTDataset(processed_valid_data, valid_label)
-        abnormal_dataset = IoTDataset(processed_abnormal_data, abnormal_label)
+        test_dataset = IoTDataset(test_data_combined, test_label_combined)
 
-        test_dataset = ConcatDataset([base_test_dataset, abnormal_dataset])
+        train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, pin_memory=True, shuffle=True)
+        valid_loader = DataLoader(dataset=valid_dataset, batch_size=batch_size, pin_memory=True, shuffle=False)
+        test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, pin_memory=True, shuffle=False)
 
-        train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, pin_memory=True)
-        valid_loader = DataLoader(dataset=valid_dataset, batch_size=batch_size, pin_memory=True)
-        test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, pin_memory=True)
+        sim_train = dev.get("simulated_training_time", random.uniform(1.0, 5.0))
+        sim_comm = dev.get("simulated_comm_time", random.uniform(0.2, 1.5))
+
+        client_dir = os.path.join(args.output_dir, dev['name'])
+        os.makedirs(client_dir, exist_ok=True)
 
         client_info.append({
             "device": dev['name'],
-            "save_dir": "",
+            "save_dir": client_dir,
             "train_loader": train_loader,
             "valid_loader": valid_loader,
             "test_loader": test_loader,
-            "test_dataset": (processed_test_data, test_label),
-            "dev_normal_dataset": dev_normal_data,
-            "data_processor": data_processor,
-            "sim_train_time": dev.get("simulated_training_time", 1.5),
-            "sim_comm_time": dev.get("simulated_comm_time", 0.5)
+            "sim_train_time": sim_train,
+            "sim_comm_time": sim_comm
         })
 
-    # Global Validation Set
-    server_val_dataset = ConcatDataset([client['valid_loader'].dataset for client in client_info])
+    # Combined Global Validation Dataset
+    server_val_dataset = ConcatDataset([c['valid_loader'].dataset for c in client_info])
     server_val_loader = DataLoader(dataset=server_val_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Combined Global Test Dataset
+    server_test_dataset = ConcatDataset([c['test_loader'].dataset for c in client_info])
+    server_test_loader = DataLoader(dataset=server_test_dataset, batch_size=batch_size, shuffle=False)
 
-    # --- Training & Experimentation Pipeline ---
-    for update_type in ["avg", "fedprox", "mse_avg"]:
-        for model_type in ["hybrid", "autoencoder"]:
-            for run in range(num_runs):
-                set_seeds(run * 10000)
+    criterion = nn.MSELoss()
+    all_experiment_results = {}
 
+    # Main Experiment Loop over Architectures
+    for model_type in ["hybrid", "autoencoder"]:
+        logging.info(f"\n================ STARTING EXPERIMENTS FOR MODEL TYPE: {model_type.upper()} ================\n")
+        all_experiment_results[model_type] = []
+
+        for run in range(num_runs):
+            run_seed = (run + 1) * 10000
+            set_seeds(run_seed)
+            logging.info(f"--- Starting Execution Run {run + 1}/{num_runs} (Seed: {run_seed}) ---")
+
+            # Model Initialization
+            if model_type == "hybrid":
+                global_model = Shrink_Autoencoder(input_dim=dim_features, shrink_dim=shrink_dim, threshold=threshold_val)
+            else:
+                global_model = Autoencoder(input_dim=dim_features, latent_dim=shrink_dim)
+
+            global_model.to(device)
+
+            # Initialize FedOpt Aggregator & Adaptive Security Buffer
+            global_aggregator = GlobalAggregator(
+                model=global_model, 
+                update_type=args.update_type, 
+                server_lr=args.server_lr
+            )
+            sec_buffer_tracker = SecurityBuffer(
+                global_model=global_model,
+                window_size=5,
+                latency_threshold=args.latency_threshold,
+                alpha=0.2,
+                beta=0.01
+            )
+
+            run_round_history = []
+
+            for round_idx in range(num_rounds):
+                round_start_time = time.time()
+                logging.info(f"[Run {run + 1} | Model {model_type}] --- Round {round_idx + 1}/{num_rounds} ---")
+
+                # Baseline Server MSE
+                global_mse = evaluate_global_mse(global_aggregator.model, server_val_loader, device=device)
+                incoming_updates = []
+
+                # Client Local Training Phase
                 for client in client_info:
-                    client['save_dir'] = os.path.join(
-                        f"Checkpoint/{network_size}/{no_Exp}/{run}/ClientModel",
-                        scen_name, model_type, update_type, client['device']
+                    c_start = time.time()
+                    device_trainer = ClientTrainer(
+                        model=global_aggregator.model,
+                        save_dir=client['save_dir'],
+                        epoch=epoch,
+                        lr_rate=lr_rate,
+                        update_type=args.update_type
                     )
 
-                global_worse = 0
-                min_val_loss = float("inf")
+                    # Execute Training
+                    device_trainer.run(client["train_loader"], client["valid_loader"])
+                    compute_time = time.time() - c_start
 
-                directory = f'Checkpoint/Results/Update/{network_size}/{no_Exp}/Run_{run}/{metric}'
-                os.makedirs(directory, exist_ok=True)
+                    client_val_loss = getattr(device_trainer, "val_loss", 1.0)
+                    raw_weights = copy.deepcopy(device_trainer.model.state_dict())
+                    
+                    # Latency calculation (Compute + Simulated Network Delay)
+                    total_arrival_latency = compute_time + client['sim_comm_time']
 
-                filename = f'{directory}/{scen_name}_{num_participants}_{model_type}_{update_type}_results.json'
-                open(filename, 'w').close()
+                    incoming_updates.append({
+                        "client_id": client['device'],
+                        "weights": raw_weights,
+                        "arrival_time": total_arrival_latency,
+                        "val_loss": client_val_loss,
+                        "val_loss_variance": getattr(device_trainer, "val_loss_variance", 0.0)
+                    })
 
-                # Dynamic Model Initialization with verified dim_features
-                if model_type == "hybrid":
-                    global_model = Shrink_Autoencoder(
-                        input_dim=dim_features,
-                        shrink_dim=shrink_dim,
-                        threshold=threshold_val
-                    )
-                else:
-                    global_model = Autoencoder(
-                        input_dim=dim_features,
-                        latent_dim=shrink_dim
-                    )
-
-                global_model.to(device)
-
-                # Initialize Aggregator
-                global_aggregator = GlobalAggregator(global_model, update_type=update_type)
-
-                # Initialize Security Buffer for current run
-                sec_buffer_tracker = SecurityBuffer(
-                    global_model=global_model,
-                    window_size=5,
-                    latency_threshold=args.latency_threshold,
-                    base_similarity_threshold=args.base_similarity_threshold,
-                    max_variance_threshold=0.05
+                # Route updates via 3-Way Security Buffer
+                ready_updates = sec_buffer_tracker.collect_current_round_updates(
+                    incoming_updates=incoming_updates,
+                    global_model=global_aggregator.model,
+                    val_loader=server_val_loader,
+                    criterion=criterion,
+                    global_mse=global_mse,
+                    device=device
                 )
 
-                min_len = min([len(client['dev_normal_dataset']) for client in client_info])
-                dev_dataset_sampled_list = []
-                for client in client_info:
-                    sample_df = client['dev_normal_dataset'].sample(n=min_len)
-                    processed_sample, _ = client['data_processor'].transform(sample_df)
-                    dev_dataset_sampled_list.append(processed_sample)
+                # Server Aggregation via FedOpt / FedAdam
+                global_aggregator.aggregate(client_updates=ready_updates)
 
-                dev_dataset_sampled = np.concatenate(dev_dataset_sampled_list, axis=0)
+                # Round Evaluation
+                round_duration = time.time() - round_start_time
+                post_eval_mse = evaluate_global_mse(global_aggregator.model, server_val_loader, device=device)
+                
+                # Global Test Anomaly Metrics
+                global_metrics = evaluate_anomaly_detection(global_aggregator.model, server_test_loader, device=device)
 
-                if hasattr(global_aggregator, "create_dev_dataset"):
-                    global_aggregator.create_dev_dataset({"dataset": dev_dataset_sampled})
+                round_record = {
+                    "round": round_idx + 1,
+                    "global_val_mse": post_eval_mse,
+                    "test_precision": global_metrics["precision"],
+                    "test_recall": global_metrics["recall"],
+                    "test_f1": global_metrics["f1_score"],
+                    "test_auc": global_metrics["auc_roc"],
+                    "round_duration": round_duration,
+                    "accepted_updates": len(ready_updates)
+                }
 
-                results = []
-                client_latent = {}
+                run_round_history.append(round_record)
 
-                # --- Asynchronous FL Training Loop ---
-                for round_idx in range(num_rounds):
-                    if model_type == "hybrid":
-                        client_latent[round_idx] = {}
+                logging.info(
+                    f"[Round {round_idx + 1} Finished] Val MSE: {post_eval_mse:.6f} | "
+                    f"F1: {global_metrics['f1_score']:.4f} | AUC: {global_metrics['auc_roc']:.4f} | "
+                    f"Duration: {round_duration:.2f}s"
+                )
 
-                    selected_idx = random.sample(
-                        list(range(len(client_info))),
-                        int(num_participants * len(client_info))
-                    )
-                    selected_clients = [client_info[i] for i in selected_idx]
+            all_experiment_results[model_type].append(run_round_history)
 
-                    total_training_samples = sum([len(client['train_loader'].dataset) for client in selected_clients])
-                    n_avg = total_training_samples / len(selected_clients) if selected_clients else 1.0
+            # Save Model Checkpoint
+            checkpoint_path = os.path.join(args.output_dir, f"{model_type}_run{run + 1}_checkpoint.pth")
+            torch.save(global_aggregator.model.state_dict(), checkpoint_path)
+            logging.info(f"Saved run checkpoint to: {checkpoint_path}")
 
-                    for i, client in enumerate(selected_clients):
-                        logging.info(f"Async training local model on client: {client['device']}...")
+    # Summarize Run Metric Statistics (Mean ± Std)
+    summary_report = {}
+    for m_type in all_experiment_results:
+        final_f1_scores = [run_data[-1]["test_f1"] for run_data in all_experiment_results[m_type]]
+        final_auc_scores = [run_data[-1]["test_auc"] for run_data in all_experiment_results[m_type]]
+        final_mse_scores = [run_data[-1]["global_val_mse"] for run_data in all_experiment_results[m_type]]
 
-                        device_trainer = ClientTrainer(
-                            model=global_aggregator.model,
-                            save_dir=client['save_dir'],
-                            epoch=epoch,
-                            lr_rate=lr_rate,
-                            update_type=update_type
-                        )
+        summary_report[m_type] = {
+            "mean_f1": float(np.mean(final_f1_scores)),
+            "std_f1": float(np.std(final_f1_scores)),
+            "mean_auc": float(np.mean(final_auc_scores)),
+            "std_auc": float(np.std(final_auc_scores)),
+            "mean_mse": float(np.mean(final_mse_scores)),
+            "std_mse": float(np.std(final_mse_scores))
+        }
 
-                        trainer_result = device_trainer.run(client["train_loader"], client["valid_loader"])
+    # Save Results to JSON
+    output_json_struct = {
+        "summary": summary_report,
+        "detailed_runs": all_experiment_results
+    }
 
-                        client_val_loss = getattr(device_trainer, "val_loss", None)
-                        if client_val_loss is None and isinstance(trainer_result, (float, int)):
-                            client_val_loss = trainer_result
-                        elif client_val_loss is None:
-                            client_val_loss = 1.0
+    results_json_path = os.path.join(args.output_dir, "experiment_execution_results.json")
+    with open(results_json_path, "w") as f:
+        json.dump(output_json_struct, f, indent=4)
 
-                        client_val_variance = getattr(device_trainer, "val_loss_variance", 0.0)
-
-                        raw_weights = copy.deepcopy(device_trainer.model.state_dict())
-                        sample_count = len(client["train_loader"].dataset)
-                        arrival_time = client['sim_train_time'] + client['sim_comm_time']
-
-                        if hasattr(sec_buffer_tracker, "global_model"):
-                            sec_buffer_tracker.global_model = global_aggregator.model
-
-                        # --- SECURITY GATE EVALUATION ---
-                        route_status, current_sim, tau_sim, update_obj = sec_buffer_tracker.evaluate_and_route_update(
-                            client_id=client['device'],
-                            local_model_state=raw_weights,
-                            dataset_size=sample_count,
-                            arrival_time=arrival_time,
-                            n_avg=n_avg,
-                            val_loss_variance=client_val_variance
-                        )
-
-                        if route_status == "DIRECT_PATH":
-                            global_aggregator.aggregate(
-                                client_models=[raw_weights],
-                                client_losses=[client_val_loss] if update_type == "mse_avg" else None
-                            )
-                            logging.info(f"Client {client['device']} update instantly aggregated via DIRECT_PATH.")
-
-                        elif route_status == "QUARANTINE":
-                            logging.info(f"Client {client['device']} quarantined (Sim: {current_sim:.4f} < Tau: {tau_sim:.4f}).")
-
-                    # Process Quarantine Buffer
-                    released_quarantine_updates = sec_buffer_tracker.process_quarantine_validation(
-                        evaluator_fn=lambda m: real_evaluator_fn(m, server_val_loader, device, model_template=global_model),
-                        validation_loader=server_val_loader
-                    )
-
-                    if released_quarantine_updates:
-                        logging.info(f"Merging {len(released_quarantine_updates)} verified updates from QUARANTINE.")
-                        global_aggregator.aggregate(
-                            client_models=released_quarantine_updates,
-                            client_losses=None
-                        )
-
-                    current_global_loss = real_evaluator_fn(
-                        global_aggregator.model,
-                        server_val_loader,
-                        device,
-                        model_template=global_model
-                    )
-
-                    if current_global_loss is None:
-                        current_global_loss = 0.0
-
-                    global_aggregator.val_loss = current_global_loss
-                    logging.info(f"Cycle {round_idx+1}/{num_rounds} - Updated global model - Global loss: {current_global_loss:.6f}")
-
-                    # Early Stopping & Best Model Checkpointing
-                    best_model_dir = f'Checkpoint/BestModel/{network_size}/{no_Exp}/Run_{run}/{model_type}_{update_type}'
-                    os.makedirs(best_model_dir, exist_ok=True)
-                    best_model_path = os.path.join(best_model_dir, f"{scen_name}_best_model.pth")
-
-                    if current_global_loss < min_val_loss:
-                        min_val_loss = current_global_loss
-                        global_worse = 0
-                        torch.save(global_aggregator.model.state_dict(), best_model_path)
-                        logging.info(f"Global validation loss improved to {min_val_loss:.6f}. Saved best checkpoint.")
-                    else:
-                        global_worse += 1
-                        logging.info(f"Global validation loss did not improve. Patience: {global_worse}/{global_patience}")
-
-                    logging.info("Async cycle finished! Evaluating performance...")
-                    global_aggregator.model.to(device)
-                    evaluator = Evaluator(global_aggregator.model, metric=metric, model_type=model_type, device=device)
-                    round_results = {}
-
-                    for i, client in enumerate(client_info):
-                        logging.info(f"Evaluating client {i} - name: {client['device']}")
-                        if model_type == "hybrid":
-                            auc_score, test_latent, test_label = evaluator.evaluate(client["test_loader"], client["train_loader"])
-                            client_latent[round_idx][client['device']] = (test_latent, test_label)
-                        else:
-                            auc_score = evaluator.evaluate(client["test_loader"], client["train_loader"])
-
-                        round_results[client['device']] = auc_score
-
-                    round_results["global_loss"] = current_global_loss
-                    round_results['join_clients'] = selected_idx
-                    round_results = {f'round_{round_idx+1}': round_results}
-
-                    with open(filename, 'a') as f:
-                        f.write(json.dumps(round_results) + '\n')
-
-                    if global_worse >= global_patience:
-                        logging.info(f"Early stopping triggered at round {round_idx + 1}.")
-                        break
-
-                if model_type == "hybrid":
-                    file_path = f'Checkpoint/LatentData/{network_size}/{no_Exp}/Run_{run}/latent_{model_type}_{update_type}.pkl'
-                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                    with open(file_path, 'wb') as f:
-                        pickle.dump(client_latent, f)
+    logging.info(f"\n================ PIPELINE EXECUTION COMPLETED ================")
+    logging.info(f"Results Summary saved successfully to: {results_json_path}")
