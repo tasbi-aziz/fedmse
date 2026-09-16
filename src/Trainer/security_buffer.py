@@ -69,7 +69,6 @@ class SecurityBuffer:
         # ---------------------------------------------------------
 
         self.window_size = window_size
-
         self.latency_threshold = latency_threshold
 
         self.alpha = alpha
@@ -949,6 +948,18 @@ class SecurityBuffer:
             bool(mse_history_fail)
         ])
 
+        # =========================================================
+        # NEW: INDIVIDUAL CONDITION DIAGNOSTIC LOG
+        # =========================================================
+
+        logging.info(
+            f"[Security Buffer] Client {client_id} | "
+            f"MagnitudeFail={magnitude_fail} | "
+            f"TimingFail={timing_fail} | "
+            f"LossFail={loss_fail} | "
+            f"MSEHistoryFail={mse_history_fail}"
+        )
+
         total_conditions = 4
 
         risk_score = (
@@ -1118,7 +1129,7 @@ class SecurityBuffer:
             )
 
             # -----------------------------------------------------
-            # NEW: FINITE SAFETY CHECK
+            # FINITE SAFETY CHECK
             # -----------------------------------------------------
 
             if not self._is_update_finite(
@@ -1265,7 +1276,7 @@ class SecurityBuffer:
             )
 
             # -----------------------------------------------------
-            # NEW: FINITE SAFETY CHECK
+            # FINITE SAFETY CHECK
             #
             # This happens BEFORE the four behavioral checks.
             # NaN/Inf is NOT counted in failed_conditions.
