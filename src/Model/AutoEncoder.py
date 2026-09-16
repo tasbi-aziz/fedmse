@@ -140,6 +140,10 @@ class Encoder(nn.Module):
         Returns:
             mu
             logvar
+
+        logvar is clipped to a numerically stable range
+        to prevent exp(logvar) from becoming excessively
+        large during VAE training.
         """
 
         hidden = self.encoder_network(
@@ -152,6 +156,28 @@ class Encoder(nn.Module):
 
         logvar = self.logvar_layer(
             hidden
+        )
+
+        # --------------------------------------------------------
+        # Numerical stability:
+        #
+        # Prevent logvar from becoming extremely large or small.
+        #
+        # This stabilizes:
+        #
+        #     exp(logvar)
+        #
+        # and
+        #
+        #     exp(0.5 * logvar)
+        #
+        # used in KL loss and reparameterization.
+        # --------------------------------------------------------
+
+        logvar = torch.clamp(
+            logvar,
+            min=-10.0,
+            max=10.0
         )
 
         return mu, logvar
@@ -352,6 +378,8 @@ class Autoencoder(nn.Module):
         where:
 
             epsilon ~ N(0, I)
+
+        logvar has already been clipped inside the encoder.
         """
 
         # Standard deviation
@@ -388,6 +416,8 @@ class Autoencoder(nn.Module):
             KL(q(z|x) || N(0,I))
 
         Returns mean KL loss over the batch.
+
+        logvar is already bounded by the encoder.
         """
 
         kl = -0.5 * torch.sum(
@@ -534,7 +564,7 @@ class Autoencoder(nn.Module):
         """
         Returns mu, logvar.
 
-        Useful when the latent distribution is needed.
+        logvar returned here is also clipped.
         """
 
         return self.encoder(
