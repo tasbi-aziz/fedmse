@@ -21,7 +21,8 @@ class GlobalAggregator:
         beta1: float = 0.9,
         beta2: float = 0.999,
         tau: float = 1e-3,
-        max_server_update_norm: float = 1.0
+        max_server_update_norm: float = 1.0,
+        max_server_step_norm: float = 0.1
     ):
         """
         Global Aggregator for FedMSE using:
@@ -33,9 +34,14 @@ class GlobalAggregator:
 
             W_i = dataset_size * weight_factor
 
-        Server-side pseudo-gradient clipping is applied to
-        prevent extreme aggregated updates from destabilizing
-        the global model.
+        Two levels of server-side protection are applied:
+
+        1. Pseudo-gradient clipping
+           Prevents extreme aggregated client updates.
+
+        2. Final server-step clipping
+           Prevents the Adam/FedOpt server step from becoming
+           excessively large after moment normalization.
 
         Parameters
         ----------
@@ -60,6 +66,10 @@ class GlobalAggregator:
         max_server_update_norm:
             Maximum norm allowed for each server-side
             pseudo-gradient tensor.
+
+        max_server_step_norm:
+            Maximum norm allowed for the final Adam/FedOpt
+            server step.
         """
 
         self.model = model
@@ -76,6 +86,14 @@ class GlobalAggregator:
 
         self.max_server_update_norm = (
             max_server_update_norm
+        )
+
+        # ---------------------------------------------------------
+        # NEW: Final Server Step Norm Limit
+        # ---------------------------------------------------------
+
+        self.max_server_step_norm = (
+            max_server_step_norm
         )
 
         # ---------------------------------------------------------
@@ -187,6 +205,62 @@ class GlobalAggregator:
             grad = grad * scale
 
         return grad
+
+    # =============================================================
+    # NEW: FINAL SERVER STEP CLIPPING
+    # =============================================================
+
+    def _clip_server_step(
+        self,
+        step_update: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Clips the final FedOpt/FedAdam server step
+        using an L2 norm.
+
+        This is applied AFTER Adam moment calculation:
+
+            pseudo-gradient
+                    ↓
+              m_t and v_t
+                    ↓
+             Adam normalization
+                    ↓
+              server step
+                    ↓
+             THIS CLIPPING
+                    ↓
+          global model update
+
+        This protects the global model from excessively
+        large server-side parameter changes.
+        """
+
+        if step_update is None:
+            return step_update
+
+        step_norm = torch.norm(
+            step_update,
+            p=2
+        )
+
+        if (
+            torch.isfinite(step_norm)
+            and
+            step_norm > self.max_server_step_norm
+        ):
+
+            scale = (
+                self.max_server_step_norm
+                /
+                (step_norm + 1e-12)
+            )
+
+            step_update = (
+                step_update * scale
+            )
+
+        return step_update
 
     # =============================================================
     # AGGREGATE
@@ -302,25 +376,31 @@ class GlobalAggregator:
             # -----------------------------------------------------
 
             try:
+
                 n_i = max(
                     float(n_i),
                     0.0
                 )
+
             except (
                 TypeError,
                 ValueError
             ):
+
                 n_i = 1.0
 
             try:
+
                 w_i = max(
                     float(w_i),
                     0.0
                 )
+
             except (
                 TypeError,
                 ValueError
             ):
+
                 w_i = 1.0
 
             effective_weight = (
@@ -367,6 +447,7 @@ class GlobalAggregator:
         ):
 
             try:
+
                 device = next(
                     self.model.parameters()
                 ).device
@@ -453,7 +534,7 @@ class GlobalAggregator:
                 )
 
                 # -------------------------------------------------
-                # SERVER-SIDE GRADIENT CLIPPING
+                # SERVER-SIDE PSEUDO-GRADIENT CLIPPING
                 # -------------------------------------------------
 
                 grad = self._clip_server_gradient(
@@ -542,6 +623,10 @@ class GlobalAggregator:
                         self.tau
                     )
 
+                    # -------------------------------------------------
+                    # SERVER STEP CALCULATION
+                    # -------------------------------------------------
+
                     step_update = (
                         self.server_lr
                         *
@@ -551,6 +636,16 @@ class GlobalAggregator:
                             denom
                         )
                     ).to(device)
+
+                    # -------------------------------------------------
+                    # NEW: FINAL SERVER STEP CLIPPING
+                    # -------------------------------------------------
+
+                    step_update = (
+                        self._clip_server_step(
+                            step_update
+                        )
+                    )
 
                     # -------------------------------------------------
                     # Global update
