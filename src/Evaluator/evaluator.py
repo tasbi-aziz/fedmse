@@ -1,13 +1,20 @@
+"""
+Model Evaluator module for Autoencoder and Hybrid (Centroid-based) anomaly detection models.
+Provides single and joint side-by-side performance evaluation.
+"""
+
 import logging
+import time
 import numpy as np
 import torch
 from tqdm import tqdm
-from sklearn.metrics import (
-    roc_curve,
-    auc,
-    f1_score,
-    precision_score,
-    recall_score
+from sklearn.metrics import roc_curve, auc, f1_score, precision_score, recall_score
+from Model.Centroid import CentroidBasedOneClassClassifier
+
+# Configure the logging module
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
 
@@ -19,7 +26,15 @@ class Evaluator(object):
         model_type="both",
         metric="AUC",
         device=None
-    ):
+    ) -> None:
+
+        """
+        :param model: Trained PyTorch model (Autoencoder or similar)
+        :param model_type: "autoencoder", "hybrid", or "both" for direct comparison
+        :param metric: "AUC", "classification", or "time"
+        :param device: torch.device instance
+        """
+
         self.device = (
             device
             if device is not None
@@ -35,37 +50,50 @@ class Evaluator(object):
         self.metric = metric
 
     # ============================================================
-    # EXTRACT MODEL OUTPUT
+    # EXTRACT FEATURES AND RECONSTRUCTION
     # ============================================================
 
     def _extract_features_and_output(self, batch_data):
 
+        """
+        Safely extracts latent representation and reconstructed
+        output from the model.
+
+        VAE returns:
+
+            (output, mu, logvar)
+
+        Therefore:
+
+            output = model_out[0]  -> reconstruction X_hat
+            latent = model_out[1]  -> mu
+
+        The previous implementation assumed:
+
+            (latent, reconstruction)
+
+        which was incorrect for the current VAE.
+        """
+
         model_out = self.model(batch_data)
 
         # --------------------------------------------------------
-        # VAE / Autoencoder
+        # VAE / Autoencoder returning tuple
         #
-        # Your VAE returns:
+        # Current VAE:
         #
         #     (output, mu, logvar)
         #
-        # Therefore:
-        #
-        #     model_out[0] = reconstruction
-        #     model_out[1] = mu
-        #     model_out[2] = logvar
         # --------------------------------------------------------
 
         if isinstance(model_out, (tuple, list)):
 
-            # Reconstruction
+            # First element is the reconstructed output
             output = model_out[0]
 
-            # Latent representation
-            #
-            # For the VAE, mu is the deterministic latent
-            # representation and is therefore used as latent
-            # features when needed.
+            # Second element is mu
+            # which is used as the deterministic latent
+            # representation for Hybrid evaluation.
             if len(model_out) > 1:
                 latent = model_out[1]
             else:
@@ -73,17 +101,24 @@ class Evaluator(object):
 
         else:
 
+            # Standard model returning only reconstruction
             output = model_out
+
+            # ----------------------------------------------------
+            # If model has encode(), extract latent representation
+            # ----------------------------------------------------
 
             if hasattr(self.model, "encode"):
 
-                encoded = self.model.encode(batch_data)
+                encoded = self.model.encode(
+                    batch_data
+                )
 
                 # VAE encode() returns:
                 #
                 #     (mu, logvar)
                 #
-                # We use mu as the latent representation.
+                # Use mu as latent representation.
                 if isinstance(
                     encoded,
                     (tuple, list)
@@ -93,6 +128,7 @@ class Evaluator(object):
                     latent = encoded
 
             else:
+
                 latent = output
 
         return latent, output
@@ -101,17 +137,7 @@ class Evaluator(object):
     # AUC
     # ============================================================
 
-    def calculate_auc(
-        self,
-        y_true,
-        score
-    ):
-
-        score = np.asarray(score)
-
-        # --------------------------------------------------------
-        # Safety check
-        # --------------------------------------------------------
+    def calculate_auc(self, y_true, score):
 
         if not np.all(np.isfinite(score)):
 
@@ -120,12 +146,7 @@ class Evaluator(object):
                 "Replacing NaN/Inf values."
             )
 
-            score = np.nan_to_num(
-                score,
-                nan=0.0,
-                posinf=np.finfo(np.float64).max,
-                neginf=np.finfo(np.float64).min
-            )
+            score = np.nan_to_num(score)
 
         fpr, tpr, _ = roc_curve(
             y_true,
@@ -148,7 +169,7 @@ class Evaluator(object):
     ):
 
         return np.where(
-            np.asarray(score) > threshold,
+            np.array(score) > threshold,
             1,
             0
         )
@@ -197,26 +218,44 @@ class Evaluator(object):
     # AUTOENCODER / VAE EVALUATION
     # ============================================================
 
-    def _eval_autoencoder(
-        self,
-        test_loader
-    ):
+    def _eval_autoencoder(self, test_loader):
+
+        """
+        Evaluates model using pure Reconstruction Error (MSE).
+
+        For the current VAE:
+
+            X
+            ↓
+          Encoder
+            ↓
+        mu, logvar
+            ↓
+       reparameterization
+            ↓
+            z
+            ↓
+         Decoder
+            ↓
+           X_hat
+
+        Anomaly score:
+
+            MSE(X, X_hat)
+
+        IMPORTANT:
+        The VAE's mu is NOT used as the reconstruction.
+        """
 
         anomaly_scores = []
         test_labels = []
-
-        self.model.eval()
 
         with torch.no_grad():
 
             for batch_input in tqdm(
                 test_loader,
-                desc="Evaluating Autoencoder..."
+                desc='Evaluating Autoencoder...'
             ):
-
-                # ------------------------------------------------
-                # Input data
-                # ------------------------------------------------
 
                 batch_data = (
                     batch_input[0]
@@ -224,36 +263,25 @@ class Evaluator(object):
                 )
 
                 # ------------------------------------------------
-                # Model forward pass
+                # Extract:
                 #
-                # VAE returns:
-                #
-                #     reconstruction, mu, logvar
+                # latent = mu
+                # output = reconstruction X_hat
                 # ------------------------------------------------
 
-                latent, output = (
+                _, output = (
                     self._extract_features_and_output(
                         batch_data
                     )
                 )
 
                 # ------------------------------------------------
-                # Reconstruction error
+                # Reconstruction MSE per sample
                 #
-                # IMPORTANT:
-                #
-                # output = reconstructed X
-                #
-                # Therefore anomaly score is:
-                #
-                #     MSE(X, X_hat)
-                #
-                # NOT:
-                #
-                #     MSE(X, mu)
+                # MSE(X, X_hat)
                 # ------------------------------------------------
 
-                reconstruction_error = torch.mean(
+                recon_loss = torch.mean(
                     torch.nn.MSELoss(
                         reduction="none"
                     )(
@@ -264,7 +292,7 @@ class Evaluator(object):
                 )
 
                 anomaly_scores.append(
-                    reconstruction_error
+                    recon_loss
                 )
 
                 test_labels.append(
@@ -272,7 +300,7 @@ class Evaluator(object):
                 )
 
         # ========================================================
-        # Combine batches
+        # Combine all batches
         # ========================================================
 
         anomaly_scores = torch.cat(
@@ -286,7 +314,7 @@ class Evaluator(object):
         ).cpu().numpy()
 
         # ========================================================
-        # AUC
+        # Calculate AUC
         # ========================================================
 
         auc_val = self.calculate_auc(
@@ -295,9 +323,9 @@ class Evaluator(object):
         )
 
         # ========================================================
-        # F1 / Precision / Recall
+        # Calculate F1 / Precision / Recall
         #
-        # Fixed threshold = 0.5
+        # Existing threshold = 0.5
         # ========================================================
 
         (
@@ -306,13 +334,8 @@ class Evaluator(object):
             rec_val
         ) = self.calculate_classification_metrics(
             test_labels,
-            anomaly_scores,
-            threshold=0.5
+            anomaly_scores
         )
-
-        # ========================================================
-        # Return evaluation results
-        # ========================================================
 
         return {
             "scores": anomaly_scores,
@@ -324,39 +347,352 @@ class Evaluator(object):
         }
 
     # ============================================================
-    # PUBLIC EVALUATION FUNCTION
+    # HYBRID EVALUATION
+    # ============================================================
+
+    def _eval_hybrid(
+        self,
+        train_loader,
+        test_loader
+    ):
+
+        """
+        Evaluates model using Latent Representation
+        + Centroid Classifier.
+        """
+
+        if train_loader is None:
+
+            raise ValueError(
+                "🚨 Error: 'train_loader' is required "
+                "for Hybrid evaluation to fit Centroid classifier."
+            )
+
+        train_latents = []
+        test_latents = []
+        test_labels = []
+
+        with torch.no_grad():
+
+            # ====================================================
+            # 1. Extract Train Latent Space
+            # ====================================================
+
+            for batch_input in tqdm(
+                train_loader,
+                desc='Extracting Train Latents...'
+            ):
+
+                batch_data = (
+                    batch_input[0]
+                    .to(self.device)
+                )
+
+                # For VAE:
+                #
+                # latent = mu
+                # output = reconstruction
+
+                latent, _ = (
+                    self._extract_features_and_output(
+                        batch_data
+                    )
+                )
+
+                train_latents.append(
+                    latent
+                )
+
+            # ====================================================
+            # 2. Extract Test Latent Space
+            # ====================================================
+
+            for batch_input in tqdm(
+                test_loader,
+                desc='Extracting Test Latents...'
+            ):
+
+                batch_data = (
+                    batch_input[0]
+                    .to(self.device)
+                )
+
+                # For VAE:
+                #
+                # latent = mu
+
+                latent, _ = (
+                    self._extract_features_and_output(
+                        batch_data
+                    )
+                )
+
+                test_latents.append(
+                    latent
+                )
+
+                test_labels.append(
+                    batch_input[1]
+                )
+
+        # ========================================================
+        # Convert to NumPy
+        # ========================================================
+
+        train_latents = torch.cat(
+            train_latents,
+            dim=0
+        ).cpu().numpy()
+
+        test_latents = torch.cat(
+            test_latents,
+            dim=0
+        ).cpu().numpy()
+
+        test_labels = torch.cat(
+            test_labels,
+            dim=0
+        ).cpu().numpy()
+
+        # ========================================================
+        # Fit Centroid Model
+        # ========================================================
+
+        cen = CentroidBasedOneClassClassifier()
+
+        cen.fit(
+            train_latents
+        )
+
+        # ========================================================
+        # Centroid inference
+        # ========================================================
+
+        start_time = time.time()
+
+        predictions_cen = cen.get_density(
+            test_latents
+        )
+
+        infer_time = (
+            time.time()
+            - start_time
+        )
+
+        # ========================================================
+        # Metrics
+        # ========================================================
+
+        auc_val = self.calculate_auc(
+            test_labels,
+            predictions_cen
+        )
+
+        (
+            f1_val,
+            prec_val,
+            rec_val
+        ) = self.calculate_classification_metrics(
+            test_labels,
+            predictions_cen
+        )
+
+        return {
+            "scores": predictions_cen,
+            "labels": test_labels,
+            "train_latents": train_latents,
+            "test_latents": test_latents,
+            "auc": auc_val,
+            "f1": f1_val,
+            "precision": prec_val,
+            "recall": rec_val,
+            "infer_time": infer_time
+        }
+
+    # ============================================================
+    # MAIN EVALUATION CONTROLLER
     # ============================================================
 
     def evaluate(
         self,
-        test_loader
+        test_loader,
+        train_loader=None
     ):
+
+        """
+        Main evaluation controller.
+
+        Supports:
+
+            "autoencoder"
+            "hybrid"
+            "both"
+        """
+
+        self.model.eval()
+
+        results = {}
+
+        # ========================================================
+        # Autoencoder / VAE
+        # ========================================================
 
         if self.model_type in [
             "autoencoder",
-            "vae",
-            "ae"
+            "both"
         ]:
 
-            return self._eval_autoencoder(
-                test_loader
+            results["autoencoder"] = (
+                self._eval_autoencoder(
+                    test_loader
+                )
+            )
+
+        # ========================================================
+        # Hybrid
+        # ========================================================
+
+        if self.model_type in [
+            "hybrid",
+            "both"
+        ]:
+
+            results["hybrid"] = (
+                self._eval_hybrid(
+                    train_loader,
+                    test_loader
+                )
+            )
+
+        # ========================================================
+        # Print comparison
+        # ========================================================
+
+        self._log_comparison(
+            results
+        )
+
+        # ========================================================
+        # Return requested metric
+        # ========================================================
+
+        if self.model_type == "autoencoder":
+
+            return (
+                results["autoencoder"]["auc"]
+                if self.metric == "AUC"
+                else results["autoencoder"]["f1"]
             )
 
         elif self.model_type == "hybrid":
 
-            return self._eval_autoencoder(
-                test_loader
-            )
+            if self.metric == "time":
 
-        elif self.model_type == "both":
+                return results["hybrid"]["infer_time"]
 
-            return self._eval_autoencoder(
-                test_loader
+            return (
+                results["hybrid"]["auc"]
+                if self.metric == "AUC"
+                else results["hybrid"]["f1"]
             )
 
         else:
 
-            raise ValueError(
-                f"Unsupported model_type: "
-                f"{self.model_type}"
+            return results
+
+    # ============================================================
+    # COMPARISON LOG
+    # ============================================================
+
+    def _log_comparison(
+        self,
+        results
+    ):
+
+        """
+        Helper to log a neat comparison table in the console.
+        """
+
+        logging.info(
+            "=" * 65
+        )
+
+        logging.info(
+            f"{'METRIC SUMMARY COMPARISON':^65}"
+        )
+
+        logging.info(
+            "=" * 65
+        )
+
+        has_ae = (
+            "autoencoder"
+            in results
+        )
+
+        has_hy = (
+            "hybrid"
+            in results
+        )
+
+        header = (
+            f"{'Metric':<15} |"
+        )
+
+        if has_ae:
+
+            header += (
+                f" {'Autoencoder (MSE)':<20} |"
             )
+
+        if has_hy:
+
+            header += (
+                f" {'Hybrid (Centroid)':<20} |"
+            )
+
+        logging.info(
+            header
+        )
+
+        logging.info(
+            "-" * 65
+        )
+
+        for metric_key, name in [
+            ("auc", "AUC Score"),
+            ("f1", "F1 Score"),
+            ("precision", "Precision"),
+            ("recall", "Recall")
+        ]:
+
+            row = (
+                f"{name:<15} |"
+            )
+
+            if has_ae:
+
+                row += (
+                    f" {results['autoencoder'][metric_key]:<20.4f} |"
+                )
+
+            if has_hy:
+
+                row += (
+                    f" {results['hybrid'][metric_key]:<20.4f} |"
+                )
+
+            logging.info(
+                row
+            )
+
+        logging.info(
+            "=" * 65
+        )
+
+    # ============================================================
+    # VISUALIZATION
+    # ============================================================
+
+    def visualize(self):
+        pass
