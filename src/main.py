@@ -145,9 +145,10 @@ initial_epochs = 1
 
 # ------------------------------------------------
 # VAE KL weight
+# CHANGED FROM 0.001 TO 0.0001
 # ------------------------------------------------
 
-vae_kl_weight = 0.001
+vae_kl_weight = 0.0001
 
 # ------------------------------------------------
 # Server-side validation weighting
@@ -278,7 +279,7 @@ def evaluate_global_mse(
             )
 
             loss = criterion(
-                reconstructed,
+                reconstructed, 
                 inputs
             )
 
@@ -843,7 +844,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--server_lr",
         type=float,
-        default=1.0,
+        default=0.01,
         help=(
             "Server-side learning rate"
         )
@@ -1104,7 +1105,8 @@ if __name__ == "__main__":
 
         raw_client_data.append({
 
-            "device": dev["name"],
+            "device":
+                dev["name"],
 
             "bootstrap_data":
                 bootstrap_data,
