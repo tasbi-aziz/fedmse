@@ -20,7 +20,7 @@ class SecurityBuffer:
         latency_threshold: float = 10.0,
         alpha: float = 0.2,
         beta: float = 0.01,
-        cos_sim_threshold: float = -0.1,  # kept only for backward compatibility
+        cos_sim_threshold: float = -0.1,
         magnitude_threshold: float = 1.0,
         loss_change_threshold: float = 0.50,
         mse_change_threshold: float = 0.50,
@@ -41,6 +41,12 @@ class SecurityBuffer:
         Separately:
         - arrival_time > 10 sec routes the update to secondary
           processing, but lateness alone is NOT treated as an attack.
+
+        BEFORE all behavioral checks:
+        - The incoming update is checked for NaN / Inf.
+        - Non-finite updates are rejected immediately.
+        - NaN / Inf is NOT counted as one of the four
+          behavioral security conditions.
 
         Cosine similarity is NO LONGER used for security decisions.
         It is retained in the constructor only for backward compatibility.
@@ -64,7 +70,6 @@ class SecurityBuffer:
 
         self.window_size = window_size
 
-        # 10-second arrival/routing threshold
         self.latency_threshold = latency_threshold
 
         self.alpha = alpha
@@ -79,15 +84,6 @@ class SecurityBuffer:
         self.mse_change_threshold = mse_change_threshold
         self.mse_std_change_threshold = mse_std_change_threshold
 
-        # Relative change threshold for workload-normalized
-        # training time.
-        #
-        # Example:
-        # previous = 0.001
-        # current  = 0.0016
-        # relative change = 60%
-        #
-        # If threshold = 50%, this becomes suspicious.
         self.train_time_change_threshold = (
             train_time_change_threshold
         )
@@ -103,11 +99,6 @@ class SecurityBuffer:
 
         # ---------------------------------------------------------
         # Per-client historical behavior
-        #
-        # Using client-specific history helps distinguish:
-        # legitimate Non-IID behavior
-        # from
-        # unusual behavior of the same client.
         # ---------------------------------------------------------
 
         self.client_history: Dict[
@@ -132,6 +123,110 @@ class SecurityBuffer:
             self.global_model = copy.deepcopy(
                 global_model
             )
+
+    # =============================================================
+    # FINITE UPDATE SAFETY CHECK
+    # =============================================================
+
+    def _is_update_finite(
+        self,
+        update: Dict[str, Any]
+    ) -> bool:
+        """
+        Checks whether the incoming client update contains
+        NaN or Inf values.
+
+        This is a SAFETY check, NOT one of the four
+        behavioral security conditions.
+
+        Floating-point tensors are checked recursively.
+
+        Returns:
+            True  -> update is finite
+            False -> update contains NaN/Inf
+        """
+
+        if not isinstance(update, dict):
+            return False
+
+        def check_value(value):
+
+            # -----------------------------------------------------
+            # Tensor
+            # -----------------------------------------------------
+
+            if isinstance(value, torch.Tensor):
+
+                if value.is_floating_point():
+
+                    return bool(
+                        torch.isfinite(
+                            value
+                        ).all().item()
+                    )
+
+                return True
+
+            # -----------------------------------------------------
+            # Dictionary
+            # -----------------------------------------------------
+
+            if isinstance(value, dict):
+
+                for nested_value in value.values():
+
+                    if not check_value(
+                        nested_value
+                    ):
+                        return False
+
+                return True
+
+            # -----------------------------------------------------
+            # List / Tuple
+            # -----------------------------------------------------
+
+            if isinstance(
+                value,
+                (list, tuple)
+            ):
+
+                for nested_value in value:
+
+                    if not check_value(
+                        nested_value
+                    ):
+                        return False
+
+                return True
+
+            # -----------------------------------------------------
+            # Numeric scalar
+            # -----------------------------------------------------
+
+            if isinstance(
+                value,
+                (float, int)
+            ):
+
+                if isinstance(
+                    value,
+                    float
+                ):
+
+                    return math.isfinite(
+                        value
+                    )
+
+                return True
+
+            # -----------------------------------------------------
+            # Other metadata
+            # -----------------------------------------------------
+
+            return True
+
+        return check_value(update)
 
     # =============================================================
     # CLIENT HISTORY
@@ -220,17 +315,6 @@ class SecurityBuffer:
         model_update: dict,
         global_model: nn.Module
     ) -> float:
-        """
-        Computes:
-
-            ||local_weights - global_weights||
-
-        This is NOT cosine similarity.
-
-        It measures the size of the client's model update.
-
-        Only floating-point tensors are considered.
-        """
 
         if (
             global_model is None
@@ -309,13 +393,6 @@ class SecurityBuffer:
         self,
         val_mse_list: list
     ):
-        """
-        Converts the validation MSE list into
-        log-compressed statistics.
-
-        The log compression prevents extremely large
-        MSE values from creating huge security scores.
-        """
 
         if not val_mse_list:
 
@@ -403,23 +480,8 @@ class SecurityBuffer:
         base_threshold: float,
         factor: float = 3.0
     ):
-        """
-        Calculates a client-specific adaptive upper threshold.
-
-        If historical data is insufficient, the configured
-        base threshold is used.
-
-        Otherwise:
-
-            threshold =
-                max(
-                    base_threshold,
-                    mean + factor * std
-                )
-        """
 
         if not history_values:
-
             return base_threshold
 
         if (
@@ -427,7 +489,6 @@ class SecurityBuffer:
             <
             self.min_history
         ):
-
             return base_threshold
 
         tensor = torch.tensor(
@@ -468,25 +529,6 @@ class SecurityBuffer:
         train_time: float,
         dataset_size: int
     ) -> float:
-        """
-        Normalizes ACTUAL LOCAL TRAINING TIME by local dataset size.
-
-        IMPORTANT:
-        - train_time = local training computation time only.
-        - arrival_time is NOT used here.
-
-        Two timing concepts are intentionally separated:
-
-        1. Arrival routing:
-               arrival_time <= 10 sec -> timely
-               arrival_time > 10 sec  -> late
-
-        2. Workload-aware computation behavior:
-               train_time / dataset_size
-
-        Therefore, a large dataset can naturally take longer
-        to train without automatically becoming suspicious.
-        """
 
         try:
 
@@ -504,11 +546,9 @@ class SecurityBuffer:
                 return 0.0
 
             if train_time < 0:
-
                 return 0.0
 
             if dataset_size <= 0:
-
                 return 0.0
 
             return (
@@ -552,8 +592,6 @@ class SecurityBuffer:
 
         # ---------------------------------------------------------
         # arrival_time
-        #
-        # Used ONLY for the 10-second asynchronous routing rule.
         # ---------------------------------------------------------
 
         latency = update.get(
@@ -576,8 +614,6 @@ class SecurityBuffer:
 
         # ---------------------------------------------------------
         # train_time
-        #
-        # Actual local computation time.
         # ---------------------------------------------------------
 
         train_time = update.get(
@@ -720,18 +756,6 @@ class SecurityBuffer:
         # CONDITION 2:
         # WORKLOAD-AWARE TIMING BEHAVIOR
         # =========================================================
-        #
-        # IMPORTANT:
-        #
-        # arrival_time:
-        #     only determines whether the update is inside or
-        #     outside the 10-second asynchronous window.
-        #
-        # train_time / dataset_size:
-        #     determines whether this client's computation
-        #     behavior changed unusually compared with its own
-        #     history.
-        # =========================================================
 
         previous_time_per_sample = (
             history[
@@ -781,8 +805,6 @@ class SecurityBuffer:
 
         # ---------------------------------------------------------
         # 10-second arrival routing
-        #
-        # This is NOT included in the behavioral trust score.
         # ---------------------------------------------------------
 
         latency_fail = (
@@ -919,17 +941,6 @@ class SecurityBuffer:
         # =========================================================
         # RISK / TRUST
         # =========================================================
-        #
-        # Four behavioral signals:
-        #
-        #   1. magnitude
-        #   2. workload-normalized timing behavior
-        #   3. local loss behavior
-        #   4. MSE history behavior
-        #
-        # The 10-second arrival threshold is NOT mixed into
-        # the behavioral score.
-        # =========================================================
 
         failed_conditions = sum([
             bool(magnitude_fail),
@@ -983,19 +994,11 @@ class SecurityBuffer:
             "client_id":
                 client_id,
 
-            # -----------------------------------------------------
-            # Magnitude
-            # -----------------------------------------------------
-
             "magnitude":
                 magnitude,
 
             "magnitude_threshold":
                 magnitude_threshold,
-
-            # -----------------------------------------------------
-            # Timing
-            # -----------------------------------------------------
 
             "latency":
                 latency,
@@ -1018,19 +1021,11 @@ class SecurityBuffer:
             "time_change_threshold":
                 self.train_time_change_threshold,
 
-            # -----------------------------------------------------
-            # Loss
-            # -----------------------------------------------------
-
             "val_loss":
                 val_loss,
 
             "loss_threshold":
                 loss_threshold,
-
-            # -----------------------------------------------------
-            # MSE
-            # -----------------------------------------------------
 
             "mse_mean":
                 mse_stats["mean"],
@@ -1047,18 +1042,12 @@ class SecurityBuffer:
             "mse_std_change":
                 mse_std_change,
 
-            # -----------------------------------------------------
-            # Failure flags
-            # -----------------------------------------------------
-
             "Magnitude_Fail":
                 magnitude_fail,
 
-            # 10-sec arrival routing flag
             "Latency_Fail":
                 latency_fail,
 
-            # Workload-aware computation behavior flag
             "Timing_Fail":
                 timing_fail,
 
@@ -1067,10 +1056,6 @@ class SecurityBuffer:
 
             "MSE_History_Fail":
                 mse_history_fail,
-
-            # -----------------------------------------------------
-            # Score
-            # -----------------------------------------------------
 
             "failed_conditions":
                 failed_conditions,
@@ -1081,13 +1066,8 @@ class SecurityBuffer:
             "trust_score":
                 trust_score,
 
-            # Backward-compatible field
             "score":
                 trust_score,
-
-            # -----------------------------------------------------
-            # Decision
-            # -----------------------------------------------------
 
             "decision":
                 decision,
@@ -1110,27 +1090,6 @@ class SecurityBuffer:
         device: str = "cpu",
         **kwargs
     ) -> List[Dict[str, Any]]:
-
-        """
-        Main asynchronous update routing.
-
-        Routing uses arrival_time:
-
-            <= 10 sec
-                -> timely
-
-            > 10 sec
-                -> secondary / buffer
-
-        Security behavior uses:
-
-            1. update magnitude
-            2. workload-normalized timing behavior
-            3. local loss
-            4. MSE history
-
-        No cosine similarity is used.
-        """
 
         if global_model is not None:
 
@@ -1157,6 +1116,23 @@ class SecurityBuffer:
                     "unknown"
                 )
             )
+
+            # -----------------------------------------------------
+            # NEW: FINITE SAFETY CHECK
+            # -----------------------------------------------------
+
+            if not self._is_update_finite(
+                buffered_item
+            ):
+
+                logging.warning(
+                    f"[Security Buffer] "
+                    f"REJECTED non-finite buffered update | "
+                    f"Client: {client_id} | "
+                    f"NaN/Inf detected"
+                )
+
+                continue
 
             # -----------------------------------------------------
             # Expiration
@@ -1288,6 +1264,37 @@ class SecurityBuffer:
                 )
             )
 
+            # -----------------------------------------------------
+            # NEW: FINITE SAFETY CHECK
+            #
+            # This happens BEFORE the four behavioral checks.
+            # NaN/Inf is NOT counted in failed_conditions.
+            # -----------------------------------------------------
+
+            if not self._is_update_finite(
+                update
+            ):
+
+                update[
+                    "route"
+                ] = "REJECT"
+
+                update[
+                    "validation_required"
+                ] = False
+
+                logging.warning(
+                    f"[Security Buffer] "
+                    f"REJECT Client {client_id} | "
+                    f"NaN/Inf detected in incoming update"
+                )
+
+                continue
+
+            # -----------------------------------------------------
+            # Existing behavioral security logic
+            # -----------------------------------------------------
+
             behavior = (
                 self.evaluate_update_behavior(
                     update,
@@ -1399,14 +1406,6 @@ class SecurityBuffer:
 
             # -----------------------------------------------------
             # SLOW / LATE UPDATE
-            # -----------------------------------------------------
-            #
-            # IMPORTANT:
-            # A late arrival is NOT automatically malicious.
-            #
-            # It goes to secondary processing regardless of
-            # whether its workload-normalized computation time
-            # looks normal.
             # -----------------------------------------------------
 
             elif (
