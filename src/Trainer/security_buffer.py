@@ -1,18 +1,69 @@
+# security_buffer.py
+
 import copy
-import logging
 import math
-import torch
-import torch.nn as nn
+import logging
 from typing import List, Dict, Any
 
+import torch
+import torch.nn as nn
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+
+logger = logging.getLogger(__name__)
 
 
 class SecurityBuffer:
+    """
+    Security-aware asynchronous/latency-aware update router.
+
+    Routing policy
+    --------------
+
+    Safety check:
+        NaN / Inf
+            -> DROP
+
+    Four behavioral security conditions:
+        1. Update magnitude
+        2. Workload-normalized training-time behavior
+        3. Local validation-loss behavior
+        4. Historical validation-MSE behavior
+
+    Security severity has priority over latency:
+
+        3-4 failures
+            -> QUARANTINE
+            -> verify in next round
+            -> accepted => next round, weight_factor = 0.3
+            -> rejected => DROP
+
+        1-2 failures
+            -> SECONDARY BUFFER
+            -> verify in next round
+            -> accepted => next round, weight_factor = 0.7
+            -> rejected => DROP
+
+        0 failures:
+            FAST  (arrival_latency <= 1.5 sec)
+                -> DIRECT
+                -> current round, weight_factor = 1.0
+
+            SLOW  (arrival_latency > 1.5 sec)
+                -> SECONDARY BUFFER
+                -> next round, weight_factor = 0.7
+
+    Important:
+        Latency is a routing signal, NOT a security failure.
+
+        Therefore:
+            SLOW + CLEAN       -> SECONDARY
+            SLOW + 1-2 fails   -> SECONDARY
+            SLOW + 3-4 fails   -> QUARANTINE
+
+    The buffer only stores delayed updates.
+    Buffered updates are NOT returned as current-round ready updates.
+    """
+
     def __init__(
         self,
         global_model: nn.Module = None,
@@ -27,216 +78,86 @@ class SecurityBuffer:
         mse_std_change_threshold: float = 0.50,
         train_time_change_threshold: float = 0.50,
         history_size: int = 5,
-        min_history: int = 2
+        min_history: int = 2,
     ):
-        """
-        Security Buffer for asynchronous federated learning.
 
-        Current behavioral decision signals:
-        1. Update magnitude
-        2. Workload-normalized training-time behavior
-        3. Local loss behavior
-        4. Historical validation-MSE behavior
+        self.global_model = global_model
 
-        Separately:
-        - arrival_time > 10 sec routes the update to secondary
-          processing, but lateness alone is NOT treated as an attack.
-
-        BEFORE all behavioral checks:
-        - The incoming update is checked for NaN / Inf.
-        - Non-finite updates are rejected immediately.
-        - NaN / Inf is NOT counted as one of the four
-          behavioral security conditions.
-
-        Cosine similarity is NO LONGER used for security decisions.
-        It is retained in the constructor only for backward compatibility.
-
-        Routing:
-        - Fast + clean       -> DIRECT
-        - Fast + suspicious  -> SECONDARY CHECK
-        - Slow               -> SECONDARY CHECK
-        - Secondary failure  -> QUARANTINE
-        """
-
-        self.global_model = (
-            copy.deepcopy(global_model)
-            if global_model is not None
-            else None
-        )
-
-        # ---------------------------------------------------------
-        # Configuration
-        # ---------------------------------------------------------
-
+        # Maximum number of rounds an update may remain buffered.
         self.window_size = window_size
+
+        # FAST / SLOW threshold.
         self.latency_threshold = latency_threshold
 
         self.alpha = alpha
         self.beta = beta
 
-        # Kept only so old code/config does not break.
-        # NOT USED in any decision.
+        # Kept for backward compatibility.
         self.cos_sim_threshold = cos_sim_threshold
 
+        # Security thresholds.
         self.magnitude_threshold = magnitude_threshold
         self.loss_change_threshold = loss_change_threshold
         self.mse_change_threshold = mse_change_threshold
         self.mse_std_change_threshold = mse_std_change_threshold
+        self.train_time_change_threshold = train_time_change_threshold
 
-        self.train_time_change_threshold = (
-            train_time_change_threshold
-        )
-
+        # Historical behavior settings.
         self.history_size = history_size
         self.min_history = min_history
 
-        # ---------------------------------------------------------
-        # Delayed updates
-        # ---------------------------------------------------------
-
+        # Delayed updates live here.
+        #
+        # IMPORTANT:
+        # Items inside this buffer are NOT current-round updates.
+        # They are considered again when the next round starts.
         self.buffer: List[Dict[str, Any]] = []
 
-        # ---------------------------------------------------------
-        # Per-client historical behavior
-        # ---------------------------------------------------------
+        # Per-client behavioral history.
+        self.client_history: Dict[str, Dict[str, List[float]]] = {}
 
-        self.client_history: Dict[
-            str,
-            Dict[str, List[float]]
-        ] = {}
-
-    # =============================================================
+    # ============================================================
     # GLOBAL MODEL
-    # =============================================================
+    # ============================================================
 
-    def set_global_model(
-        self,
-        global_model: nn.Module
-    ):
+    def set_global_model(self, global_model: nn.Module):
+        """Update the current global model reference."""
+        self.global_model = global_model
+
+    # ============================================================
+    # SAFETY CHECK
+    # ============================================================
+
+    def _is_update_finite(self, obj: Any) -> bool:
         """
-        Update internal copy of global model.
+        Recursively check whether an object contains NaN/Inf.
         """
 
-        if global_model is not None:
+        if torch.is_tensor(obj):
+            return bool(torch.isfinite(obj).all().item())
 
-            self.global_model = copy.deepcopy(
-                global_model
+        if isinstance(obj, dict):
+            return all(
+                self._is_update_finite(value)
+                for value in obj.values()
             )
 
-    # =============================================================
-    # FINITE UPDATE SAFETY CHECK
-    # =============================================================
+        if isinstance(obj, (list, tuple)):
+            return all(
+                self._is_update_finite(value)
+                for value in obj
+            )
 
-    def _is_update_finite(
-        self,
-        update: Dict[str, Any]
-    ) -> bool:
-        """
-        Checks whether the incoming client update contains
-        NaN or Inf values.
+        if isinstance(obj, (float, int)):
+            return math.isfinite(float(obj))
 
-        This is a SAFETY check, NOT one of the four
-        behavioral security conditions.
+        return True
 
-        Floating-point tensors are checked recursively.
-
-        Returns:
-            True  -> update is finite
-            False -> update contains NaN/Inf
-        """
-
-        if not isinstance(update, dict):
-            return False
-
-        def check_value(value):
-
-            # -----------------------------------------------------
-            # Tensor
-            # -----------------------------------------------------
-
-            if isinstance(value, torch.Tensor):
-
-                if value.is_floating_point():
-
-                    return bool(
-                        torch.isfinite(
-                            value
-                        ).all().item()
-                    )
-
-                return True
-
-            # -----------------------------------------------------
-            # Dictionary
-            # -----------------------------------------------------
-
-            if isinstance(value, dict):
-
-                for nested_value in value.values():
-
-                    if not check_value(
-                        nested_value
-                    ):
-                        return False
-
-                return True
-
-            # -----------------------------------------------------
-            # List / Tuple
-            # -----------------------------------------------------
-
-            if isinstance(
-                value,
-                (list, tuple)
-            ):
-
-                for nested_value in value:
-
-                    if not check_value(
-                        nested_value
-                    ):
-                        return False
-
-                return True
-
-            # -----------------------------------------------------
-            # Numeric scalar
-            # -----------------------------------------------------
-
-            if isinstance(
-                value,
-                (float, int)
-            ):
-
-                if isinstance(
-                    value,
-                    float
-                ):
-
-                    return math.isfinite(
-                        value
-                    )
-
-                return True
-
-            # -----------------------------------------------------
-            # Other metadata
-            # -----------------------------------------------------
-
-            return True
-
-        return check_value(update)
-
-    # =============================================================
+    # ============================================================
     # CLIENT HISTORY
-    # =============================================================
+    # ============================================================
 
-    def _get_client_history(
-        self,
-        client_id
-    ):
-
-        client_id = str(client_id)
+    def _get_client_history(self, client_id: str):
 
         if client_id not in self.client_history:
 
@@ -246,1334 +167,1309 @@ class SecurityBuffer:
                 "val_loss": [],
                 "mse_mean": [],
                 "mse_std": [],
-                "mse_max": []
+                "mse_max": [],
             }
 
-        return self.client_history[
-            client_id
-        ]
+        return self.client_history[client_id]
 
     def _append_history(
         self,
-        client_id,
-        magnitude,
-        time_per_sample,
-        val_loss,
-        mse_mean,
-        mse_std,
-        mse_max
+        client_id: str,
+        key: str,
+        value: float,
     ):
 
-        history = self._get_client_history(
-            client_id
+        if value is None:
+            return
+
+        try:
+            value = float(value)
+        except Exception:
+            return
+
+        if not math.isfinite(value):
+            return
+
+        history = self._get_client_history(client_id)
+
+        history[key].append(value)
+
+        if len(history[key]) > self.history_size:
+            history[key] = history[key][-self.history_size:]
+
+    def _remember_update(self, update: Dict[str, Any]):
+
+        client_id = str(
+            update.get("client_id", "unknown")
         )
 
-        values = {
-            "magnitude": magnitude,
-            "train_time_per_sample": time_per_sample,
-            "val_loss": val_loss,
-            "mse_mean": mse_mean,
-            "mse_std": mse_std,
-            "mse_max": mse_max
-        }
+        diagnostics = update.get(
+            "security_diagnostics",
+            {}
+        )
 
-        for key, value in values.items():
+        self._append_history(
+            client_id,
+            "magnitude",
+            diagnostics.get("magnitude"),
+        )
 
-            if value is None:
-                continue
+        self._append_history(
+            client_id,
+            "train_time_per_sample",
+            diagnostics.get("train_time_per_sample"),
+        )
 
-            try:
-                value = float(value)
-            except (
-                TypeError,
-                ValueError
-            ):
-                continue
+        self._append_history(
+            client_id,
+            "val_loss",
+            diagnostics.get("val_loss"),
+        )
 
-            if not math.isfinite(
-                value
-            ):
-                continue
+        self._append_history(
+            client_id,
+            "mse_mean",
+            diagnostics.get("mse_mean"),
+        )
 
-            history[key].append(
-                value
-            )
+        self._append_history(
+            client_id,
+            "mse_std",
+            diagnostics.get("mse_std"),
+        )
 
-            if len(
-                history[key]
-            ) > self.history_size:
+        self._append_history(
+            client_id,
+            "mse_max",
+            diagnostics.get("mse_max"),
+        )
 
-                history[key].pop(0)
-
-    # =============================================================
+    # ============================================================
     # UPDATE MAGNITUDE
-    # =============================================================
+    # ============================================================
 
     def compute_update_magnitude(
         self,
-        model_update: dict,
-        global_model: nn.Module
+        update_weights: Dict[str, torch.Tensor],
     ) -> float:
 
-        if (
-            global_model is None
-            or not model_update
-        ):
+        if self.global_model is None:
             return 0.0
 
-        global_dict = (
-            global_model.state_dict()
-        )
+        global_state = self.global_model.state_dict()
 
-        squared_sum = 0.0
+        total_sq = 0.0
 
-        for name, local_param in (
-            model_update.items()
-        ):
+        for name, local_tensor in update_weights.items():
 
-            if name not in global_dict:
+            if name not in global_state:
                 continue
 
-            global_param = (
-                global_dict[name]
-            )
+            global_tensor = global_state[name]
 
-            if not torch.is_floating_point(
-                local_param
-            ):
+            try:
+                local_tensor = local_tensor.detach().float()
+                global_tensor = global_tensor.detach().float()
+
+                if local_tensor.shape != global_tensor.shape:
+                    continue
+
+                diff = local_tensor - global_tensor
+
+                total_sq += float(
+                    torch.sum(diff * diff).item()
+                )
+
+            except Exception:
                 continue
 
-            if not torch.is_floating_point(
-                global_param
-            ):
-                continue
+        return math.sqrt(max(total_sq, 0.0))
 
-            local_cpu = (
-                local_param.detach()
-                .cpu()
-                .float()
-            )
-
-            global_cpu = (
-                global_param.detach()
-                .cpu()
-                .float()
-            )
-
-            if (
-                local_cpu.shape
-                !=
-                global_cpu.shape
-            ):
-                continue
-
-            difference = (
-                local_cpu
-                -
-                global_cpu
-            )
-
-            squared_sum += torch.sum(
-                difference * difference
-            ).item()
-
-        return math.sqrt(
-            max(
-                squared_sum,
-                0.0
-            )
-        )
-
-    # =============================================================
+    # ============================================================
     # MSE STATISTICS
-    # =============================================================
+    # ============================================================
 
     def compute_mse_statistics(
         self,
-        val_mse_list: list
+        mse_list,
     ):
 
-        if not val_mse_list:
+        if mse_list is None:
+            return 0.0, 0.0, 0.0
 
-            return {
-                "mean": 0.0,
-                "std": 0.0,
-                "max": 0.0
-            }
+        finite_values = []
 
-        safe_values = []
-
-        for value in val_mse_list:
+        for value in mse_list:
 
             try:
+                value = float(value)
 
-                value = float(
-                    value
-                )
+                if math.isfinite(value):
+                    value = max(value, 0.0)
+                    finite_values.append(value)
 
-                if not math.isfinite(
-                    value
-                ):
-                    continue
-
-                value = max(
-                    value,
-                    0.0
-                )
-
-                value = math.log1p(
-                    value
-                )
-
-                safe_values.append(
-                    value
-                )
-
-            except (
-                TypeError,
-                ValueError
-            ):
+            except Exception:
                 continue
 
-        if not safe_values:
+        if not finite_values:
+            return 0.0, 0.0, 0.0
 
-            return {
-                "mean": 0.0,
-                "std": 0.0,
-                "max": 0.0
-            }
-
-        mse_tensor = torch.tensor(
-            safe_values,
-            dtype=torch.float32
+        # log1p prevents extremely large MSE values
+        # from dominating the history comparison.
+        values = torch.tensor(
+            finite_values,
+            dtype=torch.float32,
         )
 
-        return {
-            "mean": float(
-                torch.mean(
-                    mse_tensor
-                ).item()
-            ),
+        values = torch.log1p(values)
 
-            "std": float(
+        mean_value = float(
+            torch.mean(values).item()
+        )
+
+        if len(values) > 1:
+            std_value = float(
                 torch.std(
-                    mse_tensor,
-                    unbiased=False
-                ).item()
-            ),
-
-            "max": float(
-                torch.max(
-                    mse_tensor
+                    values,
+                    unbiased=False,
                 ).item()
             )
-        }
+        else:
+            std_value = 0.0
 
-    # =============================================================
+        max_value = float(
+            torch.max(values).item()
+        )
+
+        return (
+            mean_value,
+            std_value,
+            max_value,
+        )
+
+    # ============================================================
     # ADAPTIVE THRESHOLD
-    # =============================================================
+    # ============================================================
 
     def _adaptive_threshold(
         self,
         history_values: List[float],
         base_threshold: float,
-        factor: float = 3.0
-    ):
+    ) -> float:
 
-        if not history_values:
+        if len(history_values) < self.min_history:
             return base_threshold
 
-        if (
-            len(history_values)
-            <
-            self.min_history
-        ):
+        try:
+            values = torch.tensor(
+                history_values,
+                dtype=torch.float32,
+            )
+
+            mean = float(
+                torch.mean(values).item()
+            )
+
+            std = float(
+                torch.std(
+                    values,
+                    unbiased=False,
+                ).item()
+            )
+
+            adaptive = mean + (3.0 * std)
+
+            return max(
+                float(base_threshold),
+                float(adaptive),
+            )
+
+        except Exception:
             return base_threshold
 
-        tensor = torch.tensor(
-            history_values,
-            dtype=torch.float32
-        )
-
-        mean_value = float(
-            torch.mean(
-                tensor
-            ).item()
-        )
-
-        std_value = float(
-            torch.std(
-                tensor,
-                unbiased=False
-            ).item()
-        )
-
-        adaptive_value = (
-            mean_value
-            +
-            factor * std_value
-        )
-
-        return max(
-            base_threshold,
-            adaptive_value
-        )
-
-    # =============================================================
-    # WORKLOAD-AWARE TRAINING TIME
-    # =============================================================
+    # ============================================================
+    # WORKLOAD NORMALIZED TRAINING TIME
+    # ============================================================
 
     def compute_time_per_sample(
         self,
         train_time: float,
-        dataset_size: int
+        dataset_size: int,
     ) -> float:
 
         try:
-
-            train_time = float(
-                train_time
-            )
-
-            dataset_size = int(
-                dataset_size
-            )
-
-            if not math.isfinite(
-                train_time
-            ):
-                return 0.0
-
-            if train_time < 0:
-                return 0.0
+            train_time = float(train_time)
+            dataset_size = int(dataset_size)
 
             if dataset_size <= 0:
                 return 0.0
 
-            return (
-                train_time
-                /
-                dataset_size
-            )
+            if not math.isfinite(train_time):
+                return 0.0
 
-        except (
-            TypeError,
-            ValueError
-        ):
+            return train_time / float(dataset_size)
 
+        except Exception:
             return 0.0
 
-    # =============================================================
-    # BEHAVIOR CHECK
-    # =============================================================
+    # ============================================================
+    # RELATIVE CHANGE
+    # ============================================================
+
+    @staticmethod
+    def _relative_change(
+        current: float,
+        previous: float,
+    ) -> float:
+
+        try:
+            current = float(current)
+            previous = float(previous)
+
+            denominator = max(
+                abs(previous),
+                1e-12,
+            )
+
+            return abs(
+                current - previous
+            ) / denominator
+
+        except Exception:
+            return 0.0
+
+    # ============================================================
+    # BEHAVIOR EVALUATION
+    # ============================================================
 
     def evaluate_update_behavior(
         self,
         update: Dict[str, Any],
-        global_model: nn.Module = None
     ) -> Dict[str, Any]:
 
-        if global_model is None:
-
-            global_model = (
-                self.global_model
-            )
-
-        client_id = update.get(
-            "client_id",
-            "unknown"
+        client_id = str(
+            update.get("client_id", "unknown")
         )
 
         weights = update.get(
             "weights",
-            {}
+            {},
         )
 
-        # ---------------------------------------------------------
-        # arrival_time
-        # ---------------------------------------------------------
-
-        latency = update.get(
-            "arrival_time",
-            0.0
-        )
-
-        try:
-
-            latency = float(
-                latency
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-
-            latency = 0.0
-
-        # ---------------------------------------------------------
-        # train_time
-        # ---------------------------------------------------------
-
-        train_time = update.get(
-            "train_time",
-            0.0
-        )
-
-        try:
-
-            train_time = float(
-                train_time
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-
-            train_time = 0.0
-
-        # ---------------------------------------------------------
-        # dataset size
-        # ---------------------------------------------------------
-
-        dataset_size = update.get(
-            "dataset_size",
+        arrival_latency = float(
             update.get(
-                "data_size",
-                0
+                "arrival_time",
+                update.get("latency", 0.0),
             )
         )
 
-        try:
-
-            dataset_size = int(
-                dataset_size
+        train_time = float(
+            update.get(
+                "train_time",
+                0.0,
             )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-
-            dataset_size = 0
-
-        # ---------------------------------------------------------
-        # Local validation loss
-        # ---------------------------------------------------------
-
-        val_loss = update.get(
-            "val_loss",
-            0.0
         )
 
-        try:
-
-            val_loss = float(
-                val_loss
+        dataset_size = int(
+            update.get(
+                "dataset_size",
+                1,
             )
+        )
 
-        except (
-            TypeError,
-            ValueError
-        ):
+        val_loss = float(
+            update.get(
+                "val_loss",
+                0.0,
+            )
+        )
 
-            val_loss = 0.0
-
-        # ---------------------------------------------------------
-        # 5-fold MSE list
-        # ---------------------------------------------------------
-
-        val_mse_list = update.get(
+        mse_list = update.get(
             "val_mse_list",
-            []
+            [],
         )
 
-        # =========================================================
-        # 1. UPDATE MAGNITUDE
-        # =========================================================
+        # --------------------------------------------------------
+        # Basic finite checks
+        # --------------------------------------------------------
 
-        magnitude = (
-            self.compute_update_magnitude(
-                weights,
-                global_model
-            )
+        if not math.isfinite(arrival_latency):
+            arrival_latency = float("inf")
+
+        if not math.isfinite(train_time):
+            train_time = float("inf")
+
+        if not math.isfinite(val_loss):
+            val_loss = float("inf")
+
+        # --------------------------------------------------------
+        # Current measurements
+        # --------------------------------------------------------
+
+        magnitude = self.compute_update_magnitude(
+            weights
         )
 
-        # =========================================================
-        # 2. WORKLOAD-NORMALIZED TRAINING TIME
-        # =========================================================
-
-        time_per_sample = (
-            self.compute_time_per_sample(
-                train_time,
-                dataset_size
-            )
+        time_per_sample = self.compute_time_per_sample(
+            train_time,
+            dataset_size,
         )
 
-        # =========================================================
-        # 3. MSE STATISTICS
-        # =========================================================
-
-        mse_stats = (
+        mse_mean, mse_std, mse_max = (
             self.compute_mse_statistics(
-                val_mse_list
+                mse_list
             )
         )
 
-        # =========================================================
-        # CLIENT HISTORY
-        # =========================================================
-
-        history = (
-            self._get_client_history(
-                client_id
-            )
+        history = self._get_client_history(
+            client_id
         )
 
-        # =========================================================
-        # CONDITION 1:
+        # ========================================================
+        # CONDITION 1
         # UPDATE MAGNITUDE
-        # =========================================================
+        # ========================================================
 
-        magnitude_threshold = (
-            self._adaptive_threshold(
-                history["magnitude"],
+        magnitude_fail = False
+
+        if len(history["magnitude"]) >= self.min_history:
+
+            magnitude_threshold = (
+                self._adaptive_threshold(
+                    history["magnitude"],
+                    self.magnitude_threshold,
+                )
+            )
+
+            magnitude_fail = (
+                magnitude > magnitude_threshold
+            )
+
+        else:
+
+            magnitude_threshold = (
                 self.magnitude_threshold
             )
-        )
 
-        magnitude_fail = (
-            magnitude
-            >
-            magnitude_threshold
-            if history["magnitude"]
-            else False
-        )
+        # ========================================================
+        # CONDITION 2
+        # WORKLOAD NORMALIZED TRAINING TIME
+        # ========================================================
 
-        # =========================================================
-        # CONDITION 2:
-        # WORKLOAD-AWARE TIMING BEHAVIOR
-        # =========================================================
-
-        previous_time_per_sample = (
-            history[
-                "train_time_per_sample"
-            ][-1]
-            if history[
-                "train_time_per_sample"
-            ]
-            else None
-        )
-
-        timing_change = 0.0
+        timing_fail = False
 
         if (
-            previous_time_per_sample
-            is not None
-            and
-            previous_time_per_sample > 0
-            and
-            time_per_sample >= 0
+            len(history["train_time_per_sample"])
+            >= self.min_history
         ):
 
+            previous_time = (
+                history[
+                    "train_time_per_sample"
+                ][-1]
+            )
+
             timing_change = (
-                abs(
-                    time_per_sample
-                    -
-                    previous_time_per_sample
-                )
-                /
-                (
-                    abs(
-                        previous_time_per_sample
-                    )
-                    +
-                    1e-12
+                self._relative_change(
+                    time_per_sample,
+                    previous_time,
                 )
             )
 
-        timing_fail = (
-            timing_change
-            >
-            self.train_time_change_threshold
-            if previous_time_per_sample
-            is not None
-            else False
-        )
+            timing_fail = (
+                timing_change
+                > self.train_time_change_threshold
+            )
 
-        # ---------------------------------------------------------
-        # 10-second arrival routing
-        # ---------------------------------------------------------
+        else:
+
+            timing_change = 0.0
+
+        # ========================================================
+        # LATENCY CLASSIFICATION
+        # ========================================================
+
+        # IMPORTANT:
+        # Latency is NOT a security failure.
 
         latency_fail = (
-            latency
-            >
-            self.latency_threshold
+            arrival_latency
+            > self.latency_threshold
         )
 
-        # =========================================================
-        # CONDITION 3:
-        # LOCAL LOSS BEHAVIOR
-        # =========================================================
+        if latency_fail:
+            latency_class = "SLOW"
+        else:
+            latency_class = "FAST"
 
-        loss_threshold = (
-            self._adaptive_threshold(
-                history["val_loss"],
-                self.loss_change_threshold
-            )
-        )
+        # ========================================================
+        # CONDITION 3
+        # VALIDATION LOSS
+        # ========================================================
 
         loss_fail = False
 
         if (
-            history["val_loss"]
-            and
-            val_loss > 0
+            len(history["val_loss"])
+            >= self.min_history
         ):
 
             previous_loss = (
                 history["val_loss"][-1]
             )
 
-            if previous_loss > 0:
-
-                relative_loss_change = (
-                    abs(
-                        val_loss
-                        -
-                        previous_loss
-                    )
-                    /
-                    (
-                        previous_loss
-                        +
-                        1e-8
-                    )
+            loss_change = (
+                self._relative_change(
+                    val_loss,
+                    previous_loss,
                 )
+            )
 
-                loss_fail = (
-                    relative_loss_change
-                    >
-                    loss_threshold
+            adaptive_loss_threshold = (
+                self._adaptive_threshold(
+                    history["val_loss"],
+                    self.loss_change_threshold,
                 )
+            )
 
-        # =========================================================
-        # CONDITION 4:
-        # MSE HISTORY CHANGE
-        # =========================================================
+            loss_fail = (
+                loss_change
+                > adaptive_loss_threshold
+            )
+
+        else:
+
+            loss_change = 0.0
+            adaptive_loss_threshold = (
+                self.loss_change_threshold
+            )
+
+        # ========================================================
+        # CONDITION 4
+        # HISTORICAL VALIDATION MSE
+        # ========================================================
 
         mse_history_fail = False
 
-        mse_mean_change = 0.0
+        mean_change = 0.0
+        std_change = 0.0
 
-        mse_std_change = 0.0
-
-        if history["mse_mean"]:
+        if (
+            len(history["mse_mean"])
+            >= self.min_history
+        ):
 
             previous_mean = (
-                history[
-                    "mse_mean"
-                ][-1]
+                history["mse_mean"][-1]
             )
 
             previous_std = (
-                history[
-                    "mse_std"
-                ][-1]
+                history["mse_std"][-1]
             )
 
-            current_mean = (
-                mse_stats["mean"]
-            )
-
-            current_std = (
-                mse_stats["std"]
-            )
-
-            if previous_mean > 0:
-
-                mse_mean_change = (
-                    abs(
-                        current_mean
-                        -
-                        previous_mean
-                    )
-                    /
-                    (
-                        abs(
-                            previous_mean
-                        )
-                        +
-                        1e-8
-                    )
+            mean_change = (
+                self._relative_change(
+                    mse_mean,
+                    previous_mean,
                 )
+            )
 
-            if previous_std > 0:
-
-                mse_std_change = (
-                    abs(
-                        current_std
-                        -
-                        previous_std
-                    )
-                    /
-                    (
-                        abs(
-                            previous_std
-                        )
-                        +
-                        1e-8
-                    )
+            std_change = (
+                self._relative_change(
+                    mse_std,
+                    previous_std,
                 )
+            )
 
             mse_history_fail = (
-                mse_mean_change
-                >
-                self.mse_change_threshold
+                mean_change
+                > self.mse_change_threshold
                 or
-                mse_std_change
-                >
-                self.mse_std_change_threshold
+                std_change
+                > self.mse_std_change_threshold
             )
 
-        # =========================================================
-        # RISK / TRUST
-        # =========================================================
+        # ========================================================
+        # FOUR SECURITY FAILURES
+        # ========================================================
 
-        failed_conditions = sum([
-            bool(magnitude_fail),
-            bool(timing_fail),
-            bool(loss_fail),
-            bool(mse_history_fail)
-        ])
-
-        # =========================================================
-        # NEW: INDIVIDUAL CONDITION DIAGNOSTIC LOG
-        # =========================================================
-
-        logging.info(
-            f"[Security Buffer] Client {client_id} | "
-            f"MagnitudeFail={magnitude_fail} | "
-            f"TimingFail={timing_fail} | "
-            f"LossFail={loss_fail} | "
-            f"MSEHistoryFail={mse_history_fail}"
+        failed_conditions = sum(
+            [
+                int(magnitude_fail),
+                int(timing_fail),
+                int(loss_fail),
+                int(mse_history_fail),
+            ]
         )
 
-        total_conditions = 4
+        # --------------------------------------------------------
+        # Trust / risk
+        # --------------------------------------------------------
 
         risk_score = (
-            failed_conditions
-            /
-            total_conditions
+            failed_conditions / 4.0
         )
 
         trust_score = (
-            1.0
-            -
-            risk_score
+            1.0 - risk_score
         )
 
-        # =========================================================
-        # DECISION
-        # =========================================================
+        # ========================================================
+        # FINAL ROUTING
+        # ========================================================
+        #
+        # SECURITY SEVERITY HAS PRIORITY.
+        #
+        # 3-4 failures -> QUARANTINE
+        # 1-2 failures -> SECONDARY
+        # 0 failures:
+        #       FAST -> DIRECT
+        #       SLOW -> SECONDARY
+        #
 
-        if failed_conditions == 0:
+        if failed_conditions >= 3:
 
-            decision = "DIRECT"
+            decision = "QUARANTINE"
+            validation_required = True
 
-            validation_required = False
-
-        elif failed_conditions <= 2:
+        elif failed_conditions >= 1:
 
             decision = "SECONDARY_CHECK"
-
             validation_required = True
 
         else:
 
-            decision = "QUARANTINE"
+            if latency_fail:
 
-            validation_required = False
+                decision = "SECONDARY_CHECK"
+                validation_required = True
 
-        # =========================================================
-        # RETURN ALL DIAGNOSTIC VALUES
-        # =========================================================
+            else:
 
-        return {
+                decision = "DIRECT"
+                validation_required = False
 
-            "client_id":
-                client_id,
+        # ========================================================
+        # DIAGNOSTICS
+        # ========================================================
 
-            "magnitude":
-                magnitude,
+        diagnostics = {
 
-            "magnitude_threshold":
-                magnitude_threshold,
+            "client_id": client_id,
 
-            "latency":
-                latency,
+            "magnitude": magnitude,
+            "magnitude_threshold": magnitude_threshold,
+            "Magnitude_Fail": bool(
+                magnitude_fail
+            ),
 
-            "train_time":
-                train_time,
+            "train_time": train_time,
+            "dataset_size": dataset_size,
+            "train_time_per_sample": (
+                time_per_sample
+            ),
+            "timing_change": timing_change,
+            "Timing_Fail": bool(
+                timing_fail
+            ),
 
-            "dataset_size":
-                dataset_size,
+            "arrival_latency": (
+                arrival_latency
+            ),
+            "Latency_Fail": bool(
+                latency_fail
+            ),
+            "latency_class": latency_class,
 
-            "time_per_sample":
-                time_per_sample,
+            "val_loss": val_loss,
+            "loss_change": loss_change,
+            "loss_threshold": (
+                adaptive_loss_threshold
+            ),
+            "Loss_Fail": bool(
+                loss_fail
+            ),
 
-            "previous_time_per_sample":
-                previous_time_per_sample,
+            "mse_mean": mse_mean,
+            "mse_std": mse_std,
+            "mse_max": mse_max,
+            "mse_mean_change": mean_change,
+            "mse_std_change": std_change,
+            "MSE_History_Fail": bool(
+                mse_history_fail
+            ),
 
-            "timing_change":
-                timing_change,
+            "failed_conditions": (
+                failed_conditions
+            ),
 
-            "time_change_threshold":
-                self.train_time_change_threshold,
+            "risk_score": risk_score,
+            "trust_score": trust_score,
 
-            "val_loss":
-                val_loss,
-
-            "loss_threshold":
-                loss_threshold,
-
-            "mse_mean":
-                mse_stats["mean"],
-
-            "mse_std":
-                mse_stats["std"],
-
-            "mse_max":
-                mse_stats["max"],
-
-            "mse_mean_change":
-                mse_mean_change,
-
-            "mse_std_change":
-                mse_std_change,
-
-            "Magnitude_Fail":
-                magnitude_fail,
-
-            "Latency_Fail":
-                latency_fail,
-
-            "Timing_Fail":
-                timing_fail,
-
-            "Loss_Fail":
-                loss_fail,
-
-            "MSE_History_Fail":
-                mse_history_fail,
-
-            "failed_conditions":
-                failed_conditions,
-
-            "risk_score":
-                risk_score,
-
-            "trust_score":
-                trust_score,
-
-            "score":
-                trust_score,
-
-            "decision":
-                decision,
-
-            "validation_required":
+            "decision": decision,
+            "validation_required": (
                 validation_required
+            ),
         }
 
-    # =============================================================
+        # ========================================================
+        # LOG
+        # ========================================================
+
+        logger.info(
+            "[SecurityBuffer] Client-%s | "
+            "Latency=%.3fs (%s) | "
+            "Magnitude_Fail=%s | "
+            "Timing_Fail=%s | "
+            "Loss_Fail=%s | "
+            "MSE_History_Fail=%s | "
+            "Failures=%d/4 | "
+            "Trust=%.2f | "
+            "Decision=%s",
+            client_id,
+            arrival_latency,
+            latency_class,
+            magnitude_fail,
+            timing_fail,
+            loss_fail,
+            mse_history_fail,
+            failed_conditions,
+            trust_score,
+            decision,
+        )
+
+        return diagnostics
+
+    # ============================================================
+    # APPLY ROUTE METADATA
+    # ============================================================
+
+    def _prepare_secondary_update(
+        self,
+        update: Dict[str, Any],
+    ) -> Dict[str, Any]:
+
+        item = copy.deepcopy(update)
+
+        item["route"] = "SECONDARY_CHECK"
+
+        item["validation_required"] = True
+
+        item["weight_factor"] = 0.7
+
+        item["buffer_age"] = int(
+            item.get("buffer_age", 0)
+        )
+
+        return item
+
+    def _prepare_quarantine_update(
+        self,
+        update: Dict[str, Any],
+    ) -> Dict[str, Any]:
+
+        item = copy.deepcopy(update)
+
+        item["route"] = "QUARANTINE"
+
+        item["validation_required"] = True
+
+        item["weight_factor"] = 0.3
+
+        item["buffer_age"] = int(
+            item.get("buffer_age", 0)
+        )
+
+        return item
+
+    # ============================================================
     # COLLECT CURRENT ROUND UPDATES
-    # =============================================================
+    # ============================================================
 
     def collect_current_round_updates(
         self,
         incoming_updates: List[Dict[str, Any]],
         global_model: nn.Module = None,
-        val_loader=None,
-        criterion=None,
-        global_mse: float = None,
-        device: str = "cpu",
-        **kwargs
     ) -> List[Dict[str, Any]]:
 
         if global_model is not None:
-
             self.set_global_model(
                 global_model
             )
 
-        ready_updates = []
+        # --------------------------------------------------------
+        # IMPORTANT
+        #
+        # ready_updates = ONLY updates that may participate in
+        # CURRENT round aggregation.
+        #
+        # Existing buffered updates are NEVER placed here.
+        # They are carried forward and returned separately through
+        # the buffer state.
+        # --------------------------------------------------------
 
-        next_buffer = []
+        ready_updates: List[
+            Dict[str, Any]
+        ] = []
 
-        # =========================================================
-        # STEP 1:
+        next_buffer: List[
+            Dict[str, Any]
+        ] = []
+
+        # ========================================================
+        # STEP 1
         # RECHECK EXISTING BUFFERED UPDATES
-        # =========================================================
+        # ========================================================
+
+        if self.buffer:
+
+            logger.info(
+                "[SecurityBuffer] "
+                "Rechecking %d buffered update(s) "
+                "for this round.",
+                len(self.buffer),
+            )
 
         for buffered_item in self.buffer:
 
-            buffered_item["age"] += 1
-
-            client_id = (
-                buffered_item.get(
-                    "client_id",
-                    "unknown"
-                )
-            )
-
-            # -----------------------------------------------------
-            # FINITE SAFETY CHECK
-            # -----------------------------------------------------
-
-            if not self._is_update_finite(
+            item = copy.deepcopy(
                 buffered_item
-            ):
+            )
 
-                logging.warning(
-                    f"[Security Buffer] "
-                    f"REJECTED non-finite buffered update | "
-                    f"Client: {client_id} | "
-                    f"NaN/Inf detected"
+            client_id = str(
+                item.get(
+                    "client_id",
+                    "unknown",
+                )
+            )
+
+            # Increase age because one round has passed.
+            item["buffer_age"] = (
+                int(
+                    item.get(
+                        "buffer_age",
+                        0,
+                    )
+                )
+                + 1
+            )
+
+            # ----------------------------------------------------
+            # Safety
+            # ----------------------------------------------------
+
+            if not self._is_update_finite(item):
+
+                logger.warning(
+                    "[SecurityBuffer] "
+                    "Client-%s buffered update "
+                    "contains NaN/Inf -> DROP",
+                    client_id,
                 )
 
                 continue
 
-            # -----------------------------------------------------
+            # ----------------------------------------------------
             # Expiration
-            # -----------------------------------------------------
+            # ----------------------------------------------------
 
             if (
-                buffered_item["age"]
-                >
-                self.window_size
+                item["buffer_age"]
+                > self.window_size
             ):
 
-                logging.warning(
-                    f"[Security Buffer] DROPPED expired update | "
-                    f"Client: {client_id} | "
-                    f"Reached Max Age ({self.window_size})"
+                logger.warning(
+                    "[SecurityBuffer] "
+                    "Client-%s buffered update "
+                    "expired after %d rounds -> DROP",
+                    client_id,
+                    item["buffer_age"],
                 )
 
                 continue
 
-            # -----------------------------------------------------
-            # Secondary checking
-            # -----------------------------------------------------
+            # ----------------------------------------------------
+            # Re-evaluate behavior
+            # ----------------------------------------------------
 
-            behavior = (
+            diagnostics = (
                 self.evaluate_update_behavior(
-                    buffered_item,
-                    self.global_model
+                    item
                 )
             )
 
-            buffered_item.update(
-                behavior
+            item[
+                "security_diagnostics"
+            ] = diagnostics
+
+            decision = diagnostics[
+                "decision"
+            ]
+
+            failed_conditions = (
+                diagnostics[
+                    "failed_conditions"
+                ]
             )
 
-            # -----------------------------------------------------
-            # Secondary check passed
-            # -----------------------------------------------------
+            # ====================================================
+            # CLEAN + FAST
+            # ====================================================
 
             if (
-                behavior["decision"]
-                ==
-                "DIRECT"
+                decision == "DIRECT"
+                and failed_conditions == 0
             ):
 
-                buffered_item["route"] = (
-                    "RELEASED"
+                # IMPORTANT:
+                # This is now a NEXT-ROUND release.
+                #
+                # It is NOT an original current-round arrival.
+                # Therefore it receives the secondary factor.
+                #
+                # A buffered update must never suddenly become
+                # weight_factor=1.0 just because it became clean.
+                #
+                # Determine its original route.
+                original_route = item.get(
+                    "route",
+                    "SECONDARY_CHECK",
                 )
 
-                buffered_item[
+                if original_route == "QUARANTINE":
+
+                    item["route"] = (
+                        "QUARANTINE_RELEASED"
+                    )
+
+                    item["weight_factor"] = 0.3
+
+                    logger.info(
+                        "[SecurityBuffer] "
+                        "Client-%s QUARANTINE "
+                        "VERIFIED -> RELEASED "
+                        "for NEXT round "
+                        "(factor=0.3)",
+                        client_id,
+                    )
+
+                else:
+
+                    item["route"] = (
+                        "SECONDARY_RELEASED"
+                    )
+
+                    item["weight_factor"] = 0.7
+
+                    logger.info(
+                        "[SecurityBuffer] "
+                        "Client-%s SECONDARY "
+                        "VERIFIED -> RELEASED "
+                        "for NEXT round "
+                        "(factor=0.7)",
+                        client_id,
+                    )
+
+                item[
                     "validation_required"
                 ] = False
 
-                ready_updates.append(
-                    buffered_item
+                item[
+                    "release_round_pending"
+                ] = True
+
+                # ------------------------------------------------
+                # IMPORTANT:
+                #
+                # DO NOT append to ready_updates here.
+                #
+                # It belongs to the next aggregation round.
+                # We keep it in next_buffer with a release flag.
+                # ------------------------------------------------
+
+                next_buffer.append(item)
+
+                continue
+
+            # ====================================================
+            # STILL SECONDARY
+            # ====================================================
+
+            if decision == "SECONDARY_CHECK":
+
+                item["route"] = (
+                    "SECONDARY_CHECK"
                 )
 
-                self._remember_update(
-                    buffered_item
+                item["weight_factor"] = 0.7
+
+                item[
+                    "validation_required"
+                ] = True
+
+                next_buffer.append(item)
+
+                logger.info(
+                    "[SecurityBuffer] "
+                    "Client-%s remains in "
+                    "SECONDARY buffer "
+                    "(failures=%d/4, age=%d)",
+                    client_id,
+                    failed_conditions,
+                    item["buffer_age"],
                 )
 
-                logging.info(
-                    f"[Security Buffer] "
-                    f"RELEASED buffered update | "
-                    f"Client: {client_id} | "
-                    f"Age: {buffered_item['age']} | "
-                    f"Arrival Latency: "
-                    f"{behavior['latency']:.2f}s | "
-                    f"Train Time: "
-                    f"{behavior['train_time']:.2f}s | "
-                    f"Time/Sample: "
-                    f"{behavior['time_per_sample']:.6f} | "
-                    f"Trust: "
-                    f"{behavior['trust_score']:.3f}"
+                continue
+
+            # ====================================================
+            # QUARANTINE
+            # ====================================================
+
+            if decision == "QUARANTINE":
+
+                item["route"] = (
+                    "QUARANTINE"
                 )
 
-            # -----------------------------------------------------
-            # Still suspicious
-            # -----------------------------------------------------
+                item["weight_factor"] = 0.3
 
-            elif (
-                behavior["decision"]
-                ==
-                "SECONDARY_CHECK"
-            ):
+                item[
+                    "validation_required"
+                ] = True
 
-                next_buffer.append(
-                    buffered_item
+                next_buffer.append(item)
+
+                logger.warning(
+                    "[SecurityBuffer] "
+                    "Client-%s remains QUARANTINED "
+                    "(failures=%d/4, age=%d)",
+                    client_id,
+                    failed_conditions,
+                    item["buffer_age"],
                 )
 
-                logging.info(
-                    f"[Security Buffer] "
-                    f"HOLDING buffered update | "
-                    f"Client: {client_id} | "
-                    f"Age: {buffered_item['age']} | "
-                    f"Trust: "
-                    f"{behavior['trust_score']:.3f}"
-                )
+                continue
 
-            # -----------------------------------------------------
-            # Strongly suspicious
-            # -----------------------------------------------------
-
-            else:
-
-                buffered_item[
-                    "route"
-                ] = "QUARANTINE"
-
-                logging.warning(
-                    f"[Security Buffer] "
-                    f"QUARANTINE buffered update | "
-                    f"Client: {client_id} | "
-                    f"Age: {buffered_item['age']} | "
-                    f"Failed: "
-                    f"{behavior['failed_conditions']}/4"
-                )
-
-        # =========================================================
-        # STEP 2:
-        # PROCESS NEW INCOMING UPDATES
-        # =========================================================
+        # ========================================================
+        # STEP 2
+        # PROCESS NEW CURRENT-ROUND UPDATES
+        # ========================================================
 
         for update in incoming_updates:
 
-            client_id = (
+            client_id = str(
                 update.get(
                     "client_id",
-                    "unknown"
+                    "unknown",
                 )
             )
 
-            # -----------------------------------------------------
-            # FINITE SAFETY CHECK
-            #
-            # This happens BEFORE the four behavioral checks.
-            # NaN/Inf is NOT counted in failed_conditions.
-            # -----------------------------------------------------
+            # ----------------------------------------------------
+            # Safety first
+            # ----------------------------------------------------
 
-            if not self._is_update_finite(
-                update
-            ):
+            if not self._is_update_finite(update):
 
-                update[
-                    "route"
-                ] = "REJECT"
-
-                update[
-                    "validation_required"
-                ] = False
-
-                logging.warning(
-                    f"[Security Buffer] "
-                    f"REJECT Client {client_id} | "
-                    f"NaN/Inf detected in incoming update"
+                logger.warning(
+                    "[SecurityBuffer] "
+                    "Client-%s current update "
+                    "contains NaN/Inf -> DROP",
+                    client_id,
                 )
 
                 continue
 
-            # -----------------------------------------------------
-            # Existing behavioral security logic
-            # -----------------------------------------------------
+            # ----------------------------------------------------
+            # Evaluate four security conditions + latency
+            # ----------------------------------------------------
 
-            behavior = (
+            diagnostics = (
                 self.evaluate_update_behavior(
-                    update,
-                    self.global_model
+                    update
                 )
             )
 
-            update.update(
-                behavior
+            update_item = copy.deepcopy(
+                update
             )
 
-            latency = (
-                behavior["latency"]
+            update_item[
+                "security_diagnostics"
+            ] = diagnostics
+
+            failed_conditions = (
+                diagnostics[
+                    "failed_conditions"
+                ]
             )
 
-            # -----------------------------------------------------
-            # FAST + CLEAN
-            # -----------------------------------------------------
+            latency_fail = diagnostics[
+                "Latency_Fail"
+            ]
 
-            if (
-                latency
-                <=
-                self.latency_threshold
-                and
-                behavior["decision"]
-                ==
+            # ====================================================
+            # CASE 1
+            # 3-4 SECURITY FAILURES
+            # ====================================================
+
+            if failed_conditions >= 3:
+
+                update_item = (
+                    self._prepare_quarantine_update(
+                        update_item
+                    )
+                )
+
+                update_item[
+                    "buffer_age"
+                ] = 0
+
+                next_buffer.append(
+                    update_item
+                )
+
+                logger.warning(
+                    "[SecurityBuffer] "
+                    "Client-%s -> QUARANTINE | "
+                    "Failures=%d/4 | "
+                    "Latency=%.3fs | "
+                    "Factor=0.3 | "
+                    "Held for NEXT round",
+                    client_id,
+                    failed_conditions,
+                    diagnostics[
+                        "arrival_latency"
+                    ],
+                )
+
+                continue
+
+            # ====================================================
+            # CASE 2
+            # 1-2 SECURITY FAILURES
+            # ====================================================
+
+            if failed_conditions >= 1:
+
+                update_item = (
+                    self._prepare_secondary_update(
+                        update_item
+                    )
+                )
+
+                update_item[
+                    "buffer_age"
+                ] = 0
+
+                next_buffer.append(
+                    update_item
+                )
+
+                logger.info(
+                    "[SecurityBuffer] "
+                    "Client-%s -> SECONDARY BUFFER | "
+                    "Failures=%d/4 | "
+                    "Latency=%.3fs | "
+                    "Factor=0.7 | "
+                    "Held for NEXT round",
+                    client_id,
+                    failed_conditions,
+                    diagnostics[
+                        "arrival_latency"
+                    ],
+                )
+
+                continue
+
+            # ====================================================
+            # CASE 3
+            # 0 SECURITY FAILURES + SLOW
+            # ====================================================
+
+            if latency_fail:
+
+                update_item = (
+                    self._prepare_secondary_update(
+                        update_item
+                    )
+                )
+
+                update_item[
+                    "buffer_age"
+                ] = 0
+
+                next_buffer.append(
+                    update_item
+                )
+
+                logger.info(
+                    "[SecurityBuffer] "
+                    "Client-%s -> SLOW / "
+                    "SECONDARY BUFFER | "
+                    "Failures=0/4 | "
+                    "Latency=%.3fs > %.3fs | "
+                    "Factor=0.7 | "
+                    "Held for NEXT round",
+                    client_id,
+                    diagnostics[
+                        "arrival_latency"
+                    ],
+                    self.latency_threshold,
+                )
+
+                continue
+
+            # ====================================================
+            # CASE 4
+            # 0 SECURITY FAILURES + FAST
+            # ====================================================
+
+            update_item["route"] = (
                 "DIRECT"
-            ):
+            )
 
-                update["route"] = (
-                    "DIRECT"
-                )
+            update_item[
+                "validation_required"
+            ] = False
 
-                update[
-                    "validation_required"
-                ] = False
+            update_item[
+                "weight_factor"
+            ] = 1.0
 
-                ready_updates.append(
-                    update
-                )
+            update_item[
+                "buffer_age"
+            ] = 0
 
-                self._remember_update(
-                    update
-                )
+            # This is the ONLY type that enters
+            # current-round ready_updates.
+            ready_updates.append(
+                update_item
+            )
 
-                logging.info(
-                    f"[Security Buffer] "
-                    f"DIRECT ACCEPT Client {client_id} | "
-                    f"Arrival Latency: "
-                    f"{latency:.2f}s | "
-                    f"Train Time: "
-                    f"{behavior['train_time']:.2f}s | "
-                    f"Time/Sample: "
-                    f"{behavior['time_per_sample']:.6f} | "
-                    f"Magnitude: "
-                    f"{behavior['magnitude']:.4f} | "
-                    f"Trust: "
-                    f"{behavior['trust_score']:.3f}"
-                )
+            # Remember direct update for future
+            # behavioral history.
+            self._remember_update(
+                update_item
+            )
 
-            # -----------------------------------------------------
-            # FAST BUT SUSPICIOUS
-            # -----------------------------------------------------
+            logger.info(
+                "[SecurityBuffer] "
+                "Client-%s -> DIRECT | "
+                "FAST | "
+                "Failures=0/4 | "
+                "Latency=%.3fs <= %.3fs | "
+                "Factor=1.0 | "
+                "CURRENT round aggregation",
+                client_id,
+                diagnostics[
+                    "arrival_latency"
+                ],
+                self.latency_threshold,
+            )
 
-            elif (
-                latency
-                <=
-                self.latency_threshold
-                and
-                behavior["decision"]
-                ==
-                "SECONDARY_CHECK"
-            ):
-
-                update_copy = (
-                    copy.deepcopy(
-                        update
-                    )
-                )
-
-                update_copy["age"] = 0
-
-                update_copy[
-                    "route"
-                ] = "SECONDARY_CHECK"
-
-                update_copy[
-                    "validation_required"
-                ] = True
-
-                next_buffer.append(
-                    update_copy
-                )
-
-                logging.info(
-                    f"[Security Buffer] "
-                    f"SECONDARY CHECK Client {client_id} | "
-                    f"Arrival Latency: "
-                    f"{latency:.2f}s | "
-                    f"Train Time: "
-                    f"{behavior['train_time']:.2f}s | "
-                    f"Time/Sample: "
-                    f"{behavior['time_per_sample']:.6f} | "
-                    f"Failed: "
-                    f"{behavior['failed_conditions']}/4 | "
-                    f"Trust: "
-                    f"{behavior['trust_score']:.3f}"
-                )
-
-            # -----------------------------------------------------
-            # SLOW / LATE UPDATE
-            # -----------------------------------------------------
-
-            elif (
-                latency
-                >
-                self.latency_threshold
-            ):
-
-                update_copy = (
-                    copy.deepcopy(
-                        update
-                    )
-                )
-
-                update_copy["age"] = 0
-
-                update_copy[
-                    "route"
-                ] = "SECONDARY_CHECK"
-
-                update_copy[
-                    "validation_required"
-                ] = True
-
-                next_buffer.append(
-                    update_copy
-                )
-
-                logging.info(
-                    f"[Security Buffer] "
-                    f"BUFFERED SLOW Client {client_id} | "
-                    f"Arrival Latency: "
-                    f"{latency:.2f}s > "
-                    f"{self.latency_threshold:.2f}s | "
-                    f"Train Time: "
-                    f"{behavior['train_time']:.2f}s | "
-                    f"Time/Sample: "
-                    f"{behavior['time_per_sample']:.6f} | "
-                    f"Timing Fail: "
-                    f"{behavior['Timing_Fail']} | "
-                    f"Trust: "
-                    f"{behavior['trust_score']:.3f}"
-                )
-
-            # -----------------------------------------------------
-            # STRONGLY SUSPICIOUS
-            # -----------------------------------------------------
-
-            else:
-
-                update[
-                    "route"
-                ] = "QUARANTINE"
-
-                update[
-                    "validation_required"
-                ] = False
-
-                logging.warning(
-                    f"[Security Buffer] "
-                    f"QUARANTINE Client {client_id} | "
-                    f"Failed: "
-                    f"{behavior['failed_conditions']}/4 | "
-                    f"Trust: "
-                    f"{behavior['trust_score']:.3f}"
-                )
-
-        # =========================================================
-        # UPDATE BUFFER
-        # =========================================================
+        # ========================================================
+        # SAVE BUFFER
+        # ========================================================
 
         self.buffer = next_buffer
 
-        logging.info(
-            f"[Security Buffer] Summary -> "
-            f"Direct/Released Updates: "
-            f"{len(ready_updates)} | "
-            f"Secondary/Buffered: "
-            f"{len(self.buffer)}"
+        # ========================================================
+        # SUMMARY
+        # ========================================================
+
+        direct_clients = [
+            str(
+                item.get(
+                    "client_id",
+                    "unknown",
+                )
+            )
+            for item in ready_updates
+        ]
+
+        buffered_clients = [
+            str(
+                item.get(
+                    "client_id",
+                    "unknown",
+                )
+            )
+            for item in self.buffer
+        ]
+
+        logger.info(
+            "[SecurityBuffer] "
+            "CURRENT round direct aggregation: %s",
+            direct_clients,
         )
+
+        logger.info(
+            "[SecurityBuffer] "
+            "NEXT round buffer: %s",
+            buffered_clients,
+        )
+
+        logger.info(
+            "[SecurityBuffer] "
+            "Current ready=%d | "
+            "Buffered for next round=%d",
+            len(ready_updates),
+            len(self.buffer),
+        )
+
+        # --------------------------------------------------------
+        # ONLY CURRENT-ROUND DIRECT UPDATES RETURNED.
+        # --------------------------------------------------------
 
         return ready_updates
 
-    # =============================================================
-    # STORE HISTORY
-    # =============================================================
+    # ============================================================
+    # BUFFER STATUS
+    # ============================================================
 
-    def _remember_update(
-        self,
-        update
-    ):
+    def get_buffer_status(self):
 
-        client_id = (
-            update.get(
-                "client_id",
-                "unknown"
+        clients = []
+
+        for item in self.buffer:
+
+            clients.append(
+                {
+                    "client_id": item.get(
+                        "client_id",
+                        "unknown",
+                    ),
+                    "route": item.get(
+                        "route",
+                        "UNKNOWN",
+                    ),
+                    "age": item.get(
+                        "buffer_age",
+                        0,
+                    ),
+                    "weight_factor": item.get(
+                        "weight_factor",
+                        1.0,
+                    ),
+                    "validation_required": item.get(
+                        "validation_required",
+                        False,
+                    ),
+                }
             )
-        )
-
-        self._append_history(
-            client_id=client_id,
-
-            magnitude=update.get(
-                "magnitude"
-            ),
-
-            time_per_sample=update.get(
-                "time_per_sample"
-            ),
-
-            val_loss=update.get(
-                "val_loss"
-            ),
-
-            mse_mean=update.get(
-                "mse_mean"
-            ),
-
-            mse_std=update.get(
-                "mse_std"
-            ),
-
-            mse_max=update.get(
-                "mse_max"
-            )
-        )
-
-    # =============================================================
-    # DIAGNOSTIC STATUS
-    # =============================================================
-
-    def get_buffer_status(
-        self
-    ) -> dict:
 
         return {
-
-            "buffered_count":
-                len(
-                    self.buffer
-                ),
-
-            "buffered_clients": [
-                item.get(
-                    "client_id"
-                )
-                for item in self.buffer
-            ],
-
-            "window_size":
-                self.window_size,
-
-            "latency_threshold":
-                self.latency_threshold,
-
-            "history_clients":
-                len(
-                    self.client_history
-                )
+            "count": len(
+                self.buffer
+            ),
+            "clients": clients,
+            "window_size": (
+                self.window_size
+            ),
+            "latency_threshold": (
+                self.latency_threshold
+            ),
+            "history_clients": list(
+                self.client_history.keys()
+            ),
         }
