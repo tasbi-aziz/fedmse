@@ -1003,12 +1003,12 @@ if __name__ == "__main__":
 
             abnormal_data = None
 
-        # ---------------------------------------------------------
+               # ---------------------------------------------------------
         # Split normal data
         #
         # 40% train
         # 10% validation
-        # remaining test-normal
+        # test-normal comes from separate test_normal.csv
         # ---------------------------------------------------------
 
         train_normal_size = int(
@@ -1044,12 +1044,23 @@ if __name__ == "__main__":
             )
         )
 
+        # ---------------------------------------------------------
+        # Load dedicated test_normal.csv
+        # ---------------------------------------------------------
+
+        test_normal_data_path = os.path.join(
+            config["data_path"],
+            dev["test_normal_data_path"]
+        )
+
         test_normal_data = (
-            normal_data[
-                train_normal_size
-                +
-                valid_normal_size:
-            ]
+            load_data(
+                test_normal_data_path
+            )
+            .sample(
+                frac=1,
+                random_state=data_seed
+            )
             .reset_index(
                 drop=True
             )
