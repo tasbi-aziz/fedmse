@@ -17,7 +17,7 @@ class SecurityBuffer:
         self,
         global_model: nn.Module = None,
         window_size: int = 5,
-        latency_threshold: float = 10.0,
+        latency_threshold: float = 1.5,
         alpha: float = 0.2,
         beta: float = 0.01,
         cos_sim_threshold: float = -0.1,
