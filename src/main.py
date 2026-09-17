@@ -1845,7 +1845,32 @@ if __name__ == "__main__":
                         device_trainer.get_parameters()
                     )
 
-                    incoming_updates.append({
+                    update = {
+                        "client_id": client["device"],
+                        "weights": raw_weights,
+                        "arrival_time": total_arrival_latency,
+                        "train_time": local_train_time,
+                        "dataset_size": device_trainer.dataset_size,
+                        "val_mse_list": copy.deepcopy(
+                         device_trainer.val_mse_list
+                         ),
+                        "val_loss": device_trainer.val_loss,
+                        "val_variance": device_trainer.val_loss_variance,
+                        "train_loss": device_trainer.train_loss,
+                        "reconstruction_loss": device_trainer.reconstruction_loss,
+                        "kl_loss": device_trainer.kl_loss
+                         }
+
+# Client-3 = attacker
+                    if client["device"] == "Client-3":
+                      update = manipulate_update(update)
+                    else:
+                       update = manipulate_update(
+                          update,
+                          attack_type="none"
+                       )
+
+                     incoming_updates.append(update)
 
                         "client_id":
                             client["device"],
