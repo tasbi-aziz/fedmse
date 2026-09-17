@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class SecurityBuffer:
     """
-    Security-aware asynchronous/latency-aware update router.
+    Security-aware asynchronous / latency-aware update router.
 
     Routing policy
     --------------
@@ -29,39 +29,50 @@ class SecurityBuffer:
         3. Local validation-loss behavior
         4. Historical validation-MSE behavior
 
-    Security severity has priority over latency:
+    Latency is NOT a security failure.
 
-        3-4 failures
+    Routing:
+
+        3-4 security failures
             -> QUARANTINE
-            -> verify in next round
-            -> accepted => next round, weight_factor = 0.3
+            -> buffer for next round
+            -> main.py verifies later
+            -> accepted => factor 0.3
             -> rejected => DROP
 
-        1-2 failures
+        1-2 security failures
             -> SECONDARY BUFFER
-            -> verify in next round
-            -> accepted => next round, weight_factor = 0.7
+            -> buffer for next round
+            -> main.py verifies later
+            -> accepted => factor 0.7
             -> rejected => DROP
 
-        0 failures:
-            FAST  (arrival_latency <= 1.5 sec)
+        0 security failures:
+
+            FAST
+                arrival_latency <= 1.5 sec
                 -> DIRECT
-                -> current round, weight_factor = 1.0
+                -> current round
+                -> factor 1.0
 
-            SLOW  (arrival_latency > 1.5 sec)
+            SLOW
+                arrival_latency > 1.5 sec
                 -> SECONDARY BUFFER
-                -> next round, weight_factor = 0.7
+                -> next round
+                -> factor 0.7
 
-    Important:
-        Latency is a routing signal, NOT a security failure.
 
-        Therefore:
-            SLOW + CLEAN       -> SECONDARY
-            SLOW + 1-2 fails   -> SECONDARY
-            SLOW + 3-4 fails   -> QUARANTINE
+    IMPORTANT:
 
-    The buffer only stores delayed updates.
-    Buffered updates are NOT returned as current-round ready updates.
+    This class only decides the routing of CURRENT-ROUND updates.
+
+    Buffered updates are NOT re-validated or released here.
+
+    main.py is responsible for:
+        - validating buffered updates
+        - accepting/rejecting them
+        - carrying accepted updates to next-round aggregation
+        - applying factor 0.7 / 0.3
     """
 
     def __init__(
@@ -83,7 +94,7 @@ class SecurityBuffer:
 
         self.global_model = global_model
 
-        # Maximum number of rounds an update may remain buffered.
+        # Maximum buffer age.
         self.window_size = window_size
 
         # FAST / SLOW threshold.
@@ -106,35 +117,49 @@ class SecurityBuffer:
         self.history_size = history_size
         self.min_history = min_history
 
-        # Delayed updates live here.
+        # Delayed updates.
         #
         # IMPORTANT:
-        # Items inside this buffer are NOT current-round updates.
-        # They are considered again when the next round starts.
+        # These updates are NOT current-round aggregation updates.
+        #
+        # main.py will process this buffer in the next-round logic.
         self.buffer: List[Dict[str, Any]] = []
 
         # Per-client behavioral history.
-        self.client_history: Dict[str, Dict[str, List[float]]] = {}
+        self.client_history: Dict[
+            str,
+            Dict[str, List[float]]
+        ] = {}
 
     # ============================================================
     # GLOBAL MODEL
     # ============================================================
 
-    def set_global_model(self, global_model: nn.Module):
-        """Update the current global model reference."""
+    def set_global_model(
+        self,
+        global_model: nn.Module
+    ):
+        """
+        Update the current global model reference.
+        """
         self.global_model = global_model
 
     # ============================================================
     # SAFETY CHECK
     # ============================================================
 
-    def _is_update_finite(self, obj: Any) -> bool:
+    def _is_update_finite(
+        self,
+        obj: Any
+    ) -> bool:
         """
-        Recursively check whether an object contains NaN/Inf.
+        Recursively check whether an object contains NaN / Inf.
         """
 
         if torch.is_tensor(obj):
-            return bool(torch.isfinite(obj).all().item())
+            return bool(
+                torch.isfinite(obj).all().item()
+            )
 
         if isinstance(obj, dict):
             return all(
@@ -149,7 +174,9 @@ class SecurityBuffer:
             )
 
         if isinstance(obj, (float, int)):
-            return math.isfinite(float(obj))
+            return math.isfinite(
+                float(obj)
+            )
 
         return True
 
@@ -157,7 +184,10 @@ class SecurityBuffer:
     # CLIENT HISTORY
     # ============================================================
 
-    def _get_client_history(self, client_id: str):
+    def _get_client_history(
+        self,
+        client_id: str
+    ):
 
         if client_id not in self.client_history:
 
@@ -190,17 +220,28 @@ class SecurityBuffer:
         if not math.isfinite(value):
             return
 
-        history = self._get_client_history(client_id)
+        history = self._get_client_history(
+            client_id
+        )
 
         history[key].append(value)
 
         if len(history[key]) > self.history_size:
-            history[key] = history[key][-self.history_size:]
 
-    def _remember_update(self, update: Dict[str, Any]):
+            history[key] = (
+                history[key][-self.history_size:]
+            )
+
+    def _remember_update(
+        self,
+        update: Dict[str, Any]
+    ):
 
         client_id = str(
-            update.get("client_id", "unknown")
+            update.get(
+                "client_id",
+                "unknown"
+            )
         )
 
         diagnostics = update.get(
@@ -217,7 +258,9 @@ class SecurityBuffer:
         self._append_history(
             client_id,
             "train_time_per_sample",
-            diagnostics.get("train_time_per_sample"),
+            diagnostics.get(
+                "train_time_per_sample"
+            ),
         )
 
         self._append_history(
@@ -256,7 +299,9 @@ class SecurityBuffer:
         if self.global_model is None:
             return 0.0
 
-        global_state = self.global_model.state_dict()
+        global_state = (
+            self.global_model.state_dict()
+        )
 
         total_sq = 0.0
 
@@ -268,22 +313,38 @@ class SecurityBuffer:
             global_tensor = global_state[name]
 
             try:
-                local_tensor = local_tensor.detach().float()
-                global_tensor = global_tensor.detach().float()
 
-                if local_tensor.shape != global_tensor.shape:
+                local_tensor = (
+                    local_tensor.detach().float()
+                )
+
+                global_tensor = (
+                    global_tensor.detach().float()
+                )
+
+                if (
+                    local_tensor.shape
+                    != global_tensor.shape
+                ):
                     continue
 
-                diff = local_tensor - global_tensor
+                diff = (
+                    local_tensor
+                    - global_tensor
+                )
 
                 total_sq += float(
-                    torch.sum(diff * diff).item()
+                    torch.sum(
+                        diff * diff
+                    ).item()
                 )
 
             except Exception:
                 continue
 
-        return math.sqrt(max(total_sq, 0.0))
+        return math.sqrt(
+            max(total_sq, 0.0)
+        )
 
     # ============================================================
     # MSE STATISTICS
@@ -302,11 +363,19 @@ class SecurityBuffer:
         for value in mse_list:
 
             try:
+
                 value = float(value)
 
                 if math.isfinite(value):
-                    value = max(value, 0.0)
-                    finite_values.append(value)
+
+                    value = max(
+                        value,
+                        0.0
+                    )
+
+                    finite_values.append(
+                        value
+                    )
 
             except Exception:
                 continue
@@ -314,8 +383,8 @@ class SecurityBuffer:
         if not finite_values:
             return 0.0, 0.0, 0.0
 
-        # log1p prevents extremely large MSE values
-        # from dominating the history comparison.
+        # log1p prevents extremely large
+        # MSE values from dominating history.
         values = torch.tensor(
             finite_values,
             dtype=torch.float32,
@@ -328,13 +397,16 @@ class SecurityBuffer:
         )
 
         if len(values) > 1:
+
             std_value = float(
                 torch.std(
                     values,
                     unbiased=False,
                 ).item()
             )
+
         else:
+
             std_value = 0.0
 
         max_value = float(
@@ -357,10 +429,14 @@ class SecurityBuffer:
         base_threshold: float,
     ) -> float:
 
-        if len(history_values) < self.min_history:
+        if (
+            len(history_values)
+            < self.min_history
+        ):
             return base_threshold
 
         try:
+
             values = torch.tensor(
                 history_values,
                 dtype=torch.float32,
@@ -377,7 +453,9 @@ class SecurityBuffer:
                 ).item()
             )
 
-            adaptive = mean + (3.0 * std)
+            adaptive = (
+                mean + (3.0 * std)
+            )
 
             return max(
                 float(base_threshold),
@@ -385,6 +463,7 @@ class SecurityBuffer:
             )
 
         except Exception:
+
             return base_threshold
 
     # ============================================================
@@ -398,18 +477,30 @@ class SecurityBuffer:
     ) -> float:
 
         try:
-            train_time = float(train_time)
-            dataset_size = int(dataset_size)
+
+            train_time = float(
+                train_time
+            )
+
+            dataset_size = int(
+                dataset_size
+            )
 
             if dataset_size <= 0:
                 return 0.0
 
-            if not math.isfinite(train_time):
+            if not math.isfinite(
+                train_time
+            ):
                 return 0.0
 
-            return train_time / float(dataset_size)
+            return (
+                train_time
+                / float(dataset_size)
+            )
 
         except Exception:
+
             return 0.0
 
     # ============================================================
@@ -423,6 +514,7 @@ class SecurityBuffer:
     ) -> float:
 
         try:
+
             current = float(current)
             previous = float(previous)
 
@@ -436,6 +528,7 @@ class SecurityBuffer:
             ) / denominator
 
         except Exception:
+
             return 0.0
 
     # ============================================================
@@ -448,81 +541,107 @@ class SecurityBuffer:
     ) -> Dict[str, Any]:
 
         client_id = str(
-            update.get("client_id", "unknown")
+            update.get(
+                "client_id",
+                "unknown"
+            )
         )
 
         weights = update.get(
             "weights",
-            {},
+            {}
         )
 
         arrival_latency = float(
             update.get(
                 "arrival_time",
-                update.get("latency", 0.0),
+                update.get(
+                    "latency",
+                    0.0
+                ),
             )
         )
 
         train_time = float(
             update.get(
                 "train_time",
-                0.0,
+                0.0
             )
         )
 
         dataset_size = int(
             update.get(
                 "dataset_size",
-                1,
+                1
             )
         )
 
         val_loss = float(
             update.get(
                 "val_loss",
-                0.0,
+                0.0
             )
         )
 
         mse_list = update.get(
             "val_mse_list",
-            [],
+            []
         )
 
         # --------------------------------------------------------
         # Basic finite checks
         # --------------------------------------------------------
 
-        if not math.isfinite(arrival_latency):
-            arrival_latency = float("inf")
+        if not math.isfinite(
+            arrival_latency
+        ):
+            arrival_latency = float(
+                "inf"
+            )
 
-        if not math.isfinite(train_time):
-            train_time = float("inf")
+        if not math.isfinite(
+            train_time
+        ):
+            train_time = float(
+                "inf"
+            )
 
-        if not math.isfinite(val_loss):
-            val_loss = float("inf")
+        if not math.isfinite(
+            val_loss
+        ):
+            val_loss = float(
+                "inf"
+            )
 
         # --------------------------------------------------------
         # Current measurements
         # --------------------------------------------------------
 
-        magnitude = self.compute_update_magnitude(
-            weights
-        )
-
-        time_per_sample = self.compute_time_per_sample(
-            train_time,
-            dataset_size,
-        )
-
-        mse_mean, mse_std, mse_max = (
-            self.compute_mse_statistics(
-                mse_list
+        magnitude = (
+            self.compute_update_magnitude(
+                weights
             )
         )
 
-        history = self._get_client_history(
-            client_id
+        time_per_sample = (
+            self.compute_time_per_sample(
+                train_time,
+                dataset_size,
+            )
+        )
+
+        (
+            mse_mean,
+            mse_std,
+            mse_max,
+        ) = self.compute_mse_statistics(
+            mse_list
+        )
+
+        history = (
+            self._get_client_history(
+                client_id
+            )
         )
 
         # ========================================================
@@ -532,7 +651,10 @@ class SecurityBuffer:
 
         magnitude_fail = False
 
-        if len(history["magnitude"]) >= self.min_history:
+        if (
+            len(history["magnitude"])
+            >= self.min_history
+        ):
 
             magnitude_threshold = (
                 self._adaptive_threshold(
@@ -542,7 +664,8 @@ class SecurityBuffer:
             )
 
             magnitude_fail = (
-                magnitude > magnitude_threshold
+                magnitude
+                > magnitude_threshold
             )
 
         else:
@@ -559,7 +682,11 @@ class SecurityBuffer:
         timing_fail = False
 
         if (
-            len(history["train_time_per_sample"])
+            len(
+                history[
+                    "train_time_per_sample"
+                ]
+            )
             >= self.min_history
         ):
 
@@ -640,6 +767,7 @@ class SecurityBuffer:
         else:
 
             loss_change = 0.0
+
             adaptive_loss_threshold = (
                 self.loss_change_threshold
             )
@@ -702,9 +830,9 @@ class SecurityBuffer:
             ]
         )
 
-        # --------------------------------------------------------
-        # Trust / risk
-        # --------------------------------------------------------
+        # ========================================================
+        # TRUST / RISK
+        # ========================================================
 
         risk_score = (
             failed_conditions / 4.0
@@ -717,15 +845,8 @@ class SecurityBuffer:
         # ========================================================
         # FINAL ROUTING
         # ========================================================
-        #
-        # SECURITY SEVERITY HAS PRIORITY.
-        #
-        # 3-4 failures -> QUARANTINE
-        # 1-2 failures -> SECONDARY
-        # 0 failures:
-        #       FAST -> DIRECT
-        #       SLOW -> SECONDARY
-        #
+
+        # Security severity has priority over latency.
 
         if failed_conditions >= 3:
 
@@ -757,12 +878,16 @@ class SecurityBuffer:
 
             "client_id": client_id,
 
+            # Condition 1
             "magnitude": magnitude,
-            "magnitude_threshold": magnitude_threshold,
+            "magnitude_threshold": (
+                magnitude_threshold
+            ),
             "Magnitude_Fail": bool(
                 magnitude_fail
             ),
 
+            # Condition 2
             "train_time": train_time,
             "dataset_size": dataset_size,
             "train_time_per_sample": (
@@ -773,6 +898,7 @@ class SecurityBuffer:
                 timing_fail
             ),
 
+            # Latency routing
             "arrival_latency": (
                 arrival_latency
             ),
@@ -781,6 +907,7 @@ class SecurityBuffer:
             ),
             "latency_class": latency_class,
 
+            # Condition 3
             "val_loss": val_loss,
             "loss_change": loss_change,
             "loss_threshold": (
@@ -790,6 +917,7 @@ class SecurityBuffer:
                 loss_fail
             ),
 
+            # Condition 4
             "mse_mean": mse_mean,
             "mse_std": mse_std,
             "mse_max": mse_max,
@@ -799,10 +927,10 @@ class SecurityBuffer:
                 mse_history_fail
             ),
 
+            # Overall
             "failed_conditions": (
                 failed_conditions
             ),
-
             "risk_score": risk_score,
             "trust_score": trust_score,
 
@@ -849,16 +977,23 @@ class SecurityBuffer:
         update: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        item = copy.deepcopy(update)
+        item = copy.deepcopy(
+            update
+        )
 
-        item["route"] = "SECONDARY_CHECK"
+        item["route"] = (
+            "SECONDARY_CHECK"
+        )
 
         item["validation_required"] = True
 
         item["weight_factor"] = 0.7
 
         item["buffer_age"] = int(
-            item.get("buffer_age", 0)
+            item.get(
+                "buffer_age",
+                0
+            )
         )
 
         return item
@@ -868,16 +1003,23 @@ class SecurityBuffer:
         update: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        item = copy.deepcopy(update)
+        item = copy.deepcopy(
+            update
+        )
 
-        item["route"] = "QUARANTINE"
+        item["route"] = (
+            "QUARANTINE"
+        )
 
         item["validation_required"] = True
 
         item["weight_factor"] = 0.3
 
         item["buffer_age"] = int(
-            item.get("buffer_age", 0)
+            item.get(
+                "buffer_age",
+                0
+            )
         )
 
         return item
@@ -890,23 +1032,25 @@ class SecurityBuffer:
         self,
         incoming_updates: List[Dict[str, Any]],
         global_model: nn.Module = None,
+        val_loader=None,
+        criterion=None,
+        global_mse=None,
+        device=None,
     ) -> List[Dict[str, Any]]:
+        """
+        Process ONLY new updates arriving in the current round.
+
+        The extra arguments are accepted for compatibility with
+        main.py but are intentionally NOT used here.
+
+        Delayed/buffered updates are handled separately by main.py.
+        """
 
         if global_model is not None:
+
             self.set_global_model(
                 global_model
             )
-
-        # --------------------------------------------------------
-        # IMPORTANT
-        #
-        # ready_updates = ONLY updates that may participate in
-        # CURRENT round aggregation.
-        #
-        # Existing buffered updates are NEVER placed here.
-        # They are carried forward and returned separately through
-        # the buffer state.
-        # --------------------------------------------------------
 
         ready_updates: List[
             Dict[str, Any]
@@ -917,241 +1061,6 @@ class SecurityBuffer:
         ] = []
 
         # ========================================================
-        # STEP 1
-        # RECHECK EXISTING BUFFERED UPDATES
-        # ========================================================
-
-        if self.buffer:
-
-            logger.info(
-                "[SecurityBuffer] "
-                "Rechecking %d buffered update(s) "
-                "for this round.",
-                len(self.buffer),
-            )
-
-        for buffered_item in self.buffer:
-
-            item = copy.deepcopy(
-                buffered_item
-            )
-
-            client_id = str(
-                item.get(
-                    "client_id",
-                    "unknown",
-                )
-            )
-
-            # Increase age because one round has passed.
-            item["buffer_age"] = (
-                int(
-                    item.get(
-                        "buffer_age",
-                        0,
-                    )
-                )
-                + 1
-            )
-
-            # ----------------------------------------------------
-            # Safety
-            # ----------------------------------------------------
-
-            if not self._is_update_finite(item):
-
-                logger.warning(
-                    "[SecurityBuffer] "
-                    "Client-%s buffered update "
-                    "contains NaN/Inf -> DROP",
-                    client_id,
-                )
-
-                continue
-
-            # ----------------------------------------------------
-            # Expiration
-            # ----------------------------------------------------
-
-            if (
-                item["buffer_age"]
-                > self.window_size
-            ):
-
-                logger.warning(
-                    "[SecurityBuffer] "
-                    "Client-%s buffered update "
-                    "expired after %d rounds -> DROP",
-                    client_id,
-                    item["buffer_age"],
-                )
-
-                continue
-
-            # ----------------------------------------------------
-            # Re-evaluate behavior
-            # ----------------------------------------------------
-
-            diagnostics = (
-                self.evaluate_update_behavior(
-                    item
-                )
-            )
-
-            item[
-                "security_diagnostics"
-            ] = diagnostics
-
-            decision = diagnostics[
-                "decision"
-            ]
-
-            failed_conditions = (
-                diagnostics[
-                    "failed_conditions"
-                ]
-            )
-
-            # ====================================================
-            # CLEAN + FAST
-            # ====================================================
-
-            if (
-                decision == "DIRECT"
-                and failed_conditions == 0
-            ):
-
-                # IMPORTANT:
-                # This is now a NEXT-ROUND release.
-                #
-                # It is NOT an original current-round arrival.
-                # Therefore it receives the secondary factor.
-                #
-                # A buffered update must never suddenly become
-                # weight_factor=1.0 just because it became clean.
-                #
-                # Determine its original route.
-                original_route = item.get(
-                    "route",
-                    "SECONDARY_CHECK",
-                )
-
-                if original_route == "QUARANTINE":
-
-                    item["route"] = (
-                        "QUARANTINE_RELEASED"
-                    )
-
-                    item["weight_factor"] = 0.3
-
-                    logger.info(
-                        "[SecurityBuffer] "
-                        "Client-%s QUARANTINE "
-                        "VERIFIED -> RELEASED "
-                        "for NEXT round "
-                        "(factor=0.3)",
-                        client_id,
-                    )
-
-                else:
-
-                    item["route"] = (
-                        "SECONDARY_RELEASED"
-                    )
-
-                    item["weight_factor"] = 0.7
-
-                    logger.info(
-                        "[SecurityBuffer] "
-                        "Client-%s SECONDARY "
-                        "VERIFIED -> RELEASED "
-                        "for NEXT round "
-                        "(factor=0.7)",
-                        client_id,
-                    )
-
-                item[
-                    "validation_required"
-                ] = False
-
-                item[
-                    "release_round_pending"
-                ] = True
-
-                # ------------------------------------------------
-                # IMPORTANT:
-                #
-                # DO NOT append to ready_updates here.
-                #
-                # It belongs to the next aggregation round.
-                # We keep it in next_buffer with a release flag.
-                # ------------------------------------------------
-
-                next_buffer.append(item)
-
-                continue
-
-            # ====================================================
-            # STILL SECONDARY
-            # ====================================================
-
-            if decision == "SECONDARY_CHECK":
-
-                item["route"] = (
-                    "SECONDARY_CHECK"
-                )
-
-                item["weight_factor"] = 0.7
-
-                item[
-                    "validation_required"
-                ] = True
-
-                next_buffer.append(item)
-
-                logger.info(
-                    "[SecurityBuffer] "
-                    "Client-%s remains in "
-                    "SECONDARY buffer "
-                    "(failures=%d/4, age=%d)",
-                    client_id,
-                    failed_conditions,
-                    item["buffer_age"],
-                )
-
-                continue
-
-            # ====================================================
-            # QUARANTINE
-            # ====================================================
-
-            if decision == "QUARANTINE":
-
-                item["route"] = (
-                    "QUARANTINE"
-                )
-
-                item["weight_factor"] = 0.3
-
-                item[
-                    "validation_required"
-                ] = True
-
-                next_buffer.append(item)
-
-                logger.warning(
-                    "[SecurityBuffer] "
-                    "Client-%s remains QUARANTINED "
-                    "(failures=%d/4, age=%d)",
-                    client_id,
-                    failed_conditions,
-                    item["buffer_age"],
-                )
-
-                continue
-
-        # ========================================================
-        # STEP 2
         # PROCESS NEW CURRENT-ROUND UPDATES
         # ========================================================
 
@@ -1160,7 +1069,7 @@ class SecurityBuffer:
             client_id = str(
                 update.get(
                     "client_id",
-                    "unknown",
+                    "unknown"
                 )
             )
 
@@ -1168,7 +1077,9 @@ class SecurityBuffer:
             # Safety first
             # ----------------------------------------------------
 
-            if not self._is_update_finite(update):
+            if not self._is_update_finite(
+                update
+            ):
 
                 logger.warning(
                     "[SecurityBuffer] "
@@ -1180,7 +1091,8 @@ class SecurityBuffer:
                 continue
 
             # ----------------------------------------------------
-            # Evaluate four security conditions + latency
+            # Evaluate four security conditions
+            # + latency classification
             # ----------------------------------------------------
 
             diagnostics = (
@@ -1189,8 +1101,8 @@ class SecurityBuffer:
                 )
             )
 
-            update_item = copy.deepcopy(
-                update
+            update_item = (
+                copy.deepcopy(update)
             )
 
             update_item[
@@ -1203,9 +1115,11 @@ class SecurityBuffer:
                 ]
             )
 
-            latency_fail = diagnostics[
-                "Latency_Fail"
-            ]
+            latency_fail = (
+                diagnostics[
+                    "Latency_Fail"
+                ]
+            )
 
             # ====================================================
             # CASE 1
@@ -1324,9 +1238,9 @@ class SecurityBuffer:
             # 0 SECURITY FAILURES + FAST
             # ====================================================
 
-            update_item["route"] = (
-                "DIRECT"
-            )
+            update_item[
+                "route"
+            ] = "DIRECT"
 
             update_item[
                 "validation_required"
@@ -1340,14 +1254,14 @@ class SecurityBuffer:
                 "buffer_age"
             ] = 0
 
-            # This is the ONLY type that enters
-            # current-round ready_updates.
+            # ONLY FAST + CLEAN updates
+            # enter current-round aggregation.
             ready_updates.append(
                 update_item
             )
 
-            # Remember direct update for future
-            # behavioral history.
+            # Remember clean direct update
+            # for future client history.
             self._remember_update(
                 update_item
             )
@@ -1368,7 +1282,7 @@ class SecurityBuffer:
             )
 
         # ========================================================
-        # SAVE BUFFER
+        # SAVE ONLY DELAYED UPDATES
         # ========================================================
 
         self.buffer = next_buffer
@@ -1381,7 +1295,7 @@ class SecurityBuffer:
             str(
                 item.get(
                     "client_id",
-                    "unknown",
+                    "unknown"
                 )
             )
             for item in ready_updates
@@ -1391,7 +1305,7 @@ class SecurityBuffer:
             str(
                 item.get(
                     "client_id",
-                    "unknown",
+                    "unknown"
                 )
             )
             for item in self.buffer
@@ -1417,10 +1331,8 @@ class SecurityBuffer:
             len(self.buffer),
         )
 
-        # --------------------------------------------------------
-        # ONLY CURRENT-ROUND DIRECT UPDATES RETURNED.
-        # --------------------------------------------------------
-
+        # ONLY current-round DIRECT updates
+        # are returned.
         return ready_updates
 
     # ============================================================
