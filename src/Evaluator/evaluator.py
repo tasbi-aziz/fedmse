@@ -1,6 +1,11 @@
 """
-Model Evaluator module for Autoencoder and Hybrid (Centroid-based) anomaly detection models.
-Provides single and joint side-by-side performance evaluation.
+Model Evaluator module for Autoencoder and Hybrid
+(Centroid-based) anomaly detection models.
+
+Supports:
+1. Global combined evaluation
+2. Client-wise evaluation
+3. VAE reconstruction-MSE based anomaly detection
 """
 
 import logging
@@ -9,9 +14,11 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from sklearn.metrics import roc_curve, auc, f1_score, precision_score, recall_score
+
 from Model.Centroid import CentroidBasedOneClassClassifier
 
-# Configure the logging module
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -27,13 +34,6 @@ class Evaluator(object):
         metric="AUC",
         device=None
     ) -> None:
-
-        """
-        :param model: Trained PyTorch model (Autoencoder or similar)
-        :param model_type: "autoencoder", "hybrid", or "both" for direct comparison
-        :param metric: "AUC", "classification", or "time"
-        :param device: torch.device instance
-        """
 
         self.device = (
             device
@@ -55,45 +55,15 @@ class Evaluator(object):
 
     def _extract_features_and_output(self, batch_data):
 
-        """
-        Safely extracts latent representation and reconstructed
-        output from the model.
-
-        VAE returns:
-
-            (output, mu, logvar)
-
-        Therefore:
-
-            output = model_out[0]  -> reconstruction X_hat
-            latent = model_out[1]  -> mu
-
-        The previous implementation assumed:
-
-            (latent, reconstruction)
-
-        which was incorrect for the current VAE.
-        """
-
         model_out = self.model(batch_data)
 
-        # --------------------------------------------------------
-        # VAE / Autoencoder returning tuple
-        #
         # Current VAE:
-        #
-        #     (output, mu, logvar)
-        #
-        # --------------------------------------------------------
+        # (output, mu, logvar)
 
         if isinstance(model_out, (tuple, list)):
 
-            # First element is the reconstructed output
             output = model_out[0]
 
-            # Second element is mu
-            # which is used as the deterministic latent
-            # representation for Hybrid evaluation.
             if len(model_out) > 1:
                 latent = model_out[1]
             else:
@@ -101,34 +71,18 @@ class Evaluator(object):
 
         else:
 
-            # Standard model returning only reconstruction
             output = model_out
-
-            # ----------------------------------------------------
-            # If model has encode(), extract latent representation
-            # ----------------------------------------------------
 
             if hasattr(self.model, "encode"):
 
-                encoded = self.model.encode(
-                    batch_data
-                )
+                encoded = self.model.encode(batch_data)
 
-                # VAE encode() returns:
-                #
-                #     (mu, logvar)
-                #
-                # Use mu as latent representation.
-                if isinstance(
-                    encoded,
-                    (tuple, list)
-                ):
+                if isinstance(encoded, (tuple, list)):
                     latent = encoded[0]
                 else:
                     latent = encoded
 
             else:
-
                 latent = output
 
         return latent, output
@@ -220,41 +174,16 @@ class Evaluator(object):
 
     def _eval_autoencoder(self, test_loader):
 
-        """
-        Evaluates model using pure Reconstruction Error (MSE).
-
-        For the current VAE:
-
-            X
-            ↓
-          Encoder
-            ↓
-        mu, logvar
-            ↓
-       reparameterization
-            ↓
-            z
-            ↓
-         Decoder
-            ↓
-           X_hat
-
-        Anomaly score:
-
-            MSE(X, X_hat)
-
-        IMPORTANT:
-        The VAE's mu is NOT used as the reconstruction.
-        """
-
         anomaly_scores = []
         test_labels = []
+
+        self.model.eval()
 
         with torch.no_grad():
 
             for batch_input in tqdm(
                 test_loader,
-                desc='Evaluating Autoencoder...'
+                desc="Evaluating Autoencoder..."
             ):
 
                 batch_data = (
@@ -262,24 +191,13 @@ class Evaluator(object):
                     .to(self.device)
                 )
 
-                # ------------------------------------------------
-                # Extract:
-                #
-                # latent = mu
-                # output = reconstruction X_hat
-                # ------------------------------------------------
-
                 _, output = (
                     self._extract_features_and_output(
                         batch_data
                     )
                 )
 
-                # ------------------------------------------------
-                # Reconstruction MSE per sample
-                #
-                # MSE(X, X_hat)
-                # ------------------------------------------------
+                # Per-sample reconstruction MSE
 
                 recon_loss = torch.mean(
                     torch.nn.MSELoss(
@@ -299,9 +217,9 @@ class Evaluator(object):
                     batch_input[1]
                 )
 
-        # ========================================================
-        # Combine all batches
-        # ========================================================
+        # --------------------------------------------------------
+        # Combine batches
+        # --------------------------------------------------------
 
         anomaly_scores = torch.cat(
             anomaly_scores,
@@ -313,20 +231,14 @@ class Evaluator(object):
             dim=0
         ).cpu().numpy()
 
-        # ========================================================
-        # Calculate AUC
-        # ========================================================
+        # --------------------------------------------------------
+        # Metrics
+        # --------------------------------------------------------
 
         auc_val = self.calculate_auc(
             test_labels,
             anomaly_scores
         )
-
-        # ========================================================
-        # Calculate F1 / Precision / Recall
-        #
-        # Existing threshold = 0.5
-        # ========================================================
 
         (
             f1_val,
@@ -347,6 +259,140 @@ class Evaluator(object):
         }
 
     # ============================================================
+    # CLIENT-WISE VAE EVALUATION
+    # ============================================================
+
+    def evaluate_client(
+        self,
+        client_id,
+        test_loader
+    ):
+
+        """
+        Evaluate the CURRENT GLOBAL MODEL on ONE client's
+        test dataset.
+
+        Each client's test_loader should contain:
+
+            test_normal.csv  -> label 0
+            abnormal.csv     -> label 1
+
+        The model used here is the current global model.
+        """
+
+        self.model.eval()
+
+        result = self._eval_autoencoder(
+            test_loader
+        )
+
+        logging.info(
+            f"[Client Evaluation] "
+            f"{client_id} | "
+            f"AUC: {result['auc']:.4f} | "
+            f"F1: {result['f1']:.4f} | "
+            f"Precision: {result['precision']:.4f} | "
+            f"Recall: {result['recall']:.4f}"
+        )
+
+        return result
+
+    # ============================================================
+    # ALL CLIENTS EVALUATION
+    # ============================================================
+
+    def evaluate_all_clients(
+        self,
+        client_test_loaders
+    ):
+
+        """
+        Evaluate the CURRENT GLOBAL MODEL on every client.
+
+        client_test_loaders can be:
+
+            {
+                "Client-1": loader1,
+                "Client-2": loader2,
+                ...
+            }
+
+        Returns one result per client.
+        """
+
+        client_results = {}
+
+        self.model.eval()
+
+        logging.info(
+            "=" * 70
+        )
+
+        logging.info(
+            "CLIENT-WISE GLOBAL MODEL EVALUATION"
+        )
+
+        logging.info(
+            "=" * 70
+        )
+
+        for client_id, test_loader in client_test_loaders.items():
+
+            result = self.evaluate_client(
+                client_id,
+                test_loader
+            )
+
+            client_results[client_id] = result
+
+        # --------------------------------------------------------
+        # Client AUC summary
+        # --------------------------------------------------------
+
+        logging.info(
+            "-" * 70
+        )
+
+        for client_id, result in client_results.items():
+
+            logging.info(
+                f"{client_id} | "
+                f"AUC: {result['auc']:.4f}"
+            )
+
+        # --------------------------------------------------------
+        # Mean client AUC
+        # --------------------------------------------------------
+
+        auc_values = [
+            result["auc"]
+            for result in client_results.values()
+        ]
+
+        if len(auc_values) > 0:
+
+            mean_auc = float(
+                np.mean(auc_values)
+            )
+
+            logging.info(
+                f"Mean Client AUC: {mean_auc:.4f}"
+            )
+
+        else:
+
+            mean_auc = 0.0
+
+        logging.info(
+            "=" * 70
+        )
+
+        return {
+            "clients": client_results,
+            "mean_auc": mean_auc
+        }
+
+    # ============================================================
     # HYBRID EVALUATION
     # ============================================================
 
@@ -356,42 +402,34 @@ class Evaluator(object):
         test_loader
     ):
 
-        """
-        Evaluates model using Latent Representation
-        + Centroid Classifier.
-        """
-
         if train_loader is None:
 
             raise ValueError(
-                "🚨 Error: 'train_loader' is required "
-                "for Hybrid evaluation to fit Centroid classifier."
+                "'train_loader' is required "
+                "for Hybrid evaluation."
             )
 
         train_latents = []
         test_latents = []
         test_labels = []
 
+        self.model.eval()
+
         with torch.no_grad():
 
-            # ====================================================
-            # 1. Extract Train Latent Space
-            # ====================================================
+            # ----------------------------------------------------
+            # Train latent space
+            # ----------------------------------------------------
 
             for batch_input in tqdm(
                 train_loader,
-                desc='Extracting Train Latents...'
+                desc="Extracting Train Latents..."
             ):
 
                 batch_data = (
                     batch_input[0]
                     .to(self.device)
                 )
-
-                # For VAE:
-                #
-                # latent = mu
-                # output = reconstruction
 
                 latent, _ = (
                     self._extract_features_and_output(
@@ -403,23 +441,19 @@ class Evaluator(object):
                     latent
                 )
 
-            # ====================================================
-            # 2. Extract Test Latent Space
-            # ====================================================
+            # ----------------------------------------------------
+            # Test latent space
+            # ----------------------------------------------------
 
             for batch_input in tqdm(
                 test_loader,
-                desc='Extracting Test Latents...'
+                desc="Extracting Test Latents..."
             ):
 
                 batch_data = (
                     batch_input[0]
                     .to(self.device)
                 )
-
-                # For VAE:
-                #
-                # latent = mu
 
                 latent, _ = (
                     self._extract_features_and_output(
@@ -434,10 +468,6 @@ class Evaluator(object):
                 test_labels.append(
                     batch_input[1]
                 )
-
-        # ========================================================
-        # Convert to NumPy
-        # ========================================================
 
         train_latents = torch.cat(
             train_latents,
@@ -454,19 +484,11 @@ class Evaluator(object):
             dim=0
         ).cpu().numpy()
 
-        # ========================================================
-        # Fit Centroid Model
-        # ========================================================
-
         cen = CentroidBasedOneClassClassifier()
 
         cen.fit(
             train_latents
         )
-
-        # ========================================================
-        # Centroid inference
-        # ========================================================
 
         start_time = time.time()
 
@@ -478,10 +500,6 @@ class Evaluator(object):
             time.time()
             - start_time
         )
-
-        # ========================================================
-        # Metrics
-        # ========================================================
 
         auc_val = self.calculate_auc(
             test_labels,
@@ -519,23 +537,13 @@ class Evaluator(object):
         train_loader=None
     ):
 
-        """
-        Main evaluation controller.
-
-        Supports:
-
-            "autoencoder"
-            "hybrid"
-            "both"
-        """
-
         self.model.eval()
 
         results = {}
 
-        # ========================================================
+        # --------------------------------------------------------
         # Autoencoder / VAE
-        # ========================================================
+        # --------------------------------------------------------
 
         if self.model_type in [
             "autoencoder",
@@ -548,9 +556,9 @@ class Evaluator(object):
                 )
             )
 
-        # ========================================================
+        # --------------------------------------------------------
         # Hybrid
-        # ========================================================
+        # --------------------------------------------------------
 
         if self.model_type in [
             "hybrid",
@@ -564,17 +572,17 @@ class Evaluator(object):
                 )
             )
 
-        # ========================================================
-        # Print comparison
-        # ========================================================
+        # --------------------------------------------------------
+        # Comparison
+        # --------------------------------------------------------
 
         self._log_comparison(
             results
         )
 
-        # ========================================================
-        # Return requested metric
-        # ========================================================
+        # --------------------------------------------------------
+        # Return
+        # --------------------------------------------------------
 
         if self.model_type == "autoencoder":
 
@@ -608,10 +616,6 @@ class Evaluator(object):
         self,
         results
     ):
-
-        """
-        Helper to log a neat comparison table in the console.
-        """
 
         logging.info(
             "=" * 65
