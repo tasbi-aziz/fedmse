@@ -63,7 +63,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from malicious_update_experiment import manipulate_update
+from Trainer import manipulate_update
 
 from sklearn.metrics import (
     precision_score,
