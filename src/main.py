@@ -62,6 +62,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+
 from malicious_update_experiment import manipulate_update
 
 from sklearn.metrics import (
@@ -1827,8 +1828,7 @@ if __name__ == "__main__":
 
                     compute_time = (
                         time.time()
-                        -
-                        c_start
+                        - c_start
                     )
 
                     local_train_time = (
@@ -1837,8 +1837,7 @@ if __name__ == "__main__":
 
                     total_arrival_latency = (
                         compute_time
-                        +
-                        client["sim_comm_time"]
+                        + client["sim_comm_time"]
                     )
 
                     raw_weights = copy.deepcopy(
@@ -1846,32 +1845,6 @@ if __name__ == "__main__":
                     )
 
                     update = {
-                        "client_id": client["device"],
-                        "weights": raw_weights,
-                        "arrival_time": total_arrival_latency,
-                        "train_time": local_train_time,
-                        "dataset_size": device_trainer.dataset_size,
-                        "val_mse_list": copy.deepcopy(
-                         device_trainer.val_mse_list
-                         ),
-                        "val_loss": device_trainer.val_loss,
-                        "val_variance": device_trainer.val_loss_variance,
-                        "train_loss": device_trainer.train_loss,
-                        "reconstruction_loss": device_trainer.reconstruction_loss,
-                        "kl_loss": device_trainer.kl_loss
-                         }
-
-# Client-3 = attacker
-                    if client["device"] == "Client-3":
-                      update = manipulate_update(update)
-                    else:
-                       update = manipulate_update(
-                          update,
-                          attack_type="none"
-                       )
-
-                     incoming_updates.append(update)
-
                         "client_id":
                             client["device"],
 
@@ -1906,7 +1879,37 @@ if __name__ == "__main__":
 
                         "kl_loss":
                             device_trainer.kl_loss
-                    })
+                    }
+
+                    # -------------------------------------------------
+                    # Client-3 = attacker
+                    # -------------------------------------------------
+
+                    if client["device"] == "Client-3":
+
+                        update = manipulate_update(
+                            update
+                        )
+
+                        logging.warning(
+                            f"[ATTACK] Client-3 malicious update "
+                            f"generated | "
+                            f"Attack Type: "
+                            f"{update.get('attack_type', 'unknown')} | "
+                            f"Parameter: "
+                            f"{update.get('attack_parameter', 'unknown')}"
+                        )
+
+                    else:
+
+                        update = manipulate_update(
+                            update,
+                            attack_type="none"
+                        )
+
+                    incoming_updates.append(
+                        update
+                    )
 
                     logging.info(
                         f"[Client {client['device']}] "
@@ -2188,6 +2191,7 @@ if __name__ == "__main__":
                 #
                 # They are held in carryover_updates and will ONLY be
                 # aggregated at the START of the NEXT round.
+                #
                 # -----------------------------------------------------
 
                 sec_buffer_tracker.buffer = (
@@ -2381,9 +2385,6 @@ if __name__ == "__main__":
 
                     "mean_client_auc":
                         mean_client_auc,
-
-                    "round_duration":
-                        round_duration,
 
                     # Current round direct
                     "direct_updates":
