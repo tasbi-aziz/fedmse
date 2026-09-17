@@ -41,6 +41,8 @@ Pipeline:
         ↓
     Global evaluation
         ↓
+    Client-wise evaluation using CURRENT GLOBAL MODEL
+        ↓
     Repeat
 """
 
@@ -145,7 +147,6 @@ initial_epochs = 1
 
 # ------------------------------------------------
 # VAE KL weight
-# CHANGED FROM 0.001 TO 0.0001
 # ------------------------------------------------
 
 vae_kl_weight = 0.0001
@@ -157,10 +158,6 @@ vae_kl_weight = 0.0001
 minimum_weight_factor = 0.10
 
 quarantine_weight_factor = 0.05
-
-# If client server-validation MSE becomes more than
-# this multiple of current global validation MSE,
-# treat it as strongly suspicious.
 
 validation_rejection_ratio = 4.0
 
@@ -202,14 +199,9 @@ def extract_reconstructed_output(outputs):
     Extracts reconstruction from model output.
 
     For VAE:
-
         (reconstruction, mu, logvar)
 
     Therefore reconstruction = outputs[0].
-
-    For normal AE / other models:
-
-        reconstruction
     """
 
     if isinstance(
@@ -218,6 +210,7 @@ def extract_reconstructed_output(outputs):
     ):
 
         if len(outputs) == 0:
+
             raise ValueError(
                 "Model returned an empty tuple/list."
             )
@@ -245,6 +238,7 @@ def evaluate_global_mse(
         global_model is None
         or val_loader is None
     ):
+
         return 0.0
 
     global_model.eval()
@@ -279,7 +273,7 @@ def evaluate_global_mse(
             )
 
             loss = criterion(
-                reconstructed, 
+                reconstructed,
                 inputs
             )
 
@@ -376,7 +370,6 @@ def evaluate_anomaly_detection(
     Evaluates anomaly detection performance.
 
     Returns:
-
         Precision
         Recall
         F1
@@ -483,19 +476,11 @@ def evaluate_anomaly_detection(
         int
     )
 
-    # -------------------------------------------------------------
-    # Precision
-    # -------------------------------------------------------------
-
     precision = precision_score(
         y_true,
         y_pred,
         zero_division=0
     )
-
-    # -------------------------------------------------------------
-    # Recall
-    # -------------------------------------------------------------
 
     recall = recall_score(
         y_true,
@@ -503,19 +488,11 @@ def evaluate_anomaly_detection(
         zero_division=0
     )
 
-    # -------------------------------------------------------------
-    # F1
-    # -------------------------------------------------------------
-
     f1 = f1_score(
         y_true,
         y_pred,
         zero_division=0
     )
-
-    # -------------------------------------------------------------
-    # AUC
-    # -------------------------------------------------------------
 
     try:
 
@@ -527,10 +504,6 @@ def evaluate_anomaly_detection(
     except ValueError:
 
         auc = 0.5
-
-    # -------------------------------------------------------------
-    # Confusion Matrix
-    # -------------------------------------------------------------
 
     cm = confusion_matrix(
         y_true,
@@ -579,6 +552,181 @@ def evaluate_anomaly_detection(
 
 
 # ================================================================
+# CLIENT-WISE GLOBAL MODEL EVALUATION
+# ================================================================
+
+def evaluate_clientwise_auc(
+    global_model,
+    client_info,
+    device="cpu"
+):
+    """
+    Evaluates the CURRENT GLOBAL MODEL separately on every
+    client's own test dataset.
+
+    IMPORTANT:
+
+    The model being evaluated is the GLOBAL MODEL after
+    the current round's FedOpt aggregation.
+
+    Each client uses:
+
+        test_normal.csv
+              +
+        abnormal.csv
+
+    Therefore each client gets its own AUC.
+
+    Returns:
+
+        {
+            "Client-1": {
+                "auc": ...,
+                "precision": ...,
+                "recall": ...,
+                "f1": ...
+            },
+            ...
+        }
+    """
+
+    client_results = {}
+
+    logging.info(
+        "===================================================="
+    )
+
+    logging.info(
+        "[Client-wise Evaluation] "
+        "Evaluating CURRENT GLOBAL MODEL on each client"
+    )
+
+    logging.info(
+        "===================================================="
+    )
+
+    # -------------------------------------------------------------
+    # Freeze current global weights
+    # -------------------------------------------------------------
+
+    global_state = copy.deepcopy(
+        global_model.state_dict()
+    )
+
+    # -------------------------------------------------------------
+    # Evaluate each client's own test dataset
+    # -------------------------------------------------------------
+
+    for client in client_info:
+
+        client_id = client["device"]
+
+        test_loader = client["test_loader"]
+
+        # ---------------------------------------------------------
+        # Create a copy of the GLOBAL MODEL.
+        #
+        # This represents sending the current global weights
+        # to this client for evaluation.
+        # ---------------------------------------------------------
+
+        client_eval_model = copy.deepcopy(
+            global_model
+        ).to(device)
+
+        client_eval_model.load_state_dict(
+            global_state
+        )
+
+        client_eval_model.eval()
+
+        # ---------------------------------------------------------
+        # Evaluate
+        # ---------------------------------------------------------
+
+        metrics = evaluate_anomaly_detection(
+            client_eval_model,
+            test_loader,
+            device=device
+        )
+
+        client_results[
+            client_id
+        ] = {
+
+            "auc":
+                float(
+                    metrics["auc_roc"]
+                ),
+
+            "precision":
+                float(
+                    metrics["precision"]
+                ),
+
+            "recall":
+                float(
+                    metrics["recall"]
+                ),
+
+            "f1":
+                float(
+                    metrics["f1_score"]
+                )
+        }
+
+        logging.info(
+            f"[Client-wise AUC] "
+            f"{client_id} | "
+            f"AUC: {metrics['auc_roc']:.4f} | "
+            f"F1: {metrics['f1_score']:.4f} | "
+            f"Precision: {metrics['precision']:.4f} | "
+            f"Recall: {metrics['recall']:.4f}"
+        )
+
+        # ---------------------------------------------------------
+        # Release temporary evaluation model
+        # ---------------------------------------------------------
+
+        del client_eval_model
+
+        if torch.cuda.is_available():
+
+            torch.cuda.empty_cache()
+
+    # -------------------------------------------------------------
+    # Mean client AUC
+    # -------------------------------------------------------------
+
+    client_auc_values = [
+        result["auc"]
+        for result in client_results.values()
+    ]
+
+    mean_client_auc = (
+        float(
+            np.mean(
+                client_auc_values
+            )
+        )
+        if client_auc_values
+        else 0.0
+    )
+
+    logging.info(
+        f"[Client-wise Evaluation] "
+        f"Mean Client AUC: "
+        f"{mean_client_auc:.4f}"
+    )
+
+    logging.info(
+        "===================================================="
+    )
+
+    return client_results
+
+
+# ================================================================
 # SERVER VALIDATION OF SECONDARY UPDATE
 # ================================================================
 
@@ -592,23 +740,6 @@ def validate_secondary_update(
     """
     Runs a suspicious / delayed client model on the
     server validation dataset.
-
-    The server validation dataset contains normal samples,
-    therefore reconstruction MSE is used as the performance
-    measure.
-
-    Weight factor:
-
-        ratio = global_MSE / client_MSE
-
-        factor = sqrt(ratio)
-
-    clipped to:
-
-        minimum_weight_factor <= factor <= 1.0
-
-    Strongly poor updates are assigned the quarantine
-    weight factor.
     """
 
     if (
@@ -623,10 +754,6 @@ def validate_secondary_update(
             float("inf"),
             "QUARANTINE"
         )
-
-    # -------------------------------------------------------------
-    # Temporary copy of current global model
-    # -------------------------------------------------------------
 
     candidate_model = copy.deepcopy(
         global_model
@@ -660,10 +787,6 @@ def validate_secondary_update(
     total_loss = 0.0
 
     total_samples = 0
-
-    # -------------------------------------------------------------
-    # Server validation
-    # -------------------------------------------------------------
 
     with torch.no_grad():
 
@@ -712,10 +835,6 @@ def validate_secondary_update(
         )
     )
 
-    # -------------------------------------------------------------
-    # Numerical safety
-    # -------------------------------------------------------------
-
     if not math.isfinite(
         candidate_mse
     ):
@@ -725,10 +844,6 @@ def validate_secondary_update(
             candidate_mse,
             "QUARANTINE"
         )
-
-    # -------------------------------------------------------------
-    # If global MSE itself is invalid
-    # -------------------------------------------------------------
 
     if (
         not math.isfinite(
@@ -743,10 +858,6 @@ def validate_secondary_update(
             "SECONDARY_ACCEPTED"
         )
 
-    # -------------------------------------------------------------
-    # Relative performance
-    # -------------------------------------------------------------
-
     performance_ratio = (
         current_global_mse
         /
@@ -756,10 +867,6 @@ def validate_secondary_update(
             1e-8
         )
     )
-
-    # -------------------------------------------------------------
-    # Strongly poor candidate
-    # -------------------------------------------------------------
 
     if (
         candidate_mse
@@ -774,16 +881,6 @@ def validate_secondary_update(
             candidate_mse,
             "QUARANTINE"
         )
-
-    # -------------------------------------------------------------
-    # Adaptive weight
-    #
-    # Better/equal than global:
-    # factor approaches 1.0
-    #
-    # Worse than global:
-    # factor decreases.
-    # -------------------------------------------------------------
 
     performance_ratio = max(
         performance_ratio,
@@ -822,13 +919,17 @@ if __name__ == "__main__":
         )
     )
 
+    # -------------------------------------------------------------
+    # IMPORTANT:
+    # 1.5 sec = FAST/SLOW classification threshold
+    # -------------------------------------------------------------
+
     parser.add_argument(
         "--latency_threshold",
         type=float,
-        default=10.0,
+        default=1.5,
         help=(
-            "Maximum arrival latency for "
-            "direct processing"
+            "FAST/SLOW arrival latency threshold in seconds"
         )
     )
 
@@ -928,10 +1029,6 @@ if __name__ == "__main__":
 
     for dev in devices_list:
 
-        # ---------------------------------------------------------
-        # Normal path
-        # ---------------------------------------------------------
-
         normal_data_path = os.path.join(
             config["data_path"],
             dev["normal_data_path"]
@@ -951,13 +1048,7 @@ if __name__ == "__main__":
         )
 
         # ---------------------------------------------------------
-        # Abnormal path
-        #
-        # Preferred:
-        #     dev["abnormal_data_path"]
-        #
-        # Fallback:
-        #     normal -> abnormal
+        # Abnormal data
         # ---------------------------------------------------------
 
         if dev.get(
@@ -1003,12 +1094,8 @@ if __name__ == "__main__":
 
             abnormal_data = None
 
-               # ---------------------------------------------------------
+        # ---------------------------------------------------------
         # Split normal data
-        #
-        # 40% train
-        # 10% validation
-        # test-normal comes from separate test_normal.csv
         # ---------------------------------------------------------
 
         train_normal_size = int(
@@ -1045,7 +1132,7 @@ if __name__ == "__main__":
         )
 
         # ---------------------------------------------------------
-        # Load dedicated test_normal.csv
+        # Dedicated test_normal.csv
         # ---------------------------------------------------------
 
         test_normal_data_path = os.path.join(
@@ -1068,9 +1155,6 @@ if __name__ == "__main__":
 
         # ---------------------------------------------------------
         # Bootstrap subset
-        #
-        # A small portion of every client's normal training
-        # dataset goes to the initial server dataset.
         # ---------------------------------------------------------
 
         bootstrap_size = max(
@@ -1103,10 +1187,6 @@ if __name__ == "__main__":
                 drop=True
             )
         )
-
-        # ---------------------------------------------------------
-        # If remaining local data becomes empty
-        # ---------------------------------------------------------
 
         if len(local_train_data) == 0:
 
@@ -1177,22 +1257,6 @@ if __name__ == "__main__":
     # COMMON PREPROCESSING
     # =============================================================
 
-    # IMPORTANT:
-    #
-    # One common processor is fitted once on the server
-    # bootstrap dataset.
-    #
-    # This guarantees every client uses exactly the same:
-    #
-    #   Log transformation
-    #   Feature selection
-    #   Feature ordering
-    #   Scaling
-    #
-    # Therefore the same model input dimensions have
-    # the same feature meanings across all clients.
-    # =============================================================
-
     data_processor = IoTDataProcessor(
         scaler="standard",
         use_log_transform=True,
@@ -1217,10 +1281,6 @@ if __name__ == "__main__":
         f"{actual_dim_features}"
     )
 
-    # -------------------------------------------------------------
-    # Selected original feature indices
-    # -------------------------------------------------------------
-
     selected_feature_indices = (
         data_processor.get_selected_features()
     )
@@ -1234,16 +1294,12 @@ if __name__ == "__main__":
 
     # =============================================================
     # STEP 4:
-    # PROCESS EVERY CLIENT USING THE SAME PROCESSOR
+    # PROCESS EVERY CLIENT
     # =============================================================
 
     client_info = []
 
     for client in raw_client_data:
-
-        # ---------------------------------------------------------
-        # Local train
-        # ---------------------------------------------------------
 
         processed_train_data, train_label = (
             data_processor.transform(
@@ -1252,10 +1308,6 @@ if __name__ == "__main__":
             )
         )
 
-        # ---------------------------------------------------------
-        # Local validation
-        # ---------------------------------------------------------
-
         processed_valid_data, valid_label = (
             data_processor.transform(
                 client["valid_data"],
@@ -1263,20 +1315,12 @@ if __name__ == "__main__":
             )
         )
 
-        # ---------------------------------------------------------
-        # Normal test
-        # ---------------------------------------------------------
-
         processed_test_normal, test_normal_label = (
             data_processor.transform(
                 client["test_normal_data"],
                 type="normal"
             )
         )
-
-        # ---------------------------------------------------------
-        # Abnormal test
-        # ---------------------------------------------------------
 
         if (
             client["abnormal_data"]
@@ -1315,7 +1359,7 @@ if __name__ == "__main__":
             )
 
         # ---------------------------------------------------------
-        # PyTorch datasets
+        # Datasets
         # ---------------------------------------------------------
 
         train_dataset = IoTDataset(
@@ -1438,9 +1482,6 @@ if __name__ == "__main__":
 
     # =============================================================
     # MODEL TYPES
-    #
-    # "autoencoder" now refers to the updated VAE class
-    # for backward compatibility with the existing codebase.
     # =============================================================
 
     model_types = [
@@ -1507,12 +1548,6 @@ if __name__ == "__main__":
 
             else:
 
-                # -------------------------------------------------
-                # Updated Autoencoder class = VAE
-                #
-                # X -> 32 -> 16 -> 32 -> X
-                # -------------------------------------------------
-
                 global_model = (
                     Autoencoder(
                         input_dim=actual_dim_features,
@@ -1569,10 +1604,6 @@ if __name__ == "__main__":
                 server_val_loader
             )
 
-            # -----------------------------------------------------
-            # Transfer trained initial parameters to global model
-            # -----------------------------------------------------
-
             global_model.load_state_dict(
                 initial_trainer.get_parameters()
             )
@@ -1607,9 +1638,6 @@ if __name__ == "__main__":
 
             # =====================================================
             # PREVIOUS SECONDARY UPDATES
-            #
-            # These are validated delayed/suspicious updates
-            # that will be incorporated in the next round.
             # =====================================================
 
             carryover_updates = []
@@ -1619,6 +1647,12 @@ if __name__ == "__main__":
             # =====================================================
 
             run_round_history = []
+
+            # =====================================================
+            # CLIENT-WISE AUC HISTORY
+            # =====================================================
+
+            client_auc_history = []
 
             # =====================================================
             # TRAINING ROUNDS
@@ -1676,10 +1710,6 @@ if __name__ == "__main__":
                         kl_weight=vae_kl_weight
                     )
 
-                    # -------------------------------------------------
-                    # Local training + 5-fold validation
-                    # -------------------------------------------------
-
                     device_trainer.run(
                         client["train_loader"],
                         client["valid_loader"]
@@ -1691,19 +1721,9 @@ if __name__ == "__main__":
                         c_start
                     )
 
-                    # -------------------------------------------------
-                    # Measured local training time
-                    #
-                    # Prefer trainer's internally measured time.
-                    # -------------------------------------------------
-
                     local_train_time = (
                         device_trainer.train_time
                     )
-
-                    # -------------------------------------------------
-                    # Simulated communication delay
-                    # -------------------------------------------------
 
                     total_arrival_latency = (
                         compute_time
@@ -1711,17 +1731,9 @@ if __name__ == "__main__":
                         client["sim_comm_time"]
                     )
 
-                    # -------------------------------------------------
-                    # Copy local weights
-                    # -------------------------------------------------
-
                     raw_weights = copy.deepcopy(
                         device_trainer.get_parameters()
                     )
-
-                    # =================================================
-                    # CLIENT PAYLOAD
-                    # =================================================
 
                     incoming_updates.append({
 
@@ -1731,37 +1743,29 @@ if __name__ == "__main__":
                         "weights":
                             raw_weights,
 
-                        # 10-second routing latency
                         "arrival_time":
                             total_arrival_latency,
 
-                        # Actual local computation time
                         "train_time":
                             local_train_time,
 
-                        # Local dataset size
                         "dataset_size":
                             device_trainer.dataset_size,
 
-                        # 5-fold MSE behavioral signature
                         "val_mse_list":
                             copy.deepcopy(
                                 device_trainer.val_mse_list
                             ),
 
-                        # Average validation reconstruction MSE
                         "val_loss":
                             device_trainer.val_loss,
 
-                        # Variance among 5 MSE values
                         "val_variance":
                             device_trainer.val_loss_variance,
 
-                        # Training reconstruction loss
                         "train_loss":
                             device_trainer.train_loss,
 
-                        # Diagnostic VAE values
                         "reconstruction_loss":
                             device_trainer.reconstruction_loss,
 
@@ -1798,7 +1802,7 @@ if __name__ == "__main__":
                 )
 
                 # -------------------------------------------------
-                # Direct updates receive full weight factor
+                # Direct updates
                 # -------------------------------------------------
 
                 for update in ready_updates:
@@ -1811,11 +1815,6 @@ if __name__ == "__main__":
 
                 # =================================================
                 # SECONDARY / BUFFERED UPDATES
-                #
-                # Run server-side validation.
-                #
-                # Accepted secondary updates are placed into
-                # carryover_updates for the NEXT round.
                 # =================================================
 
                 secondary_updates_for_next_round = []
@@ -1830,10 +1829,6 @@ if __name__ == "__main__":
                         "client_id",
                         "unknown"
                     )
-
-                    # -------------------------------------------------
-                    # Only validate secondary candidates
-                    # -------------------------------------------------
 
                     if buffered_update.get(
                         "validation_required",
@@ -1864,10 +1859,6 @@ if __name__ == "__main__":
                             "aggregation_route"
                         ] = validation_route
 
-                        # -------------------------------------------------
-                        # Secondary accepted
-                        # -------------------------------------------------
-
                         if (
                             validation_route
                             ==
@@ -1888,14 +1879,8 @@ if __name__ == "__main__":
                                 f"Scheduled for next round"
                             )
 
-                        # -------------------------------------------------
-                        # Quarantine
-                        # -------------------------------------------------
-
                         else:
 
-                            # Keep the quarantine update for
-                            # next-round low-weight aggregation.
                             secondary_updates_for_next_round.append(
                                 buffered_update
                             )
@@ -1911,31 +1896,20 @@ if __name__ == "__main__":
 
                     else:
 
-                        # -------------------------------------------------
-                        # Still unresolved in SecurityBuffer
-                        #
-                        # Keep it there for another age/recheck cycle.
-                        # -------------------------------------------------
-
                         remaining_buffer.append(
                             buffered_update
                         )
-
-                # -------------------------------------------------
-                # Replace active security buffer
-                # -------------------------------------------------
 
                 sec_buffer_tracker.buffer = (
                     remaining_buffer
                 )
 
                 # =================================================
-                # CARRYOVER UPDATES FROM PREVIOUS ROUND
+                # CARRYOVER UPDATES
                 # =================================================
 
                 aggregation_updates = []
 
-                # Previous-round validated updates first
                 if carryover_updates:
 
                     for update in carryover_updates:
@@ -1944,14 +1918,9 @@ if __name__ == "__main__":
                             update
                         )
 
-                # Current direct updates
                 aggregation_updates.extend(
                     ready_updates
                 )
-
-                # -------------------------------------------------
-                # Update carryover queue for next round
-                # -------------------------------------------------
 
                 carryover_updates = (
                     secondary_updates_for_next_round
@@ -1984,6 +1953,10 @@ if __name__ == "__main__":
                     round_start_time
                 )
 
+                # -------------------------------------------------
+                # Post aggregation global validation MSE
+                # -------------------------------------------------
+
                 post_eval_mse = (
                     evaluate_global_mse(
                         global_aggregator.model,
@@ -1993,7 +1966,7 @@ if __name__ == "__main__":
                 )
 
                 # -------------------------------------------------
-                # Global anomaly detection metrics
+                # Global combined test evaluation
                 # -------------------------------------------------
 
                 global_metrics = (
@@ -2002,6 +1975,98 @@ if __name__ == "__main__":
                         server_test_loader,
                         device=device
                     )
+                )
+
+                # =================================================
+                # NEW:
+                # CLIENT-WISE GLOBAL MODEL EVALUATION
+                # =================================================
+                #
+                # VERY IMPORTANT:
+                #
+                # This happens AFTER FedOpt aggregation.
+                #
+                # Therefore every client evaluates the SAME
+                # CURRENT GLOBAL MODEL.
+                #
+                # Each client uses:
+                #
+                #     own test_normal.csv
+                #              +
+                #     own abnormal.csv
+                #
+                # Result:
+                #
+                #     Client-1 AUC
+                #     Client-2 AUC
+                #     ...
+                #     Client-10 AUC
+                #
+                # =================================================
+
+                client_wise_metrics = (
+                    evaluate_clientwise_auc(
+                        global_aggregator.model,
+                        client_info,
+                        device=device
+                    )
+                )
+
+                # -------------------------------------------------
+                # Store round client AUCs
+                # -------------------------------------------------
+
+                round_client_auc = {}
+
+                for client_id, metrics in (
+                    client_wise_metrics.items()
+                ):
+
+                    round_client_auc[
+                        client_id
+                    ] = metrics["auc"]
+
+                    client_auc_history.append({
+
+                        "run":
+                            run + 1,
+
+                        "model_type":
+                            model_type,
+
+                        "round":
+                            round_number,
+
+                        "client":
+                            client_id,
+
+                        "auc":
+                            metrics["auc"],
+
+                        "precision":
+                            metrics["precision"],
+
+                        "recall":
+                            metrics["recall"],
+
+                        "f1":
+                            metrics["f1"]
+                    })
+
+                # -------------------------------------------------
+                # Mean client AUC
+                # -------------------------------------------------
+
+                mean_client_auc = (
+                    float(
+                        np.mean(
+                            list(
+                                round_client_auc.values()
+                            )
+                        )
+                    )
+                    if round_client_auc
+                    else 0.0
                 )
 
                 # =================================================
@@ -2028,26 +2093,30 @@ if __name__ == "__main__":
                     "test_auc":
                         global_metrics["auc_roc"],
 
+                    # -------------------------------------------------
+                    # NEW CLIENT-WISE AUC RESULTS
+                    # -------------------------------------------------
+
+                    "client_wise_auc":
+                        round_client_auc,
+
+                    "mean_client_auc":
+                        mean_client_auc,
+
                     "round_duration":
                         round_duration,
 
-                    # Direct updates in current round
                     "direct_updates":
                         len(ready_updates),
 
-                    # Updates aggregated this round,
-                    # including previous-round carryover
                     "aggregated_updates":
                         len(aggregation_updates),
 
-                    # New secondary updates scheduled
-                    # for the next round
                     "secondary_updates":
                         len(
                             secondary_updates_for_next_round
                         ),
 
-                    # Still waiting in security buffer
                     "buffered_updates":
                         len(
                             sec_buffer_tracker.buffer
@@ -2064,8 +2133,9 @@ if __name__ == "__main__":
                 logging.info(
                     f"[Round {round_number} Finished] "
                     f"Val MSE: {post_eval_mse:.6f} | "
-                    f"F1: {global_metrics['f1_score']:.4f} | "
-                    f"AUC: {global_metrics['auc_roc']:.4f} | "
+                    f"Global F1: {global_metrics['f1_score']:.4f} | "
+                    f"Global AUC: {global_metrics['auc_roc']:.4f} | "
+                    f"Mean Client AUC: {mean_client_auc:.4f} | "
                     f"Direct: {len(ready_updates)} | "
                     f"Aggregated: {len(aggregation_updates)} | "
                     f"Secondary: "
@@ -2076,7 +2146,7 @@ if __name__ == "__main__":
                 )
 
             # =====================================================
-            # RUN RESULT
+            # SAVE RUN RESULTS
             # =====================================================
 
             all_experiment_results[
@@ -2084,6 +2154,66 @@ if __name__ == "__main__":
             ].append(
                 run_round_history
             )
+
+            # =====================================================
+            # SAVE CLIENT-WISE AUC CSV FOR THIS RUN
+            # =====================================================
+
+            client_auc_df = pd.DataFrame(
+                client_auc_history
+            )
+
+            client_auc_csv_path = os.path.join(
+                args.output_dir,
+                f"{model_type}_run{run + 1}_client_auc_history.csv"
+            )
+
+            client_auc_df.to_csv(
+                client_auc_csv_path,
+                index=False
+            )
+
+            logging.info(
+                f"Saved client-wise AUC history to: "
+                f"{client_auc_csv_path}"
+            )
+
+            # =====================================================
+            # FINAL ROUND CLIENT-WISE AUC
+            # =====================================================
+
+            if run_round_history:
+
+                final_client_auc = (
+                    run_round_history[-1]
+                    .get(
+                        "client_wise_auc",
+                        {}
+                    )
+                )
+
+                logging.info(
+                    "===================================================="
+                )
+
+                logging.info(
+                    f"[FINAL CLIENT-WISE AUC] "
+                    f"Model: {model_type.upper()} | "
+                    f"Run: {run + 1}"
+                )
+
+                for client_id, auc_value in (
+                    final_client_auc.items()
+                ):
+
+                    logging.info(
+                        f"{client_id}: "
+                        f"AUC = {auc_value:.4f}"
+                    )
+
+                logging.info(
+                    "===================================================="
+                )
 
             # =====================================================
             # SAVE CHECKPOINT
@@ -2150,6 +2280,27 @@ if __name__ == "__main__":
             if run_data
         ]
 
+        # ---------------------------------------------------------
+        # Final client-wise AUC from every run
+        # ---------------------------------------------------------
+
+        final_client_auc_runs = []
+
+        for run_data in (
+            all_experiment_results[
+                m_type
+            ]
+        ):
+
+            if run_data:
+
+                final_client_auc_runs.append(
+                    run_data[-1].get(
+                        "client_wise_auc",
+                        {}
+                    )
+                )
+
         summary_report[
             m_type
         ] = {
@@ -2206,12 +2357,24 @@ if __name__ == "__main__":
                     )
                 )
                 if final_mse_scores
-                else 0.0
+                else 0.0,
+
+            # -----------------------------------------------------
+            # FINAL CLIENT-WISE AUC
+            # -----------------------------------------------------
+
+            "final_client_wise_auc":
+                final_client_auc_runs
         }
 
     # =============================================================
     # SAVE RESULTS
     # =============================================================
+
+    summary_report_path = os.path.join(
+        args.output_dir,
+        "experiment_execution_results.json"
+    )
 
     output_json_struct = {
 
@@ -2271,16 +2434,37 @@ if __name__ == "__main__":
 
             "validation_rejection_ratio":
                 validation_rejection_ratio
+        },
+
+        # ---------------------------------------------------------
+        # NEW:
+        # Client-wise evaluation description
+        # ---------------------------------------------------------
+
+        "client_wise_evaluation": {
+
+            "evaluation_stage":
+                "After FedOpt aggregation",
+
+            "model_used":
+                "Current global model",
+
+            "test_data":
+                "Each client's test_normal.csv + abnormal.csv",
+
+            "metric":
+                "ROC-AUC",
+
+            "clients_per_round":
+                network_size,
+
+            "rounds":
+                num_rounds
         }
     }
 
-    results_json_path = os.path.join(
-        args.output_dir,
-        "experiment_execution_results.json"
-    )
-
     with open(
-        results_json_path,
+        summary_report_path,
         "w"
     ) as f:
 
@@ -2289,6 +2473,77 @@ if __name__ == "__main__":
             f,
             indent=4
         )
+
+    # =============================================================
+    # FINAL CLIENT AUC CSV
+    # =============================================================
+
+    all_client_auc_df = []
+
+    for m_type in all_experiment_results:
+
+        for run_index, run_data in enumerate(
+            all_experiment_results[
+                m_type
+            ],
+            start=1
+        ):
+
+            for round_data in run_data:
+
+                client_auc_data = (
+                    round_data.get(
+                        "client_wise_auc",
+                        {}
+                    )
+                )
+
+                for client_id, auc_value in (
+                    client_auc_data.items()
+                ):
+
+                    all_client_auc_df.append({
+
+                        "model_type":
+                            m_type,
+
+                        "run":
+                            run_index,
+
+                        "round":
+                            round_data["round"],
+
+                        "client":
+                            client_id,
+
+                        "auc":
+                            auc_value
+                    })
+
+    if all_client_auc_df:
+
+        all_client_auc_df = pd.DataFrame(
+            all_client_auc_df
+        )
+
+        final_client_auc_csv = os.path.join(
+            args.output_dir,
+            "all_client_wise_auc.csv"
+        )
+
+        all_client_auc_df.to_csv(
+            final_client_auc_csv,
+            index=False
+        )
+
+        logging.info(
+            f"All client-wise AUC results saved to: "
+            f"{final_client_auc_csv}"
+        )
+
+    # =============================================================
+    # COMPLETED
+    # =============================================================
 
     logging.info(
         "\n"
@@ -2299,5 +2554,5 @@ if __name__ == "__main__":
 
     logging.info(
         f"Results Summary saved successfully to: "
-        f"{results_json_path}"
+        f"{summary_report_path}"
     )
