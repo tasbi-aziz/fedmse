@@ -64,7 +64,7 @@ import torch
 import torch.nn as nn
 
 from Trainer.malicious_update_experiment2 import (
-     manipulate_update
+    manipulate_update
 )
 
 from sklearn.metrics import (
@@ -157,6 +157,25 @@ initial_epochs = 1
 # ------------------------------------------------
 
 vae_kl_weight = 0.0001
+
+# ------------------------------------------------
+# TIMING ATTACK WARM-UP
+# ------------------------------------------------
+#
+# Client-3 remains CLEAN for the first 2 rounds.
+#
+# Starting from Round 3:
+#     Client-3 -> timing attack
+#
+# This is required because SecurityBuffer uses
+# min_history = 2 before timing behavior can be
+# evaluated against historical clean timing.
+#
+# ------------------------------------------------
+
+TIMING_ATTACK_CLIENT = "Client-3"
+
+TIMING_ATTACK_START_ROUND = 3
 
 # ------------------------------------------------
 # DELAYED UPDATE WEIGHT FACTORS
@@ -1539,8 +1558,7 @@ if __name__ == "__main__":
 
             run_seed = (
                 (run + 1)
-                *
-                10000
+                * 10000
             )
 
             set_seeds(
@@ -1723,13 +1741,6 @@ if __name__ == "__main__":
                 # STEP A:
                 # OLD DELAYED UPDATES
                 # =================================================
-                #
-                # These came from the PREVIOUS round.
-                #
-                # They are the ONLY delayed updates that may be
-                # aggregated in this round.
-                #
-                # =================================================
 
                 aggregation_updates = []
 
@@ -1798,7 +1809,7 @@ if __name__ == "__main__":
                 #
                 # New delayed updates generated during THIS round
                 # will be placed into a NEW carryover list below.
-                #
+
                 carryover_updates = []
 
                 # =================================================
@@ -1884,23 +1895,64 @@ if __name__ == "__main__":
                     }
 
                     # -------------------------------------------------
-                    # Client-3 = attacker
+                    # Client-3 = timing attacker
+                    #
+                    # Round 1:
+                    #     CLEAN
+                    #
+                    # Round 2:
+                    #     CLEAN
+                    #
+                    # Round 3 onward:
+                    #     TIMING ATTACK
+                    #
+                    # This provides the two clean historical timing
+                    # observations required by SecurityBuffer.
                     # -------------------------------------------------
 
-                    if client["device"] == "Client-3":
+                    if (
+                        client["device"]
+                        ==
+                        TIMING_ATTACK_CLIENT
+                    ):
 
-                        update = manipulate_update(
-                            update
-                        )
+                        if (
+                            round_number
+                            >=
+                            TIMING_ATTACK_START_ROUND
+                        ):
 
-                        logging.warning(
-                            f"[ATTACK] Client-3 malicious update "
-                            f"generated | "
-                            f"Attack Type: "
-                            f"{update.get('attack_type', 'unknown')} | "
-                            f"Parameter: "
-                            f"{update.get('attack_parameter', 'unknown')}"
-                        )
+                            update = manipulate_update(
+                                update,
+                                attack_type="timing"
+                            )
+
+                            logging.warning(
+                                f"[ATTACK] "
+                                f"Client-3 malicious update "
+                                f"generated | "
+                                f"Round: "
+                                f"{round_number} | "
+                                f"Attack Type: "
+                                f"{update.get('attack_type', 'unknown')} | "
+                                f"Parameter: "
+                                f"{update.get('attack_parameter', 'unknown')}"
+                            )
+
+                        else:
+
+                            update = manipulate_update(
+                                update,
+                                attack_type="none"
+                            )
+
+                            logging.info(
+                                f"[ATTACK WARM-UP] "
+                                f"Client-3 remains CLEAN | "
+                                f"Round: "
+                                f"{round_number} | "
+                                f"Timing history is being collected."
+                            )
 
                     else:
 
@@ -1953,11 +2005,6 @@ if __name__ == "__main__":
                 # =================================================
                 # STEP D:
                 # CURRENT ROUND DIRECT UPDATES
-                # =================================================
-                #
-                # Only DIRECT updates enter current aggregation
-                # from the newly received client updates.
-                #
                 # =================================================
 
                 direct_current_updates = []
@@ -2015,19 +2062,6 @@ if __name__ == "__main__":
                 # =================================================
                 # STEP E:
                 # VALIDATE CURRENT BUFFERED UPDATES
-                # =================================================
-                #
-                # IMPORTANT:
-                #
-                # These updates are validated NOW,
-                # but NEVER aggregated NOW.
-                #
-                # If accepted:
-                #     carryover_updates
-                #
-                # Next round:
-                #     aggregate with 0.7 or 0.3
-                #
                 # =================================================
 
                 secondary_updates_for_next_round = []
@@ -2115,11 +2149,6 @@ if __name__ == "__main__":
                             "aggregation_round"
                         ] = round_number + 1
 
-                        # -------------------------------------------------
-                        # CRITICAL:
-                        # Do NOT put into current aggregation_updates.
-                        # -------------------------------------------------
-
                         secondary_updates_for_next_round.append(
                             buffered_update
                         )
@@ -2187,13 +2216,7 @@ if __name__ == "__main__":
                         )
 
                 # -----------------------------------------------------
-                # Important:
-                #
                 # Validated updates have now left the SecurityBuffer.
-                #
-                # They are held in carryover_updates and will ONLY be
-                # aggregated at the START of the NEXT round.
-                #
                 # -----------------------------------------------------
 
                 sec_buffer_tracker.buffer = (
@@ -2212,18 +2235,6 @@ if __name__ == "__main__":
                 # =================================================
                 # STEP G:
                 # CURRENT ROUND AGGREGATION
-                # =================================================
-                #
-                # aggregation_updates contains:
-                #
-                #   1. Previous-round validated delayed updates
-                #      -> factor 0.7 / 0.3
-                #
-                #   2. Current-round DIRECT updates
-                #      -> factor 1.0
-                #
-                # It does NOT contain current-round buffered updates.
-                #
                 # =================================================
 
                 aggregation_updates.extend(
@@ -2388,21 +2399,16 @@ if __name__ == "__main__":
                     "mean_client_auc":
                         mean_client_auc,
 
-                    # Current round direct
                     "direct_updates":
                         len(
                             direct_current_updates
                         ),
 
-                    # Total current aggregation:
-                    # previous delayed + current direct
                     "aggregated_updates":
                         len(
                             aggregation_updates
                         ),
 
-                    # Newly accepted delayed updates
-                    # scheduled for NEXT round
                     "secondary_updates":
                         len(
                             secondary_updates_for_next_round
@@ -2762,6 +2768,30 @@ if __name__ == "__main__":
                     "DIRECT updates aggregate in current round; "
                     "validated SECONDARY and QUARANTINE updates "
                     "aggregate only in the next round."
+                )
+        },
+
+        "timing_attack_experiment": {
+
+            "attacker_client":
+                TIMING_ATTACK_CLIENT,
+
+            "attack_type":
+                "timing",
+
+            "attack_start_round":
+                TIMING_ATTACK_START_ROUND,
+
+            "warmup_rounds":
+                TIMING_ATTACK_START_ROUND - 1,
+
+            "attack_parameter":
+                "3x training time",
+
+            "purpose":
+                (
+                    "Allow two clean timing observations before "
+                    "activating the controlled timing manipulation."
                 )
         },
 
