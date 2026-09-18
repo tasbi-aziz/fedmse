@@ -457,7 +457,7 @@ class SecurityBuffer:
                 mean + (3.0 * std)
             )
 
-            return max(
+            return min(
                 float(base_threshold),
                 float(adaptive),
             )
