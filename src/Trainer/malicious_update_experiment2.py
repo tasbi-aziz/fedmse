@@ -35,7 +35,7 @@ import torch
 # Later:
 #     "combined"
 #
-ACTIVE_ATTACK = "timing"
+ACTIVE_ATTACK = "loss"
 
 
 # ================================================================
