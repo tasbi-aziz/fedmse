@@ -35,7 +35,7 @@ import torch
 # Later:
 #     "combined"
 #
-ACTIVE_ATTACK = "magnitude"
+ACTIVE_ATTACK = "timing"
 
 
 # ================================================================
