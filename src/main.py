@@ -60,7 +60,7 @@ from sklearn.metrics import (
 
 from torch.utils.data import DataLoader, ConcatDataset
 
-from DataLoder.dataloader import (
+from DataLoader.dataloader import (
     load_data,
     IoTDataset,
     IoTDataProcessor
