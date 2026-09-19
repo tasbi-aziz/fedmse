@@ -1054,7 +1054,7 @@ def main():
 
                 "features_passed_to_model":
                     actual_dim_features
-            ])
+            })
 
 
             # =================================================
