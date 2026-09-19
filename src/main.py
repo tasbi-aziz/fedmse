@@ -73,8 +73,8 @@ from Trainer.malicious_update_experiment2 import manipulate_update
 
 from Trainer.security_buffer import SecurityBuffer
 
-from Model.shrink_autoencoder import Shrink_Autoencoder
-from Model.autoencoder import AutoEncoder
+from Model.Shrink_Autoencoder import Shrink_Autoencoder
+from Model.AutoEncoder import Autoencoder
 
 
 # ============================================================
