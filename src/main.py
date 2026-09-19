@@ -67,11 +67,11 @@ from DataLoader.dataloader import (
 )
 
 from Trainer.client_trainer import ClientTrainer
-from Trainer.aggregator import GlobalAggregator
+from Trainer.global_aggregator import GlobalAggregator
 
 from Trainer.malicious_update_experiment2 import manipulate_update
 
-from Security.security_buffer import SecurityBuffer
+from Trainer.security_buffer import SecurityBuffer
 
 from Models.shrink_autoencoder import Shrink_Autoencoder
 from Models.autoencoder import Autoencoder
