@@ -10,13 +10,13 @@ Pipeline:
         ↓
     Server-side initial dataset
         ↓
-    Common preprocessing
+    RAW feature input (no preprocessing)
         ↓
-    Log transformation
+    No log transformation
         ↓
-    Unsupervised feature selection
+    No feature selection
         ↓
-    Scaling
+    No scaling
         ↓
     Initial global model training
         ↓
@@ -1295,90 +1295,114 @@ if __name__ == "__main__":
 
     # =============================================================
     # STEP 3:
-    # COMMON PREPROCESSING
+    # RAW-DATA EXPERIMENT -- NO PREPROCESSING
+    # =============================================================
+    #
+    # IMPORTANT:
+    # This experiment intentionally bypasses the previous common
+    # preprocessing pipeline. No log transformation, no feature
+    # selection, and no scaling are applied.
+    #
+    # Data flow for this experiment:
+    #
+    #     Raw features (115)
+    #             ↓
+    #     NO Log1p
+    #     NO feature selection
+    #     NO StandardScaler
+    #             ↓
+    #     115 features -> model
+    #
+    # Everything else in the FL/security pipeline remains unchanged.
     # =============================================================
 
-    data_processor = IoTDataProcessor(
-        scaler="standard",
-        use_log_transform=True,
-        n_selected_features=target_num_features
+    raw_bootstrap_data = bootstrap_server_dataframe.to_numpy(
+        dtype=np.float32
     )
 
-    processed_bootstrap_data, bootstrap_label = (
-        data_processor.fit_transform(
-            bootstrap_server_dataframe
-        )
+    bootstrap_label = np.zeros(
+        len(raw_bootstrap_data),
+        dtype=np.int64
     )
 
-    actual_dim_features = (
-        processed_bootstrap_data.shape[1]
-    )
+    actual_dim_features = raw_bootstrap_data.shape[1]
 
     logging.info(
-        f"Feature pipeline complete | "
-        f"Original features: "
-        f"{bootstrap_server_dataframe.shape[1]} | "
-        f"Selected features: "
-        f"{actual_dim_features}"
+        f"RAW feature pipeline active | "
+        f"Original features: {bootstrap_server_dataframe.shape[1]} | "
+        f"Features passed to model: {actual_dim_features} | "
+        f"Log transform: DISABLED | "
+        f"Feature selection: DISABLED | "
+        f"Scaling: DISABLED"
     )
-
-    selected_feature_indices = (
-        data_processor.get_selected_features()
-    )
-
-    if selected_feature_indices is not None:
-
-        logging.info(
-            f"Selected feature indices: "
-            f"{selected_feature_indices.tolist()}"
-        )
 
     # =============================================================
     # STEP 4:
-    # PROCESS EVERY CLIENT
+    # USE RAW DATA FOR EVERY CLIENT
     # =============================================================
 
     client_info = []
 
     for client in raw_client_data:
 
-        processed_train_data, train_label = (
-            data_processor.transform(
-                client["train_data"],
-                type="normal"
-            )
+        # ---------------------------------------------------------
+        # Raw normal training data
+        # ---------------------------------------------------------
+
+        raw_train_data = client["train_data"].to_numpy(
+            dtype=np.float32
         )
 
-        processed_valid_data, valid_label = (
-            data_processor.transform(
-                client["valid_data"],
-                type="normal"
-            )
+        train_label = np.zeros(
+            len(raw_train_data),
+            dtype=np.int64
         )
 
-        processed_test_normal, test_normal_label = (
-            data_processor.transform(
-                client["test_normal_data"],
-                type="normal"
-            )
+        # ---------------------------------------------------------
+        # Raw validation data
+        # ---------------------------------------------------------
+
+        raw_valid_data = client["valid_data"].to_numpy(
+            dtype=np.float32
         )
 
-        if (
-            client["abnormal_data"]
-            is not None
-        ):
+        valid_label = np.zeros(
+            len(raw_valid_data),
+            dtype=np.int64
+        )
 
-            processed_test_abnormal, test_abnormal_label = (
-                data_processor.transform(
-                    client["abnormal_data"],
-                    type="abnormal"
-                )
+        # ---------------------------------------------------------
+        # Raw normal test data
+        # ---------------------------------------------------------
+
+        raw_test_normal = client["test_normal_data"].to_numpy(
+            dtype=np.float32
+        )
+
+        test_normal_label = np.zeros(
+            len(raw_test_normal),
+            dtype=np.int64
+        )
+
+        # ---------------------------------------------------------
+        # Raw abnormal test data
+        # ---------------------------------------------------------
+
+        if client["abnormal_data"] is not None:
+
+            raw_test_abnormal = client["abnormal_data"].to_numpy(
+                dtype=np.float32
+            )
+
+            test_abnormal_label = np.ones(
+                len(raw_test_abnormal),
+                dtype=np.int64
             )
 
             test_data_combined = np.vstack(
                 [
-                    processed_test_normal,
-                    processed_test_abnormal
+                    raw_test_normal,
+                    raw_test_abnormal
                 ]
             )
 
@@ -1391,25 +1415,47 @@ if __name__ == "__main__":
 
         else:
 
-            test_data_combined = (
-                processed_test_normal
-            )
+            test_data_combined = raw_test_normal
 
-            test_label_combined = (
-                test_normal_label
-            )
+            test_label_combined = test_normal_label
+
+        # ---------------------------------------------------------
+        # Dataset shape validation
+        # ---------------------------------------------------------
+
+        for data_name, data_array in [
+            ("train", raw_train_data),
+            ("validation", raw_valid_data),
+            ("test", test_data_combined)
+        ]:
+
+            if data_array.ndim != 2:
+
+                raise ValueError(
+                    f"Client {client['device']} {data_name} data "
+                    f"must be 2-dimensional, got shape "
+                    f"{data_array.shape}"
+                )
+
+            if data_array.shape[1] != actual_dim_features:
+
+                raise ValueError(
+                    f"Client {client['device']} {data_name} data has "
+                    f"{data_array.shape[1]} features, but expected "
+                    f"{actual_dim_features}."
+                )
 
         # ---------------------------------------------------------
         # Datasets
         # ---------------------------------------------------------
 
         train_dataset = IoTDataset(
-            processed_train_data,
+            raw_train_data,
             train_label
         )
 
         valid_dataset = IoTDataset(
-            processed_valid_data,
+            raw_valid_data,
             valid_label
         )
 
@@ -1607,7 +1653,7 @@ if __name__ == "__main__":
             # =====================================================
 
             bootstrap_dataset = IoTDataset(
-                processed_bootstrap_data,
+                raw_bootstrap_data,
                 bootstrap_label
             )
 
@@ -2716,19 +2762,22 @@ if __name__ == "__main__":
                     bootstrap_server_dataframe.shape[1]
                 ),
 
-            "selected_features":
+            "features_passed_to_model":
                 int(
                     actual_dim_features
                 ),
 
             "use_log_transform":
-                True,
+                False,
 
             "feature_selection":
-                "Unsupervised variance-based selection",
+                "None",
 
             "scaler":
-                "standard"
+                "None",
+
+            "mode":
+                "RAW_FEATURES_NO_PREPROCESSING"
         },
 
         "vae": {
