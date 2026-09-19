@@ -66,15 +66,22 @@ from DataLoader.dataloader import (
     IoTDataProcessor
 )
 
-from Trainer.client_trainer import ClientTrainer
-from Trainer.global_aggregator import GlobalAggregator
-
 from Trainer.malicious_update_experiment2 import manipulate_update
 
-from Trainer.security_buffer import SecurityBuffer
+from Trainer import (
+    ClientTrainer,
+    GlobalAggregator
+)
 
-from Model.Shrink_Autoencoder import Shrink_Autoencoder
-from Model.AutoEncoder import Autoencoder
+from Trainer.security_buffer import (
+    SecurityBuffer
+)
+
+from Model import (
+    Shrink_Autoencoder,
+    Autoencoder
+)
+
 
 
 # ============================================================
