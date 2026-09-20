@@ -12,23 +12,41 @@ Pipeline:
         ↓
     Common preprocessing
         ↓
-    Initial server model training
+    Log transformation
         ↓
-    Federated rounds
+    Unsupervised feature selection
         ↓
-    Local training
+    Scaling
         ↓
-    Timing attack manipulation
+    Initial global model training
         ↓
-    SecurityBuffer routing
+    Local VAE training
+        ↓
+    Client update:
+        - weights
+        - dataset size
+        - training time
+        - validation loss
+        - 5-fold validation MSE list
+        ↓
+    Security Buffer
         ↓
     Direct / Secondary / Quarantine
+        ↓
+    Server validation for delayed updates
+        ↓
+    Delayed carryover to NEXT round
+        ↓
+    Secondary weight factor = 0.7
+    Quarantine weight factor = 0.3
         ↓
     FedOpt aggregation
         ↓
     Global evaluation
         ↓
-    Client-wise evaluation
+    Client-wise evaluation using CURRENT GLOBAL MODEL
+        ↓
+    Repeat
 """
 
 import os
@@ -45,10 +63,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-# ============================================================
-# COMET ML
-# ============================================================
-import comet_ml
+from Trainer.malicious_update_experiment2 import (
+    manipulate_update
+)
 
 from sklearn.metrics import (
     precision_score,
@@ -58,15 +75,16 @@ from sklearn.metrics import (
     confusion_matrix
 )
 
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import (
+    DataLoader,
+    ConcatDataset
+)
 
 from DataLoader.dataloader import (
     load_data,
     IoTDataset,
     IoTDataProcessor
 )
-
-from Trainer.malicious_update_experiment2 import manipulate_update
 
 from Trainer import (
     ClientTrainer,
@@ -83,31 +101,31 @@ from Model import (
 )
 
 
-
-# ============================================================
+# ================================================================
 # LOGGING
-# ============================================================
+# ================================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# HYPERPARAMETERS
-# ============================================================
+# ================================================================
+# GLOBAL HYPERPARAMETERS
+# ================================================================
 
 num_participants = 1.0
 
 epoch = 15
+
 num_rounds = 15
 
 lr_rate = 1e-5
 
+# VAE latent dimension
 shrink_dim = 16
+
 threshold_val = 0.2
 
 network_size = 10
@@ -118,27 +136,66 @@ num_runs = 5
 
 batch_size = 64
 
+# Number of features after unsupervised feature selection
 target_num_features = 64
+
+# ------------------------------------------------
+# Fraction of each client's normal training data
+# used to create the initial server dataset.
+# ------------------------------------------------
 
 bootstrap_fraction = 0.10
 
+# ------------------------------------------------
+# Initial server training epochs
+# ------------------------------------------------
+
 initial_epochs = 1
+
+# ------------------------------------------------
+# VAE KL weight
+# ------------------------------------------------
 
 vae_kl_weight = 0.0001
 
-
-# ============================================================
-# TIMING ATTACK CONFIGURATION
-# ============================================================
+# ------------------------------------------------
+# TIMING ATTACK WARM-UP
+# ------------------------------------------------
+#
+# Client-3 remains CLEAN for the first 2 rounds.
+#
+# Starting from Round 3:
+#     Client-3 -> timing attack
+#
+# This is required because SecurityBuffer uses
+# min_history = 2 before timing behavior can be
+# evaluated against historical clean timing.
+#
+# ------------------------------------------------
 
 TIMING_ATTACK_CLIENT = "Client-3"
 
 TIMING_ATTACK_START_ROUND = 3
 
-
-# ============================================================
-# SECURITY BUFFER WEIGHT FACTORS
-# ============================================================
+# ------------------------------------------------
+# DELAYED UPDATE WEIGHT FACTORS
+# ------------------------------------------------
+#
+# FAST + CLEAN:
+#     current round aggregation
+#     factor = 1.0
+#
+# SLOW / SECONDARY:
+#     validated in current round
+#     aggregated NEXT round
+#     factor = 0.7
+#
+# QUARANTINE:
+#     validated in current round
+#     if accepted -> aggregated NEXT round
+#     factor = 0.3
+#
+# ------------------------------------------------
 
 direct_weight_factor = 1.0
 
@@ -146,21 +203,29 @@ secondary_weight_factor = 0.7
 
 quarantine_weight_factor = 0.3
 
+# ------------------------------------------------
+# Server-side validation
+# ------------------------------------------------
+
 minimum_weight_factor = 0.10
-
-
-# ============================================================
-# VALIDATION REJECTION
-# ============================================================
 
 validation_rejection_ratio = 4.0
 
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
+config_file = (
+    "/content/fedmse/Configuration/"
+    "scen2-nba-iot-10clients.json"
+)
+
+
+# ================================================================
+# RANDOM SEED
+# ================================================================
 
 def set_seeds(seed):
+    """
+    Sets deterministic random seeds across all libraries.
+    """
 
     random.seed(seed)
 
@@ -170,383 +235,794 @@ def set_seeds(seed):
 
     if torch.cuda.is_available():
 
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(
+            seed
+        )
 
 
-# ============================================================
-# RECONSTRUCTED OUTPUT
-# ============================================================
+# ================================================================
+# MODEL OUTPUT EXTRACTION
+# ================================================================
 
-def extract_reconstructed_output(model_output):
+def extract_reconstructed_output(outputs):
+    """
+    Extracts reconstruction from model output.
 
-    if isinstance(model_output, tuple):
+    For VAE:
+        (reconstruction, mu, logvar)
 
-        return model_output[0]
+    Therefore reconstruction = outputs[0].
+    """
 
-    if isinstance(model_output, dict):
+    if isinstance(
+        outputs,
+        (tuple, list)
+    ):
 
-        if "reconstruction" in model_output:
+        if len(outputs) == 0:
 
-            return model_output["reconstruction"]
+            raise ValueError(
+                "Model returned an empty tuple/list."
+            )
 
-        if "reconstructed" in model_output:
+        return outputs[0]
 
-            return model_output["reconstructed"]
-
-    return model_output
+    return outputs
 
 
-# ============================================================
-# GLOBAL MSE EVALUATION
-# ============================================================
+# ================================================================
+# GLOBAL MSE
+# ================================================================
 
-def evaluate_global_mse(model, loader, device):
+def evaluate_global_mse(
+    global_model,
+    val_loader,
+    device="cpu"
+):
+    """
+    Computes reconstruction MSE of the global model
+    on the server validation dataset.
+    """
 
-    model.eval()
+    if (
+        global_model is None
+        or val_loader is None
+    ):
+
+        return 0.0
+
+    global_model.eval()
 
     total_loss = 0.0
 
     total_samples = 0
 
-    criterion = nn.MSELoss(reduction="sum")
+    criterion = nn.MSELoss()
 
     with torch.no_grad():
 
-        for batch in loader:
+        for batch in val_loader:
 
-            if isinstance(batch, (list, tuple)):
+            inputs = (
+                batch[0].to(device)
+                if isinstance(
+                    batch,
+                    (list, tuple)
+                )
+                else batch.to(device)
+            )
 
-                x = batch[0]
+            outputs = global_model(
+                inputs
+            )
 
-            else:
+            reconstructed = (
+                extract_reconstructed_output(
+                    outputs
+                )
+            )
 
-                x = batch
+            loss = criterion(
+                reconstructed,
+                inputs
+            )
 
-            x = x.to(device).float()
+            total_loss += (
+                loss.item()
+                *
+                inputs.size(0)
+            )
 
-            output = model(x)
+            total_samples += (
+                inputs.size(0)
+            )
 
-            reconstructed = extract_reconstructed_output(output)
-
-            loss = criterion(reconstructed, x)
-
-            total_loss += loss.item()
-
-            total_samples += x.size(0)
-
-    if total_samples == 0:
-
-        return float("inf")
-
-    return total_loss / total_samples
+    return (
+        total_loss
+        /
+        max(
+            total_samples,
+            1
+        )
+    )
 
 
-# ============================================================
-# RECONSTRUCTION ERRORS
-# ============================================================
+# ================================================================
+# SAMPLE-WISE RECONSTRUCTION ERRORS
+# ================================================================
 
-def compute_reconstruction_errors(model, loader, device):
+def compute_reconstruction_errors(
+    model,
+    data_loader,
+    device="cpu"
+):
+    """
+    Calculates sample-wise MSE reconstruction errors.
+    """
 
     model.eval()
 
     errors = []
 
+    criterion = nn.MSELoss(
+        reduction='none'
+    )
+
     with torch.no_grad():
 
-        for batch in loader:
+        for batch in data_loader:
 
-            if isinstance(batch, (list, tuple)):
+            inputs = (
+                batch[0].to(device)
+                if isinstance(
+                    batch,
+                    (list, tuple)
+                )
+                else batch.to(device)
+            )
 
-                x = batch[0]
+            outputs = model(
+                inputs
+            )
 
-            else:
+            reconstructed = (
+                extract_reconstructed_output(
+                    outputs
+                )
+            )
 
-                x = batch
-
-            x = x.to(device).float()
-
-            output = model(x)
-
-            reconstructed = extract_reconstructed_output(output)
-
-            sample_errors = torch.mean(
-                (reconstructed - x) ** 2,
+            loss = criterion(
+                reconstructed,
+                inputs
+            ).mean(
                 dim=1
             )
 
             errors.extend(
-                sample_errors.detach()
-                .cpu()
-                .numpy()
-                .tolist()
+                loss.cpu().numpy()
             )
 
-    return np.asarray(errors)
+    return np.array(
+        errors
+    )
 
 
-# ============================================================
+# ================================================================
 # ANOMALY DETECTION EVALUATION
-# ============================================================
+# ================================================================
 
 def evaluate_anomaly_detection(
     model,
-    normal_loader,
-    abnormal_loader,
-    device
+    test_loader,
+    device="cpu"
 ):
+    """
+    Evaluates anomaly detection performance.
 
-    normal_errors = compute_reconstruction_errors(
-        model,
-        normal_loader,
-        device
+    Returns:
+        Precision
+        Recall
+        F1
+        ROC-AUC
+        Threshold
+        Confusion Matrix
+    """
+
+    model.eval()
+
+    y_true = []
+
+    reconstruction_errors = []
+
+    criterion = nn.MSELoss(
+        reduction='none'
     )
 
-    abnormal_errors = compute_reconstruction_errors(
-        model,
-        abnormal_loader,
-        device
+    with torch.no_grad():
+
+        for batch in test_loader:
+
+            inputs = batch[0].to(
+                device
+            )
+
+            labels = (
+                batch[1]
+                .cpu()
+                .numpy()
+            )
+
+            outputs = model(
+                inputs
+            )
+
+            reconstructed = (
+                extract_reconstructed_output(
+                    outputs
+                )
+            )
+
+            loss = criterion(
+                reconstructed,
+                inputs
+            ).mean(
+                dim=1
+            ).cpu().numpy()
+
+            reconstruction_errors.extend(
+                loss
+            )
+
+            y_true.extend(
+                labels
+            )
+
+    y_true = np.array(
+        y_true
     )
 
-    all_errors = np.concatenate(
-        [normal_errors, abnormal_errors]
+    reconstruction_errors = np.array(
+        reconstruction_errors
     )
 
-    labels = np.concatenate(
-        [
-            np.zeros(len(normal_errors)),
-            np.ones(len(abnormal_errors))
+    normal_errors = (
+        reconstruction_errors[
+            y_true == 0
         ]
     )
 
-    # Threshold from normal reconstruction errors
-    threshold = np.percentile(
-        normal_errors,
-        95
+    if len(normal_errors) > 0:
+
+        threshold = np.percentile(
+            normal_errors,
+            95
+        )
+
+    else:
+
+        threshold = (
+            np.mean(
+                reconstruction_errors
+            )
+            +
+            np.std(
+                reconstruction_errors
+            )
+        )
+
+    y_pred = (
+        reconstruction_errors
+        >
+        threshold
+    ).astype(
+        int
     )
 
-    predictions = (
-        all_errors >= threshold
-    ).astype(int)
-
     precision = precision_score(
-        labels,
-        predictions,
+        y_true,
+        y_pred,
         zero_division=0
     )
 
     recall = recall_score(
-        labels,
-        predictions,
+        y_true,
+        y_pred,
         zero_division=0
     )
 
     f1 = f1_score(
-        labels,
-        predictions,
+        y_true,
+        y_pred,
         zero_division=0
     )
 
     try:
 
         auc = roc_auc_score(
-            labels,
-            all_errors
+            y_true,
+            reconstruction_errors
         )
 
-    except Exception:
+    except ValueError:
 
         auc = 0.5
 
     cm = confusion_matrix(
-        labels,
-        predictions,
-        labels=[0, 1]
+        y_true,
+        y_pred,
+        labels=[
+            0,
+            1
+        ]
     )
 
-    tn, fp, fn, tp = cm.ravel()
+    tn, fp, fn, tp = (
+        cm.ravel()
+    )
 
-    return {
+    metrics = {
 
-        "precision": precision,
+        "precision":
+            float(precision),
 
-        "recall": recall,
+        "recall":
+            float(recall),
 
-        "f1_score": f1,
+        "f1_score":
+            float(f1),
 
-        "auc_roc": auc,
+        "auc_roc":
+            float(auc),
 
-        "threshold": threshold,
+        "threshold":
+            float(threshold),
 
-        "tp": int(tp),
+        "tp":
+            int(tp),
 
-        "fp": int(fp),
+        "fp":
+            int(fp),
 
-        "tn": int(tn),
+        "tn":
+            int(tn),
 
-        "fn": int(fn)
+        "fn":
+            int(fn)
     }
 
+    return metrics
 
-# ============================================================
-# CLIENT-WISE AUC
-# ============================================================
+
+# ================================================================
+# CLIENT-WISE GLOBAL MODEL EVALUATION
+# ================================================================
 
 def evaluate_clientwise_auc(
-    model,
-    client_data,
-    device
+    global_model,
+    client_info,
+    device="cpu"
 ):
+    """
+    Evaluates the CURRENT GLOBAL MODEL separately on every
+    client's own test dataset.
+    """
 
-    model.eval()
+    client_results = {}
 
-    results = {}
+    logging.info(
+        "===================================================="
+    )
 
-    for client in client_data:
+    logging.info(
+        "[Client-wise Evaluation] "
+        "Evaluating CURRENT GLOBAL MODEL on each client"
+    )
+
+    logging.info(
+        "===================================================="
+    )
+
+    global_state = copy.deepcopy(
+        global_model.state_dict()
+    )
+
+    for client in client_info:
 
         client_id = client["device"]
 
-        normal_test_loader = client[
-            "normal_test_loader"
-        ]
+        test_loader = client["test_loader"]
 
-        abnormal_test_loader = client[
-            "abnormal_test_loader"
-        ]
+        client_eval_model = copy.deepcopy(
+            global_model
+        ).to(device)
 
-        try:
+        client_eval_model.load_state_dict(
+            global_state
+        )
 
-            metrics = evaluate_anomaly_detection(
-                model,
-                normal_test_loader,
-                abnormal_test_loader,
-                device
+        client_eval_model.eval()
+
+        metrics = evaluate_anomaly_detection(
+            client_eval_model,
+            test_loader,
+            device=device
+        )
+
+        client_results[
+            client_id
+        ] = {
+
+            "auc":
+                float(
+                    metrics["auc_roc"]
+                ),
+
+            "precision":
+                float(
+                    metrics["precision"]
+                ),
+
+            "recall":
+                float(
+                    metrics["recall"]
+                ),
+
+            "f1":
+                float(
+                    metrics["f1_score"]
+                )
+        }
+
+        logging.info(
+            f"[Client-wise AUC] "
+            f"{client_id} | "
+            f"AUC: {metrics['auc_roc']:.4f} | "
+            f"F1: {metrics['f1_score']:.4f} | "
+            f"Precision: {metrics['precision']:.4f} | "
+            f"Recall: {metrics['recall']:.4f}"
+        )
+
+        del client_eval_model
+
+        if torch.cuda.is_available():
+
+            torch.cuda.empty_cache()
+
+    client_auc_values = [
+        result["auc"]
+        for result in client_results.values()
+    ]
+
+    mean_client_auc = (
+        float(
+            np.mean(
+                client_auc_values
             )
+        )
+        if client_auc_values
+        else 0.0
+    )
 
-            results[client_id] = {
+    logging.info(
+        f"[Client-wise Evaluation] "
+        f"Mean Client AUC: "
+        f"{mean_client_auc:.4f}"
+    )
 
-                "auc": metrics["auc_roc"],
+    logging.info(
+        "===================================================="
+    )
 
-                "precision": metrics["precision"],
-
-                "recall": metrics["recall"],
-
-                "f1": metrics["f1_score"]
-            }
-
-        except Exception as e:
-
-            logger.warning(
-                f"Client-wise evaluation failed for "
-                f"{client_id}: {e}"
-            )
-
-            results[client_id] = {
-
-                "auc": 0.5,
-
-                "precision": 0.0,
-
-                "recall": 0.0,
-
-                "f1": 0.0
-            }
-
-    return results
+    return client_results
 
 
-# ============================================================
-# DELAYED UPDATE VALIDATION
-# ============================================================
+# ================================================================
+# SERVER VALIDATION OF DELAYED UPDATE
+# ================================================================
 
 def validate_delayed_update(
-    model,
+    update,
+    global_model,
+    server_val_loader,
     current_global_mse,
-    delayed_update,
-    server_validation_loader,
-    device,
-    rejection_ratio
+    route_type,
+    device="cpu"
 ):
+    """
+    Validates a delayed Secondary or Quarantine update
+    on the server validation dataset.
 
-    candidate_model = copy.deepcopy(model)
+    IMPORTANT:
+        This function does NOT aggregate the update.
+
+    It only decides whether the update can be carried
+    to the NEXT round.
+
+    Secondary:
+        accepted -> factor 0.7 -> next round
+
+    Quarantine:
+        accepted -> factor 0.3 -> next round
+        rejected -> DROP
+    """
+
+    if (
+        update is None
+        or "weights" not in update
+        or global_model is None
+        or server_val_loader is None
+    ):
+
+        return (
+            False,
+            quarantine_weight_factor
+            if route_type == "QUARANTINE"
+            else secondary_weight_factor,
+            float("inf"),
+            "DROP"
+        )
+
+    candidate_model = copy.deepcopy(
+        global_model
+    ).to(device)
 
     try:
 
         candidate_model.load_state_dict(
-            delayed_update["weights"]
+            update["weights"]
         )
 
-    except Exception as e:
+    except Exception as exc:
 
-        logger.error(
-            f"Failed to load delayed update: {e}"
+        logging.warning(
+            f"[Server Validation] "
+            f"Failed to load Client "
+            f"{update.get('client_id', 'unknown')} "
+            f"weights: {exc}"
         )
 
-        return False
+        return (
+            False,
+            quarantine_weight_factor
+            if route_type == "QUARANTINE"
+            else secondary_weight_factor,
+            float("inf"),
+            "DROP"
+        )
 
-    candidate_mse = evaluate_global_mse(
-        candidate_model,
-        server_validation_loader,
-        device
+    candidate_model.eval()
+
+    criterion = nn.MSELoss()
+
+    total_loss = 0.0
+
+    total_samples = 0
+
+    with torch.no_grad():
+
+        for batch in server_val_loader:
+
+            inputs = (
+                batch[0].to(device)
+                if isinstance(
+                    batch,
+                    (list, tuple)
+                )
+                else batch.to(device)
+            )
+
+            outputs = candidate_model(
+                inputs
+            )
+
+            reconstructed = (
+                extract_reconstructed_output(
+                    outputs
+                )
+            )
+
+            loss = criterion(
+                reconstructed,
+                inputs
+            )
+
+            total_loss += (
+                loss.item()
+                *
+                inputs.size(0)
+            )
+
+            total_samples += (
+                inputs.size(0)
+            )
+
+    candidate_mse = (
+        total_loss
+        /
+        max(
+            total_samples,
+            1
+        )
     )
 
-    rejection_limit = (
-        current_global_mse *
-        rejection_ratio
+    del candidate_model
+
+    if torch.cuda.is_available():
+
+        torch.cuda.empty_cache()
+
+    # -------------------------------------------------------------
+    # Invalid candidate
+    # -------------------------------------------------------------
+
+    if not math.isfinite(
+        candidate_mse
+    ):
+
+        return (
+            False,
+            quarantine_weight_factor
+            if route_type == "QUARANTINE"
+            else secondary_weight_factor,
+            candidate_mse,
+            "DROP"
+        )
+
+    # -------------------------------------------------------------
+    # No usable global baseline
+    # -------------------------------------------------------------
+
+    if (
+        not math.isfinite(
+            current_global_mse
+        )
+        or current_global_mse <= 0
+    ):
+
+        if route_type == "QUARANTINE":
+
+            return (
+                True,
+                quarantine_weight_factor,
+                candidate_mse,
+                "QUARANTINE_ACCEPTED"
+            )
+
+        else:
+
+            return (
+                True,
+                secondary_weight_factor,
+                candidate_mse,
+                "SECONDARY_ACCEPTED"
+            )
+
+    # -------------------------------------------------------------
+    # Compare candidate against current global model
+    # -------------------------------------------------------------
+
+    if (
+        candidate_mse
+        >
+        current_global_mse
+        *
+        validation_rejection_ratio
+    ):
+
+        logging.warning(
+            f"[Server Validation] "
+            f"Client {update.get('client_id', 'unknown')} "
+            f"failed validation | "
+            f"Candidate MSE: {candidate_mse:.6f} | "
+            f"Global MSE: {current_global_mse:.6f} | "
+            f"Allowed Ratio: {validation_rejection_ratio:.2f}"
+        )
+
+        return (
+            False,
+            quarantine_weight_factor
+            if route_type == "QUARANTINE"
+            else secondary_weight_factor,
+            candidate_mse,
+            "DROP"
+        )
+
+    # -------------------------------------------------------------
+    # Accepted delayed update
+    # -------------------------------------------------------------
+
+    if route_type == "QUARANTINE":
+
+        return (
+            True,
+            quarantine_weight_factor,
+            candidate_mse,
+            "QUARANTINE_ACCEPTED"
+        )
+
+    return (
+        True,
+        secondary_weight_factor,
+        candidate_mse,
+        "SECONDARY_ACCEPTED"
     )
 
-    accepted = (
-        candidate_mse <= rejection_limit
-    )
 
-    logger.info(
-        f"Delayed update validation | "
-        f"Candidate MSE={candidate_mse:.6f} | "
-        f"Current Global MSE={current_global_mse:.6f} | "
-        f"Limit={rejection_limit:.6f} | "
-        f"Accepted={accepted}"
-    )
-
-    return accepted
-
-
-# ============================================================
+# ================================================================
 # MAIN
-# ============================================================
+# ================================================================
 
-def main():
+if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Federated Learning Evaluation Pipeline "
+            "with VAE, FedOpt and Security Buffer"
+        )
+    )
+
+    # -------------------------------------------------------------
+    # 1.5 sec = FAST/SLOW classification threshold
+    # -------------------------------------------------------------
 
     parser.add_argument(
         "--latency_threshold",
         type=float,
-        default=1.5
+        default=1.5,
+        help=(
+            "FAST/SLOW arrival latency threshold in seconds"
+        )
     )
 
     parser.add_argument(
         "--update_type",
         type=str,
-        default="fedopt"
+        default="fedopt",
+        help=(
+            "Aggregation type: fedopt, fedadam or fedavg"
+        )
     )
 
     parser.add_argument(
         "--server_lr",
         type=float,
-        default=0.01
+        default=0.01,
+        help=(
+            "Server-side learning rate"
+        )
     )
 
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results"
+        default="./results",
+        help=(
+            "Output metrics directory"
+        )
     )
 
     args = parser.parse_args()
 
+    # -------------------------------------------------------------
+    # Output directory
+    # -------------------------------------------------------------
 
-    # ========================================================
-    # DEVICE
-    # ========================================================
+    os.makedirs(
+        args.output_dir,
+        exist_ok=True
+    )
+
+    # -------------------------------------------------------------
+    # Initial seed
+    # -------------------------------------------------------------
+
+    set_seeds(
+        data_seed
+    )
+
+    # -------------------------------------------------------------
+    # Device
+    # -------------------------------------------------------------
 
     device = torch.device(
         "cuda"
@@ -554,912 +1030,929 @@ def main():
         else "cpu"
     )
 
-    logger.info(
-        f"Using device: {device}"
+    logging.info(
+        f"Execution started on target device: "
+        f"{device}"
     )
 
-
-    # ========================================================
-    # OUTPUT DIRECTORY
-    # ========================================================
-
-    os.makedirs(
-        args.output_dir,
-        exist_ok=True
-    )
-
-
-    # ========================================================
+    # =============================================================
     # LOAD CONFIGURATION
-    # ========================================================
-
-    config_path = (
-        "/content/fedmse/"
-        "Configuration/"
-        "scen2-nba-iot-10clients.json"
-    )
+    # =============================================================
 
     with open(
-        config_path,
+        config_file,
         "r"
-    ) as f:
+    ) as config_f:
 
-        config = json.load(f)
+        config = json.load(
+            config_f
+        )
 
+    # -------------------------------------------------------------
+    # Select participating clients
+    # -------------------------------------------------------------
 
-    # ========================================================
-    # LOAD CLIENTS
-    # ========================================================
-
-    all_clients = load_data(
-        config
-    )
-
-
-    # ========================================================
-    # RANDOMLY SELECT CLIENTS
-    # ========================================================
-
-    random.seed(data_seed)
-
-    selected_clients = random.sample(
-        all_clients,
+    devices_list = random.sample(
+        config["devices_list"],
         network_size
     )
 
+    # =============================================================
+    # STEP 1:
+    # LOAD RAW CLIENT DATA
+    # =============================================================
 
-    logger.info(
-        f"Selected {len(selected_clients)} clients"
+    raw_client_data = []
+
+    logging.info(
+        "Loading client datasets..."
     )
 
+    for dev in devices_list:
 
-    # ========================================================
-    # CLIENT DATA PREPARATION
-    # ========================================================
-
-    client_data = []
-
-    bootstrap_frames = []
-
-
-    for client in selected_clients:
-
-        client_id = client["device"]
-
-        logger.info(
-            f"Preparing {client_id}"
+        normal_data_path = os.path.join(
+            config["data_path"],
+            dev["normal_data_path"]
         )
 
-
-        normal_data = client[
-            "normal"
-        ]
-
-        abnormal_data = client[
-            "abnormal"
-        ]
-
-
-        # ----------------------------------------------------
-        # SHUFFLE NORMAL DATA
-        # ----------------------------------------------------
-
-        normal_data = normal_data.sample(
-            frac=1.0,
-            random_state=data_seed
-        ).reset_index(
-            drop=True
+        normal_data = (
+            load_data(
+                normal_data_path
+            )
+            .sample(
+                frac=1,
+                random_state=data_seed
+            )
+            .reset_index(
+                drop=True
+            )
         )
 
+        # ---------------------------------------------------------
+        # Abnormal data
+        # ---------------------------------------------------------
 
-        # ----------------------------------------------------
-        # SPLIT NORMAL DATA
-        # ----------------------------------------------------
+        if dev.get(
+            "abnormal_data_path"
+        ):
 
-        n_total = len(normal_data)
+            abnormal_data_path = os.path.join(
+                config["data_path"],
+                dev["abnormal_data_path"]
+            )
 
-        train_end = int(
-            n_total * 0.40
+        else:
+
+            abnormal_data_path = (
+                normal_data_path
+                .replace(
+                    "normal",
+                    "abnormal"
+                )
+            )
+
+        try:
+
+            abnormal_data = (
+                load_data(
+                    abnormal_data_path
+                )
+                .sample(
+                    frac=1,
+                    random_state=data_seed
+                )
+                .reset_index(
+                    drop=True
+                )
+            )
+
+        except Exception as exc:
+
+            logging.warning(
+                f"Abnormal data load failed for "
+                f"{dev['name']}: {exc}"
+            )
+
+            abnormal_data = None
+
+        # ---------------------------------------------------------
+        # Split normal data
+        # ---------------------------------------------------------
+
+        train_normal_size = int(
+            0.4
+            *
+            len(normal_data)
         )
 
-        val_end = int(
-            n_total * 0.50
+        valid_normal_size = int(
+            0.1
+            *
+            len(normal_data)
         )
 
+        train_normal_data = (
+            normal_data[
+                :train_normal_size
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
 
-        train_normal = normal_data[
-            :train_end
-        ].copy()
+        valid_normal_data = (
+            normal_data[
+                train_normal_size:
+                train_normal_size
+                +
+                valid_normal_size
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
 
-        validation_normal = normal_data[
-            train_end:val_end
-        ].copy()
+        # ---------------------------------------------------------
+        # Dedicated test_normal.csv
+        # ---------------------------------------------------------
 
+        test_normal_data_path = os.path.join(
+            config["data_path"],
+            dev["test_normal_data_path"]
+        )
 
-        # ----------------------------------------------------
-        # TEST NORMAL
-        # ----------------------------------------------------
+        test_normal_data = (
+            load_data(
+                test_normal_data_path
+            )
+            .sample(
+                frac=1,
+                random_state=data_seed
+            )
+            .reset_index(
+                drop=True
+            )
+        )
 
-        test_normal = client[
-            "test_normal"
-        ]
-
-
-        # ----------------------------------------------------
-        # BOOTSTRAP
-        # ----------------------------------------------------
+        # ---------------------------------------------------------
+        # Bootstrap subset
+        # ---------------------------------------------------------
 
         bootstrap_size = max(
             1,
             int(
-                len(train_normal)
-                * bootstrap_fraction
+                bootstrap_fraction
+                *
+                len(train_normal_data)
             )
         )
 
-
-        bootstrap_sample = train_normal[
-            :bootstrap_size
-        ].copy()
-
-
-        local_train = train_normal[
-            bootstrap_size:
-        ].copy()
-
-
-        bootstrap_frames.append(
-            bootstrap_sample
+        bootstrap_data = (
+            train_normal_data[
+                :bootstrap_size
+            ]
+            .reset_index(
+                drop=True
+            )
         )
 
+        # ---------------------------------------------------------
+        # Remaining local training data
+        # ---------------------------------------------------------
 
-        # ====================================================
-        # DATASET OBJECTS
-        # ====================================================
-
-        train_dataset = IoTDataset(
-            local_train
+        local_train_data = (
+            train_normal_data[
+                bootstrap_size:
+            ]
+            .reset_index(
+                drop=True
+            )
         )
 
-        validation_dataset = IoTDataset(
-            validation_normal
-        )
+        if len(local_train_data) == 0:
 
-        normal_test_dataset = IoTDataset(
-            test_normal
-        )
+            local_train_data = (
+                train_normal_data
+            )
 
-        abnormal_test_dataset = IoTDataset(
-            abnormal_data
-        )
+        raw_client_data.append({
 
+            "device":
+                dev["name"],
 
-        # ====================================================
-        # DATA LOADERS
-        # ====================================================
+            "bootstrap_data":
+                bootstrap_data,
 
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True
-        )
+            "train_data":
+                local_train_data,
 
-        validation_loader = DataLoader(
-            validation_dataset,
-            batch_size=batch_size,
-            shuffle=False
-        )
+            "valid_data":
+                valid_normal_data,
 
-        normal_test_loader = DataLoader(
-            normal_test_dataset,
-            batch_size=batch_size,
-            shuffle=False
-        )
+            "test_normal_data":
+                test_normal_data,
 
-        abnormal_test_loader = DataLoader(
-            abnormal_test_dataset,
-            batch_size=batch_size,
-            shuffle=False
-        )
+            "abnormal_data":
+                abnormal_data,
 
+            "sim_train_time":
+                dev.get(
+                    "simulated_training_time",
+                    random.uniform(
+                        1.0,
+                        5.0
+                    )
+                ),
 
-        # ====================================================
-        # SAVE CLIENT INFORMATION
-        # ====================================================
-
-        client_data.append({
-
-            "device": client_id,
-
-            "train_loader": train_loader,
-
-            "validation_loader": validation_loader,
-
-            "normal_test_loader": normal_test_loader,
-
-            "abnormal_test_loader": abnormal_test_loader,
-
-            "dataset_size": len(local_train)
+            "sim_comm_time":
+                dev.get(
+                    "simulated_comm_time",
+                    random.uniform(
+                        0.2,
+                        1.5
+                    )
+                )
         })
 
+    # =============================================================
+    # STEP 2:
+    # SERVER BOOTSTRAP DATASET
+    # =============================================================
 
-    # ========================================================
-    # SERVER BOOTSTRAP DATA
-    # ========================================================
-
-    server_bootstrap_df = pd.concat(
-        bootstrap_frames,
+    bootstrap_server_dataframe = pd.concat(
+        [
+            client["bootstrap_data"]
+            for client in raw_client_data
+        ],
         ignore_index=True
     )
 
-
-    logger.info(
-        f"Server bootstrap samples: "
-        f"{len(server_bootstrap_df)}"
+    logging.info(
+        f"Initial server bootstrap dataset created "
+        f"from {len(raw_client_data)} clients | "
+        f"Samples: {len(bootstrap_server_dataframe)}"
     )
 
+    # =============================================================
+    # STEP 3:
+    # COMMON PREPROCESSING
+    # =============================================================
 
-    # ========================================================
-    # RAW PIPELINE
-    # ========================================================
-
-    logger.info(
-        "Using RAW feature pipeline: "
-        "No log transform, no feature selection, "
-        "no scaling."
+    data_processor = IoTDataProcessor(
+        scaler="standard",
+        use_log_transform=True,
+        n_selected_features=target_num_features
     )
 
+    processed_bootstrap_data, bootstrap_label = (
+        data_processor.fit_transform(
+            bootstrap_server_dataframe
+        )
+    )
 
     actual_dim_features = (
-        server_bootstrap_df.shape[1]
+        processed_bootstrap_data.shape[1]
     )
 
-
-    logger.info(
-        f"Actual number of input features: "
+    logging.info(
+        f"Feature pipeline complete | "
+        f"Original features: "
+        f"{bootstrap_server_dataframe.shape[1]} | "
+        f"Selected features: "
         f"{actual_dim_features}"
     )
 
+    selected_feature_indices = (
+        data_processor.get_selected_features()
+    )
 
-    # ========================================================
+    if selected_feature_indices is not None:
+
+        logging.info(
+            f"Selected feature indices: "
+            f"{selected_feature_indices.tolist()}"
+        )
+
+    # =============================================================
+    # STEP 4:
+    # PROCESS EVERY CLIENT
+    # =============================================================
+
+    client_info = []
+
+    for client in raw_client_data:
+
+        processed_train_data, train_label = (
+            data_processor.transform(
+                client["train_data"],
+                type="normal"
+            )
+        )
+
+        processed_valid_data, valid_label = (
+            data_processor.transform(
+                client["valid_data"],
+                type="normal"
+            )
+        )
+
+        processed_test_normal, test_normal_label = (
+            data_processor.transform(
+                client["test_normal_data"],
+                type="normal"
+            )
+        )
+
+        if (
+            client["abnormal_data"]
+            is not None
+        ):
+
+            processed_test_abnormal, test_abnormal_label = (
+                data_processor.transform(
+                    client["abnormal_data"],
+                    type="abnormal"
+                )
+            )
+
+            test_data_combined = np.vstack(
+                [
+                    processed_test_normal,
+                    processed_test_abnormal
+                ]
+            )
+
+            test_label_combined = np.hstack(
+                [
+                    test_normal_label,
+                    test_abnormal_label
+                ]
+            )
+
+        else:
+
+            test_data_combined = (
+                processed_test_normal
+            )
+
+            test_label_combined = (
+                test_normal_label
+            )
+
+        # ---------------------------------------------------------
+        # Datasets
+        # ---------------------------------------------------------
+
+        train_dataset = IoTDataset(
+            processed_train_data,
+            train_label
+        )
+
+        valid_dataset = IoTDataset(
+            processed_valid_data,
+            valid_label
+        )
+
+        test_dataset = IoTDataset(
+            test_data_combined,
+            test_label_combined
+        )
+
+        # ---------------------------------------------------------
+        # DataLoaders
+        # ---------------------------------------------------------
+
+        train_loader = DataLoader(
+            dataset=train_dataset,
+            batch_size=batch_size,
+            pin_memory=True,
+            shuffle=True
+        )
+
+        valid_loader = DataLoader(
+            dataset=valid_dataset,
+            batch_size=batch_size,
+            pin_memory=True,
+            shuffle=False
+        )
+
+        test_loader = DataLoader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            pin_memory=True,
+            shuffle=False
+        )
+
+        # ---------------------------------------------------------
+        # Output directory
+        # ---------------------------------------------------------
+
+        client_dir = os.path.join(
+            args.output_dir,
+            client["device"]
+        )
+
+        os.makedirs(
+            client_dir,
+            exist_ok=True
+        )
+
+        client_info.append({
+
+            "device":
+                client["device"],
+
+            "save_dir":
+                client_dir,
+
+            "train_loader":
+                train_loader,
+
+            "valid_loader":
+                valid_loader,
+
+            "test_loader":
+                test_loader,
+
+            "sim_train_time":
+                client["sim_train_time"],
+
+            "sim_comm_time":
+                client["sim_comm_time"]
+        })
+
+    # =============================================================
+    # STEP 5:
     # SERVER VALIDATION DATASET
-    # ========================================================
+    # =============================================================
 
-    validation_datasets = []
-
-    test_datasets = []
-
-
-    for client in client_data:
-
-        validation_datasets.append(
-            IoTDataset(
-                client["validation_loader"].dataset
-            )
-        )
-
-        test_datasets.append(
-            IoTDataset(
-                client["normal_test_loader"].dataset
-            )
-        )
-
-
-    # ========================================================
-    # SERVER VALIDATION LOADER
-    # ========================================================
-
-    server_validation_dataset = ConcatDataset(
-        validation_datasets
+    server_val_dataset = ConcatDataset(
+        [
+            client["valid_loader"].dataset
+            for client in client_info
+        ]
     )
 
-    server_validation_loader = DataLoader(
-        server_validation_dataset,
+    server_val_loader = DataLoader(
+        dataset=server_val_dataset,
         batch_size=batch_size,
         shuffle=False
     )
 
-
-    # ========================================================
+    # =============================================================
+    # STEP 6:
     # SERVER TEST DATASET
-    # ========================================================
+    # =============================================================
 
-    server_test_normal_dataset = ConcatDataset(
-        test_datasets
+    server_test_dataset = ConcatDataset(
+        [
+            client["test_loader"].dataset
+            for client in client_info
+        ]
     )
 
-    server_test_normal_loader = DataLoader(
-        server_test_normal_dataset,
+    server_test_loader = DataLoader(
+        dataset=server_test_dataset,
         batch_size=batch_size,
         shuffle=False
     )
 
+    criterion = nn.MSELoss()
 
-    # ========================================================
+    all_experiment_results = {}
+
+    # =============================================================
     # MODEL TYPES
-    # ========================================================
+    # =============================================================
 
     model_types = [
         "hybrid",
         "autoencoder"
     ]
 
-
-    # ========================================================
-    # EXPERIMENT RESULTS
-    # ========================================================
-
-    experiment_results = {
-
-        "config": {
-
-            "num_participants": num_participants,
-
-            "epoch": epoch,
-
-            "num_rounds": num_rounds,
-
-            "lr_rate": lr_rate,
-
-            "shrink_dim": shrink_dim,
-
-            "threshold_val": threshold_val,
-
-            "network_size": network_size,
-
-            "batch_size": batch_size,
-
-            "bootstrap_fraction":
-                bootstrap_fraction,
-
-            "latency_threshold":
-                args.latency_threshold,
-
-            "server_lr":
-                args.server_lr,
-
-            "update_type":
-                args.update_type
-        },
-
-        "models": {}
-    }
-
-
-    # ========================================================
-    # MODEL LOOP
-    # ========================================================
+    # =============================================================
+    # EXPERIMENT LOOP
+    # =============================================================
 
     for model_type in model_types:
 
-        logger.info(
+        logging.info(
             "\n"
-            + "=" * 80
+            "====================================================\n"
+            f"STARTING EXPERIMENTS FOR MODEL TYPE: "
+            f"{model_type.upper()}\n"
+            "===================================================="
         )
 
-        logger.info(
-            f"MODEL TYPE: {model_type}"
-        )
+        all_experiment_results[
+            model_type
+        ] = []
 
-        logger.info(
-            "=" * 80
-        )
-
-
-        model_results = []
-
-
-        # ====================================================
+        # =========================================================
         # MULTIPLE RUNS
-        # ====================================================
+        # =========================================================
 
-        for run in range(num_runs):
+        for run in range(
+            num_runs
+        ):
 
             run_seed = (
-                (run + 1) * 10000
+                (run + 1)
+                * 10000
             )
 
             set_seeds(
                 run_seed
             )
 
-
-            # =================================================
-            # COMET ML EXPERIMENT
-            # =================================================
-
-            experiment = comet_ml.Experiment(
-                project_name="security-buffer"
+            logging.info(
+                f"--- Starting Execution "
+                f"Run {run + 1}/{num_runs} "
+                f"(Seed: {run_seed}) ---"
             )
 
-            experiment.set_name(
-                f"{model_type}_run_{run + 1}"
-            )
-
-            experiment.add_tags([
-                model_type,
-                "security-buffer",
-                "timing-attack",
-                "raw-no-preprocessing",
-                "fedopt"
-            ])
-
-
-            experiment.log_parameters({
-
-                "model_type":
-                    model_type,
-
-                "run":
-                    run + 1,
-
-                "seed":
-                    run_seed,
-
-                "epochs":
-                    epoch,
-
-                "rounds":
-                    num_rounds,
-
-                "learning_rate":
-                    lr_rate,
-
-                "shrink_dim":
-                    shrink_dim,
-
-                "threshold_val":
-                    threshold_val,
-
-                "network_size":
-                    network_size,
-
-                "batch_size":
-                    batch_size,
-
-                "bootstrap_fraction":
-                    bootstrap_fraction,
-
-                "initial_epochs":
-                    initial_epochs,
-
-                "vae_kl_weight":
-                    vae_kl_weight,
-
-                "latency_threshold":
-                    args.latency_threshold,
-
-                "update_type":
-                    args.update_type,
-
-                "server_lr":
-                    args.server_lr,
-
-                "direct_weight_factor":
-                    direct_weight_factor,
-
-                "secondary_weight_factor":
-                    secondary_weight_factor,
-
-                "quarantine_weight_factor":
-                    quarantine_weight_factor,
-
-                "minimum_weight_factor":
-                    minimum_weight_factor,
-
-                "validation_rejection_ratio":
-                    validation_rejection_ratio,
-
-                "timing_attack_client":
-                    TIMING_ATTACK_CLIENT,
-
-                "timing_attack_start_round":
-                    TIMING_ATTACK_START_ROUND,
-
-                "feature_pipeline":
-                    "RAW_NO_PREPROCESSING",
-
-                "features_passed_to_model":
-                    actual_dim_features
-            })
-
-
-            # =================================================
-            # INITIAL MODEL
-            # =================================================
+            # =====================================================
+            # STEP 7:
+            # INITIAL GLOBAL MODEL
+            # =====================================================
 
             if model_type == "hybrid":
 
-                global_model = Shrink_Autoencoder(
-                    input_dim=actual_dim_features,
-                    shrink_dim=shrink_dim
+                global_model = (
+                    Shrink_Autoencoder(
+                        input_dim=actual_dim_features,
+                        shrink_dim=shrink_dim,
+                        threshold=threshold_val
+                    )
                 )
 
             else:
 
-                global_model = Autoencoder(
-                    input_dim=actual_dim_features
+                global_model = (
+                    Autoencoder(
+                        input_dim=actual_dim_features,
+                        hidden_neus=32,
+                        latent_dim=shrink_dim,
+                        output_dim=actual_dim_features,
+                        use_sigmoid=False
+                    )
                 )
 
-
-            global_model = global_model.to(
+            global_model.to(
                 device
             )
 
-
-            # =================================================
+            # =====================================================
             # INITIAL SERVER TRAINING
-            # =================================================
+            # =====================================================
+
+            bootstrap_dataset = IoTDataset(
+                processed_bootstrap_data,
+                bootstrap_label
+            )
+
+            bootstrap_loader = DataLoader(
+                dataset=bootstrap_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                pin_memory=True
+            )
+
+            logging.info(
+                "[Initial Global Training] "
+                f"Training global {model_type} "
+                f"model using server bootstrap dataset..."
+            )
 
             initial_trainer = ClientTrainer(
-                model=copy.deepcopy(global_model),
-                train_loader=server_validation_loader,
-                val_loader=server_validation_loader,
-                device=device,
-                epochs=initial_epochs,
-                lr=lr_rate,
+                model=global_model,
+                client_id="SERVER_INIT",
+                train_loader=bootstrap_loader,
+                epoch=initial_epochs,
+                lr_rate=lr_rate,
+                update_type=args.update_type,
+                device=str(device),
+                save_dir=os.path.join(
+                    args.output_dir,
+                    "server_initial"
+                ),
                 kl_weight=vae_kl_weight
             )
 
-
-            initial_trainer.run()
-
+            initial_trainer.run(
+                bootstrap_loader,
+                server_val_loader
+            )
 
             global_model.load_state_dict(
-                initial_trainer.model.state_dict()
+                initial_trainer.get_parameters()
             )
 
+            logging.info(
+                "[Initial Global Training] "
+                "Initial global model weights created successfully."
+            )
 
-            # =================================================
-            # GLOBAL AGGREGATOR
-            # =================================================
+            # =====================================================
+            # FEDOPT AGGREGATOR
+            # =====================================================
 
-            aggregator = GlobalAggregator(
-                global_model,
+            global_aggregator = GlobalAggregator(
+                model=global_model,
                 update_type=args.update_type,
-                server_lr=args.server_lr
+                server_lr=args.server_lr,
+                max_server_update_norm=1.0
             )
 
-
-            # =================================================
+            # =====================================================
             # SECURITY BUFFER
-            # =================================================
+            # =====================================================
 
             sec_buffer_tracker = SecurityBuffer(
-
+                global_model=global_model,
                 window_size=5,
-
-                latency_threshold=
-                    args.latency_threshold,
-
+                latency_threshold=args.latency_threshold,
                 alpha=0.2,
-
                 beta=0.01
             )
 
-
-            # =================================================
-            # CARRYOVER UPDATES
-            # =================================================
+            # =====================================================
+            # DELAYED UPDATES
+            # =====================================================
+            #
+            # These updates were validated during the PREVIOUS
+            # round and are eligible for aggregation in THIS round.
+            #
+            # They must NEVER be aggregated in the round in which
+            # they were first received.
+            #
+            # =====================================================
 
             carryover_updates = []
 
-
-            # =================================================
+            # =====================================================
             # ROUND HISTORY
-            # =================================================
+            # =====================================================
 
             run_round_history = []
 
-
-            # =================================================
-            # CLIENT AUC HISTORY
-            # =================================================
+            # =====================================================
+            # CLIENT-WISE AUC HISTORY
+            # =====================================================
 
             client_auc_history = []
 
+            # =====================================================
+            # TRAINING ROUNDS
+            # =====================================================
 
-            # =================================================
-            # FEDERATED ROUNDS
-            # =================================================
-
-            for round_number in range(
-                1,
-                num_rounds + 1
+            for round_idx in range(
+                num_rounds
             ):
 
                 round_start_time = time.time()
 
-
-                logger.info(
-                    "\n"
-                    + "-" * 80
+                round_number = (
+                    round_idx + 1
                 )
 
-                logger.info(
-                    f"{model_type} | "
-                    f"Run {run + 1}/{num_runs} | "
-                    f"Round {round_number}/{num_rounds}"
+                logging.info(
+                    f"[Run {run + 1} | Model {model_type}] "
+                    f"--- Round {round_number}/{num_rounds} ---"
                 )
 
-                logger.info(
-                    "-" * 80
+                # -------------------------------------------------
+                # Baseline global validation MSE
+                # -------------------------------------------------
+
+                global_mse = evaluate_global_mse(
+                    global_aggregator.model,
+                    server_val_loader,
+                    device=device
                 )
 
+                logging.info(
+                    f"[Round {round_number}] "
+                    f"Pre-Aggregation Global Val MSE: "
+                    f"{global_mse:.6f}"
+                )
 
                 # =================================================
-                # PRE-AGGREGATION GLOBAL MSE
+                # STEP A:
+                # OLD DELAYED UPDATES
                 # =================================================
 
-                pre_global_mse = evaluate_global_mse(
-                    global_model,
-                    server_validation_loader,
-                    device
-                )
-
-
-                logger.info(
-                    f"Pre-aggregation Global MSE: "
-                    f"{pre_global_mse:.6f}"
-                )
-
-
-                # =================================================
-                # RELEASE PREVIOUS CARRYOVER UPDATES
-                # =================================================
+                aggregation_updates = []
 
                 previous_carryover_count = len(
                     carryover_updates
                 )
 
+                if carryover_updates:
 
-                aggregation_updates = []
-
-
-                for delayed_update in carryover_updates:
-
-                    delayed_update_copy = copy.deepcopy(
-                        delayed_update
+                    logging.info(
+                        f"[Round {round_number}] "
+                        f"Releasing "
+                        f"{len(carryover_updates)} "
+                        f"validated delayed updates "
+                        f"from previous round."
                     )
 
+                    for update in carryover_updates:
 
-                    route_type = delayed_update_copy.get(
-                        "route_type",
-                        "Secondary"
-                    )
-
-
-                    if route_type == "Secondary":
-
-                        factor = (
-                            secondary_weight_factor
+                        update = copy.deepcopy(
+                            update
                         )
 
-                    else:
-
-                        factor = (
-                            quarantine_weight_factor
+                        route = update.get(
+                            "aggregation_route",
+                            "SECONDARY_ACCEPTED"
                         )
 
+                        # -------------------------------------------------
+                        # Preserve already assigned delayed weight factor
+                        # -------------------------------------------------
 
-                    original_weight = (
-                        delayed_update_copy.get(
-                            "weight",
-                            1.0
+                        if route == "QUARANTINE_ACCEPTED":
+
+                            update["weight_factor"] = (
+                                quarantine_weight_factor
+                            )
+
+                        else:
+
+                            update["weight_factor"] = (
+                                secondary_weight_factor
+                            )
+
+                        update[
+                            "aggregation_round"
+                        ] = round_number
+
+                        aggregation_updates.append(
+                            update
                         )
-                    )
 
+                        logging.info(
+                            f"[Carryover Release] "
+                            f"Client "
+                            f"{update.get('client_id', 'unknown')} | "
+                            f"Route: {route} | "
+                            f"Weight Factor: "
+                            f"{update['weight_factor']:.2f} | "
+                            f"Aggregating in Round "
+                            f"{round_number}"
+                        )
 
-                    delayed_update_copy[
-                        "weight"
-                    ] = max(
-                        minimum_weight_factor,
-                        original_weight * factor
-                    )
-
-
-                    aggregation_updates.append(
-                        delayed_update_copy
-                    )
-
+                # IMPORTANT:
+                # Clear carryover now.
+                #
+                # New delayed updates generated during THIS round
+                # will be placed into a NEW carryover list below.
 
                 carryover_updates = []
 
-
                 # =================================================
-                # CURRENT ROUND UPDATES
-                # =================================================
-
-                current_round_updates = []
-
-
-                # =================================================
+                # STEP B:
                 # CLIENT LOCAL TRAINING
                 # =================================================
 
-                for client in client_data:
+                incoming_updates = []
 
-                    client_id = client[
-                        "device"
-                    ]
+                for client in client_info:
 
-
-                    logger.info(
-                        f"Training {client_id}"
-                    )
-
-
-                    # ---------------------------------------------
-                    # LOCAL MODEL
-                    # ---------------------------------------------
-
-                    local_model = copy.deepcopy(
-                        global_model
-                    )
-
-
-                    # ---------------------------------------------
-                    # CLIENT TRAINER
-                    # ---------------------------------------------
+                    c_start = time.time()
 
                     device_trainer = ClientTrainer(
-
-                        model=local_model,
-
-                        train_loader=
-                            client["train_loader"],
-
-                        val_loader=
-                            client["validation_loader"],
-
-                        device=device,
-
-                        epochs=epoch,
-
-                        lr=lr_rate,
-
+                        model=global_aggregator.model,
+                        client_id=client["device"],
+                        save_dir=client["save_dir"],
+                        epoch=epoch,
+                        lr_rate=lr_rate,
+                        update_type=args.update_type,
+                        device=str(device),
                         kl_weight=vae_kl_weight
                     )
 
-
-                    # ---------------------------------------------
-                    # TRAINING TIME
-                    # ---------------------------------------------
-
-                    compute_start = time.time()
-
-
-                    device_trainer.run()
-
+                    device_trainer.run(
+                        client["train_loader"],
+                        client["valid_loader"]
+                    )
 
                     compute_time = (
                         time.time()
-                        - compute_start
+                        - c_start
                     )
 
-
-                    # ---------------------------------------------
-                    # TRAINING TIME FROM TRAINER
-                    # ---------------------------------------------
-
-                    train_time = (
+                    local_train_time = (
                         device_trainer.train_time
                     )
 
-
-                    # ---------------------------------------------
-                    # COMMUNICATION TIME
-                    # ---------------------------------------------
-
-                    communication_time = (
-                        max(
-                            0.0,
-                            compute_time - train_time
-                        )
-                    )
-
-
-                    # ---------------------------------------------
-                    # TOTAL ARRIVAL LATENCY
-                    # ---------------------------------------------
-
-                    arrival_latency = (
+                    total_arrival_latency = (
                         compute_time
-                        + communication_time
+                        + client["sim_comm_time"]
                     )
 
-
-                    # ---------------------------------------------
-                    # UPDATE
-                    # ---------------------------------------------
+                    raw_weights = copy.deepcopy(
+                        device_trainer.get_parameters()
+                    )
 
                     update = {
-
-                        "device":
-                            client_id,
+                        "client_id":
+                            client["device"],
 
                         "weights":
-                            copy.deepcopy(
-                                device_trainer.model.state_dict()
-                            ),
-
-                        "weight":
-                            float(
-                                client["dataset_size"]
-                            ),
+                            raw_weights,
 
                         "arrival_time":
-                            arrival_latency,
+                            total_arrival_latency,
 
                         "train_time":
-                            train_time,
+                            local_train_time,
 
                         "dataset_size":
-                            client["dataset_size"],
+                            device_trainer.dataset_size,
 
                         "val_mse_list":
-                            getattr(
-                                device_trainer,
-                                "val_mse_list",
-                                []
+                            copy.deepcopy(
+                                device_trainer.val_mse_list
                             ),
 
                         "val_loss":
                             device_trainer.val_loss,
 
                         "val_variance":
-                            getattr(
-                                device_trainer,
-                                "val_variance",
-                                0.0
-                            ),
+                            device_trainer.val_loss_variance,
 
                         "train_loss":
                             device_trainer.train_loss,
 
                         "reconstruction_loss":
-                            getattr(
-                                device_trainer,
-                                "reconstruction_loss",
-                                0.0
-                            ),
+                            device_trainer.reconstruction_loss,
 
                         "kl_loss":
-                            getattr(
-                                device_trainer,
-                                "kl_loss",
-                                0.0
-                            )
+                            device_trainer.kl_loss
                     }
 
-
-                    # =================================================
-                    # TIMING ATTACK
-                    # =================================================
+                    # -------------------------------------------------
+                    # Client-3 = timing attacker
+                    #
+                    # Round 1:
+                    #     CLEAN
+                    #
+                    # Round 2:
+                    #     CLEAN
+                    #
+                    # Round 3 onward:
+                    #     TIMING ATTACK
+                    #
+                    # This provides the two clean historical timing
+                    # observations required by SecurityBuffer.
+                    # -------------------------------------------------
 
                     if (
-
-                        client_id
+                        client["device"]
                         ==
                         TIMING_ATTACK_CLIENT
-
-                        and
-
-                        round_number
-                        >=
-                        TIMING_ATTACK_START_ROUND
-
                     ):
 
-                        update = manipulate_update(
-                            update,
-                            attack_type="timing"
-                        )
+                        if (
+                            round_number
+                            >=
+                            TIMING_ATTACK_START_ROUND
+                        ):
 
-                        logger.info(
-                            f"{client_id}: "
-                            f"TIMING ATTACK ACTIVE"
-                        )
+                            update = manipulate_update(
+                                update,
+                                attack_type="timing"
+                            )
+
+                            logging.warning(
+                                f"[ATTACK] "
+                                f"Client-3 malicious update "
+                                f"generated | "
+                                f"Round: "
+                                f"{round_number} | "
+                                f"Attack Type: "
+                                f"{update.get('attack_type', 'unknown')} | "
+                                f"Parameter: "
+                                f"{update.get('attack_parameter', 'unknown')}"
+                            )
+
+                        else:
+
+                            update = manipulate_update(
+                                update,
+                                attack_type="none"
+                            )
+
+                            logging.info(
+                                f"[ATTACK WARM-UP] "
+                                f"Client-3 remains CLEAN | "
+                                f"Round: "
+                                f"{round_number} | "
+                                f"Timing history is being collected."
+                            )
 
                     else:
 
@@ -1468,388 +1961,416 @@ def main():
                             attack_type="none"
                         )
 
-
-                    # =================================================
-                    # COMET CLIENT METRICS
-                    # =================================================
-
-                    client_comet_metrics = {
-
-                        f"{client_id}_train_loss":
-                            float(
-                                device_trainer.train_loss
-                            ),
-
-                        f"{client_id}_val_loss":
-                            float(
-                                device_trainer.val_loss
-                            ),
-
-                        f"{client_id}_reconstruction_loss":
-                            float(
-                                getattr(
-                                    device_trainer,
-                                    "reconstruction_loss",
-                                    0.0
-                                )
-                            ),
-
-                        f"{client_id}_kl_loss":
-                            float(
-                                getattr(
-                                    device_trainer,
-                                    "kl_loss",
-                                    0.0
-                                )
-                            ),
-
-                        f"{client_id}_train_time":
-                            float(train_time),
-
-                        f"{client_id}_compute_time":
-                            float(compute_time),
-
-                        f"{client_id}_arrival_latency":
-                            float(arrival_latency)
-                    }
-
-
-                    experiment.log_metrics(
-                        client_comet_metrics,
-                        step=round_number
-                    )
-
-
-                    # =================================================
-                    # SECURITY BUFFER COLLECTION
-                    # =================================================
-
-                    current_round_updates.append(
+                    incoming_updates.append(
                         update
                     )
 
+                    logging.info(
+                        f"[Client {client['device']}] "
+                        f"Update prepared | "
+                        f"Dataset: "
+                        f"{device_trainer.dataset_size} | "
+                        f"Train Time: "
+                        f"{local_train_time:.2f}s | "
+                        f"Arrival Latency: "
+                        f"{total_arrival_latency:.2f}s | "
+                        f"Val MSE: "
+                        f"{device_trainer.val_loss:.6f}"
+                    )
 
                 # =================================================
+                # STEP C:
                 # SECURITY BUFFER ROUTING
                 # =================================================
+                #
+                # ready_updates:
+                #     ONLY updates eligible for CURRENT round.
+                #
+                # buffered updates:
+                #     NOT eligible for CURRENT aggregation.
+                #
+                # =================================================
 
-                routed_updates = (
-                    sec_buffer_tracker
-                    .collect_current_round_updates(
-                        current_round_updates
+                ready_updates = (
+                    sec_buffer_tracker.collect_current_round_updates(
+                        incoming_updates=incoming_updates,
+                        global_model=global_aggregator.model,
+                        val_loader=server_val_loader,
+                        criterion=criterion,
+                        global_mse=global_mse,
+                        device=device
                     )
                 )
 
-
                 # =================================================
-                # DIRECT UPDATES
+                # STEP D:
+                # CURRENT ROUND DIRECT UPDATES
                 # =================================================
 
                 direct_current_updates = []
 
+                for update in ready_updates:
 
-                for update in routed_updates:
-
-                    route = update.get(
-                        "route",
-                        update.get(
-                            "route_type",
-                            "Direct"
-                        )
+                    update = copy.deepcopy(
+                        update
                     )
 
+                    route = update.get(
+                        "aggregation_route",
+                        "DIRECT"
+                    )
 
-                    if route == "Direct":
+                    # -------------------------------------------------
+                    # Only DIRECT is allowed in current round
+                    # -------------------------------------------------
 
-                        update_copy = copy.deepcopy(
+                    if route == "DIRECT":
+
+                        update["weight_factor"] = (
+                            direct_weight_factor
+                        )
+
+                        update[
+                            "aggregation_route"
+                        ] = "DIRECT"
+
+                        update[
+                            "aggregation_round"
+                        ] = round_number
+
+                        direct_current_updates.append(
                             update
                         )
 
-                        update_copy[
-                            "weight"
-                        ] = max(
-                            minimum_weight_factor,
-                            update_copy.get(
-                                "weight",
-                                1.0
-                            )
-                            * direct_weight_factor
+                        logging.info(
+                            f"[Current Round Direct] "
+                            f"Client "
+                            f"{update.get('client_id', 'unknown')} | "
+                            f"Weight Factor: 1.00"
                         )
 
-                        direct_current_updates.append(
-                            update_copy
-                        )
+                    else:
 
+                        logging.info(
+                            f"[Current Round] "
+                            f"Non-direct ready update from "
+                            f"Client "
+                            f"{update.get('client_id', 'unknown')} "
+                            f"was NOT aggregated immediately."
+                        )
 
                 # =================================================
-                # ADD DIRECT UPDATES TO AGGREGATION
+                # STEP E:
+                # VALIDATE CURRENT BUFFERED UPDATES
+                # =================================================
+
+                secondary_updates_for_next_round = []
+
+                remaining_buffer = []
+
+                current_secondary_count = 0
+
+                current_quarantine_count = 0
+
+                current_dropped_count = 0
+
+                for buffered_update in list(
+                    sec_buffer_tracker.buffer
+                ):
+
+                    client_id = buffered_update.get(
+                        "client_id",
+                        "unknown"
+                    )
+
+                    buffer_route = buffered_update.get(
+                        "aggregation_route",
+                        "SECONDARY_CHECK"
+                    )
+
+                    # -------------------------------------------------
+                    # Determine validation type
+                    # -------------------------------------------------
+
+                    if buffer_route == "QUARANTINE":
+
+                        route_type = "QUARANTINE"
+
+                        current_quarantine_count += 1
+
+                    else:
+
+                        route_type = "SECONDARY"
+
+                        current_secondary_count += 1
+
+                    # -------------------------------------------------
+                    # Every delayed update must be validated before
+                    # becoming eligible for next-round aggregation.
+                    # -------------------------------------------------
+
+                    (
+                        accepted,
+                        weight_factor,
+                        server_val_mse,
+                        validation_route
+                    ) = validate_delayed_update(
+                        update=buffered_update,
+                        global_model=global_aggregator.model,
+                        server_val_loader=server_val_loader,
+                        current_global_mse=global_mse,
+                        route_type=route_type,
+                        device=device
+                    )
+
+                    buffered_update[
+                        "server_validation_mse"
+                    ] = server_val_mse
+
+                    # =================================================
+                    # SECONDARY ACCEPTED
+                    # =================================================
+
+                    if (
+                        accepted
+                        and
+                        route_type == "SECONDARY"
+                    ):
+
+                        buffered_update[
+                            "weight_factor"
+                        ] = secondary_weight_factor
+
+                        buffered_update[
+                            "aggregation_route"
+                        ] = "SECONDARY_ACCEPTED"
+
+                        buffered_update[
+                            "aggregation_round"
+                        ] = round_number + 1
+
+                        secondary_updates_for_next_round.append(
+                            buffered_update
+                        )
+
+                        logging.info(
+                            f"[Secondary Validation] "
+                            f"Client {client_id} ACCEPTED | "
+                            f"Server Val MSE: "
+                            f"{server_val_mse:.6f} | "
+                            f"Weight Factor: 0.70 | "
+                            f"Scheduled for Round "
+                            f"{round_number + 1}"
+                        )
+
+                    # =================================================
+                    # QUARANTINE ACCEPTED
+                    # =================================================
+
+                    elif (
+                        accepted
+                        and
+                        route_type == "QUARANTINE"
+                    ):
+
+                        buffered_update[
+                            "weight_factor"
+                        ] = quarantine_weight_factor
+
+                        buffered_update[
+                            "aggregation_route"
+                        ] = "QUARANTINE_ACCEPTED"
+
+                        buffered_update[
+                            "aggregation_round"
+                        ] = round_number + 1
+
+                        secondary_updates_for_next_round.append(
+                            buffered_update
+                        )
+
+                        logging.info(
+                            f"[Quarantine Validation] "
+                            f"Client {client_id} ACCEPTED | "
+                            f"Server Val MSE: "
+                            f"{server_val_mse:.6f} | "
+                            f"Weight Factor: 0.30 | "
+                            f"Scheduled for Round "
+                            f"{round_number + 1}"
+                        )
+
+                    # =================================================
+                    # REJECTED / DROPPED
+                    # =================================================
+
+                    else:
+
+                        current_dropped_count += 1
+
+                        logging.warning(
+                            f"[Security Validation] "
+                            f"Client {client_id} DROPPED | "
+                            f"Route: {route_type} | "
+                            f"Server Val MSE: "
+                            f"{server_val_mse:.6f}"
+                        )
+
+                # -----------------------------------------------------
+                # Validated updates have now left the SecurityBuffer.
+                # -----------------------------------------------------
+
+                sec_buffer_tracker.buffer = (
+                    remaining_buffer
+                )
+
+                # =================================================
+                # STEP F:
+                # SAVE DELAYED UPDATES FOR NEXT ROUND
+                # =================================================
+
+                carryover_updates = (
+                    secondary_updates_for_next_round
+                )
+
+                # =================================================
+                # STEP G:
+                # CURRENT ROUND AGGREGATION
                 # =================================================
 
                 aggregation_updates.extend(
                     direct_current_updates
                 )
 
+                if aggregation_updates:
 
-                # =================================================
-                # DELAYED UPDATE VALIDATION
-                # =================================================
-
-                secondary_accepted = 0
-
-                quarantine_accepted = 0
-
-                dropped_updates = 0
-
-                secondary_updates_for_next_round = []
-
-                quarantine_updates_for_next_round = []
-
-
-                # =================================================
-                # VALIDATE BUFFERED UPDATES
-                # =================================================
-
-                buffered_updates = (
-                    sec_buffer_tracker.buffer
-                )
-
-
-                for delayed_update in buffered_updates:
-
-                    route_type = delayed_update.get(
-                        "route_type",
-                        delayed_update.get(
-                            "route",
-                            "Secondary"
-                        )
+                    global_aggregator.aggregate(
+                        client_updates=aggregation_updates
                     )
 
-
-                    accepted = validate_delayed_update(
-
-                        global_model,
-
-                        pre_global_mse,
-
-                        delayed_update,
-
-                        server_validation_loader,
-
-                        device,
-
-                        validation_rejection_ratio
-                    )
-
-
-                    if accepted:
-
-                        delayed_copy = copy.deepcopy(
-                            delayed_update
-                        )
-
-
-                        if route_type == "Secondary":
-
-                            delayed_copy[
-                                "route_type"
-                            ] = "Secondary"
-
-                            secondary_updates_for_next_round.append(
-                                delayed_copy
-                            )
-
-                            secondary_accepted += 1
-
-
-                        else:
-
-                            delayed_copy[
-                                "route_type"
-                            ] = "Quarantine"
-
-                            quarantine_updates_for_next_round.append(
-                                delayed_copy
-                            )
-
-                            quarantine_accepted += 1
-
-
-                    else:
-
-                        dropped_updates += 1
-
-
-                # =================================================
-                # CARRY OVER TO NEXT ROUND
-                # =================================================
-
-                carryover_updates.extend(
-                    secondary_updates_for_next_round
-                )
-
-                carryover_updates.extend(
-                    quarantine_updates_for_next_round
-                )
-
-
-                # =================================================
-                # CLEAR CURRENT SECURITY BUFFER
-                # =================================================
-
-                sec_buffer_tracker.buffer.clear()
-
-
-                # =================================================
-                # FEDOPT AGGREGATION
-                # =================================================
-
-                if len(aggregation_updates) > 0:
-
-                    global_model = aggregator.aggregate(
-                        aggregation_updates
-                    )
-
-                    global_model = global_model.to(
-                        device
+                    logging.info(
+                        f"[Round {round_number}] "
+                        f"FedOpt aggregation completed | "
+                        f"Previous delayed: "
+                        f"{previous_carryover_count} | "
+                        f"Current DIRECT: "
+                        f"{len(direct_current_updates)} | "
+                        f"Total Aggregated: "
+                        f"{len(aggregation_updates)}"
                     )
 
                 else:
 
-                    logger.warning(
-                        "No updates available "
-                        "for aggregation."
+                    logging.warning(
+                        f"[Round {round_number}] "
+                        "No updates available for aggregation."
                     )
 
-
                 # =================================================
-                # POST-AGGREGATION MSE
-                # =================================================
-
-                post_global_mse = evaluate_global_mse(
-                    global_model,
-                    server_validation_loader,
-                    device
-                )
-
-
-                # =================================================
-                # GLOBAL TEST METRICS
-                # =================================================
-
-                abnormal_test_loaders = [
-
-                    client["abnormal_test_loader"]
-
-                    for client in client_data
-                ]
-
-
-                normal_test_loaders = [
-
-                    client["normal_test_loader"]
-
-                    for client in client_data
-                ]
-
-
-                normal_test_dataset = ConcatDataset(
-                    [
-                        loader.dataset
-                        for loader in normal_test_loaders
-                    ]
-                )
-
-
-                abnormal_test_dataset = ConcatDataset(
-                    [
-                        loader.dataset
-                        for loader in abnormal_test_loaders
-                    ]
-                )
-
-
-                global_normal_test_loader = DataLoader(
-                    normal_test_dataset,
-                    batch_size=batch_size,
-                    shuffle=False
-                )
-
-
-                global_abnormal_test_loader = DataLoader(
-                    abnormal_test_dataset,
-                    batch_size=batch_size,
-                    shuffle=False
-                )
-
-
-                global_metrics = evaluate_anomaly_detection(
-
-                    global_model,
-
-                    global_normal_test_loader,
-
-                    global_abnormal_test_loader,
-
-                    device
-                )
-
-
-                # =================================================
-                # CLIENT-WISE EVALUATION
-                # =================================================
-
-                client_wise_metrics = evaluate_clientwise_auc(
-
-                    global_model,
-
-                    client_data,
-
-                    device
-                )
-
-
-                client_auc_history.append(
-                    {
-                        "round":
-                            round_number,
-
-                        "metrics":
-                            client_wise_metrics
-                    }
-                )
-
-
-                # =================================================
-                # MEAN CLIENT AUC
-                # =================================================
-
-                if len(client_wise_metrics) > 0:
-
-                    mean_client_auc = np.mean(
-                        [
-                            metrics["auc"]
-                            for metrics
-                            in client_wise_metrics.values()
-                        ]
-                    )
-
-                else:
-
-                    mean_client_auc = 0.5
-
-
-                # =================================================
-                # ROUND DURATION
+                # STEP H:
+                # ROUND EVALUATION
                 # =================================================
 
                 round_duration = (
                     time.time()
-                    - round_start_time
+                    -
+                    round_start_time
                 )
 
+                # -------------------------------------------------
+                # Post aggregation global validation MSE
+                # -------------------------------------------------
+
+                post_eval_mse = (
+                    evaluate_global_mse(
+                        global_aggregator.model,
+                        server_val_loader,
+                        device=device
+                    )
+                )
+
+                # -------------------------------------------------
+                # Global combined test evaluation
+                # -------------------------------------------------
+
+                global_metrics = (
+                    evaluate_anomaly_detection(
+                        global_aggregator.model,
+                        server_test_loader,
+                        device=device
+                    )
+                )
 
                 # =================================================
-                # ROUND HISTORY
+                # CLIENT-WISE GLOBAL MODEL EVALUATION
+                # =================================================
+
+                client_wise_metrics = (
+                    evaluate_clientwise_auc(
+                        global_aggregator.model,
+                        client_info,
+                        device=device
+                    )
+                )
+
+                # -------------------------------------------------
+                # Store round client AUCs
+                # -------------------------------------------------
+
+                round_client_auc = {}
+
+                for client_id, metrics in (
+                    client_wise_metrics.items()
+                ):
+
+                    round_client_auc[
+                        client_id
+                    ] = metrics["auc"]
+
+                    client_auc_history.append({
+
+                        "run":
+                            run + 1,
+
+                        "model_type":
+                            model_type,
+
+                        "round":
+                            round_number,
+
+                        "client":
+                            client_id,
+
+                        "auc":
+                            metrics["auc"],
+
+                        "precision":
+                            metrics["precision"],
+
+                        "recall":
+                            metrics["recall"],
+
+                        "f1":
+                            metrics["f1"]
+                    })
+
+                # -------------------------------------------------
+                # Mean client AUC
+                # -------------------------------------------------
+
+                mean_client_auc = (
+                    float(
+                        np.mean(
+                            list(
+                                round_client_auc.values()
+                            )
+                        )
+                    )
+                    if round_client_auc
+                    else 0.0
+                )
+
+                # =================================================
+                # ROUND RECORD
                 # =================================================
 
                 round_record = {
@@ -1857,38 +2378,23 @@ def main():
                     "round":
                         round_number,
 
-                    "pre_global_mse":
-                        pre_global_mse,
+                    "global_val_mse":
+                        post_eval_mse,
 
-                    "post_global_mse":
-                        post_global_mse,
-
-                    "precision":
+                    "test_precision":
                         global_metrics["precision"],
 
-                    "recall":
+                    "test_recall":
                         global_metrics["recall"],
 
-                    "f1":
+                    "test_f1":
                         global_metrics["f1_score"],
 
-                    "auc":
+                    "test_auc":
                         global_metrics["auc_roc"],
 
-                    "threshold":
-                        global_metrics["threshold"],
-
-                    "tp":
-                        global_metrics["tp"],
-
-                    "fp":
-                        global_metrics["fp"],
-
-                    "tn":
-                        global_metrics["tn"],
-
-                    "fn":
-                        global_metrics["fn"],
+                    "client_wise_auc":
+                        round_client_auc,
 
                     "mean_client_auc":
                         mean_client_auc,
@@ -1898,696 +2404,510 @@ def main():
                             direct_current_updates
                         ),
 
-                    "carryover_updates":
-                        previous_carryover_count,
-
                     "aggregated_updates":
                         len(
                             aggregation_updates
                         ),
 
+                    "secondary_updates":
+                        len(
+                            secondary_updates_for_next_round
+                        ),
+
                     "secondary_accepted":
-                        secondary_accepted,
+                        sum(
+                            1
+                            for u in
+                            secondary_updates_for_next_round
+                            if u.get(
+                                "aggregation_route"
+                            )
+                            ==
+                            "SECONDARY_ACCEPTED"
+                        ),
 
                     "quarantine_accepted":
-                        quarantine_accepted,
+                        sum(
+                            1
+                            for u in
+                            secondary_updates_for_next_round
+                            if u.get(
+                                "aggregation_route"
+                            )
+                            ==
+                            "QUARANTINE_ACCEPTED"
+                        ),
 
                     "dropped_updates":
-                        dropped_updates,
+                        current_dropped_count,
 
                     "buffered_updates":
                         len(
-                            buffered_updates
+                            sec_buffer_tracker.buffer
                         ),
 
-                    "round_duration":
-                        round_duration,
-
-                    "client_metrics":
-                        client_wise_metrics
+                    "accepted_updates":
+                        len(
+                            aggregation_updates
+                        )
                 }
-
 
                 run_round_history.append(
                     round_record
                 )
 
-
-                # =================================================
-                # COMET ROUND-LEVEL METRICS
-                # =================================================
-
-                experiment.log_metrics({
-
-                    "pre_global_mse":
-                        float(pre_global_mse),
-
-                    "global_val_mse":
-                        float(post_global_mse),
-
-                    "test_precision":
-                        float(
-                            global_metrics["precision"]
-                        ),
-
-                    "test_recall":
-                        float(
-                            global_metrics["recall"]
-                        ),
-
-                    "test_f1":
-                        float(
-                            global_metrics["f1_score"]
-                        ),
-
-                    "test_auc":
-                        float(
-                            global_metrics["auc_roc"]
-                        ),
-
-                    "anomaly_threshold":
-                        float(
-                            global_metrics["threshold"]
-                        ),
-
-                    "true_positive":
-                        int(
-                            global_metrics["tp"]
-                        ),
-
-                    "false_positive":
-                        int(
-                            global_metrics["fp"]
-                        ),
-
-                    "true_negative":
-                        int(
-                            global_metrics["tn"]
-                        ),
-
-                    "false_negative":
-                        int(
-                            global_metrics["fn"]
-                        ),
-
-                    "mean_client_auc":
-                        float(mean_client_auc),
-
-                    "direct_updates":
-                        int(
-                            len(
-                                direct_current_updates
-                            )
-                        ),
-
-                    "carryover_updates":
-                        int(
-                            previous_carryover_count
-                        ),
-
-                    "aggregated_updates":
-                        int(
-                            len(
-                                aggregation_updates
-                            )
-                        ),
-
-                    "secondary_accepted":
-                        int(
-                            secondary_accepted
-                        ),
-
-                    "quarantine_accepted":
-                        int(
-                            quarantine_accepted
-                        ),
-
-                    "dropped_updates":
-                        int(
-                            dropped_updates
-                        ),
-
-                    "buffered_updates":
-                        int(
-                            len(buffered_updates)
-                        ),
-
-                    "round_duration":
-                        float(round_duration)
-                },
-                step=round_number
+                logging.info(
+                    f"[Round {round_number} Finished] "
+                    f"Val MSE: {post_eval_mse:.6f} | "
+                    f"Global F1: {global_metrics['f1_score']:.4f} | "
+                    f"Global AUC: {global_metrics['auc_roc']:.4f} | "
+                    f"Mean Client AUC: {mean_client_auc:.4f} | "
+                    f"Current DIRECT: "
+                    f"{len(direct_current_updates)} | "
+                    f"Previous Delayed Aggregated: "
+                    f"{previous_carryover_count} | "
+                    f"Total Aggregated: "
+                    f"{len(aggregation_updates)} | "
+                    f"Scheduled Next Round: "
+                    f"{len(secondary_updates_for_next_round)} | "
+                    f"Dropped: "
+                    f"{current_dropped_count} | "
+                    f"Buffered: "
+                    f"{len(sec_buffer_tracker.buffer)} | "
+                    f"Duration: "
+                    f"{round_duration:.2f}s"
                 )
 
+            # =====================================================
+            # SAVE RUN RESULTS
+            # =====================================================
 
-                # =================================================
-                # COMET CLIENT-WISE METRICS
-                # =================================================
+            all_experiment_results[
+                model_type
+            ].append(
+                run_round_history
+            )
 
-                client_auc_comet_metrics = {}
-
-
-                for client_id, metrics in (
-                    client_wise_metrics.items()
-                ):
-
-                    client_auc_comet_metrics.update({
-
-                        f"{client_id}_auc":
-                            float(
-                                metrics["auc"]
-                            ),
-
-                        f"{client_id}_precision":
-                            float(
-                                metrics["precision"]
-                            ),
-
-                        f"{client_id}_recall":
-                            float(
-                                metrics["recall"]
-                            ),
-
-                        f"{client_id}_f1":
-                            float(
-                                metrics["f1"]
-                            )
-                    })
-
-
-                experiment.log_metrics(
-                    client_auc_comet_metrics,
-                    step=round_number
-                )
-
-
-                # =================================================
-                # LOGGING
-                # =================================================
-
-                logger.info(
-                    f"Round {round_number} Results | "
-                    f"Precision={global_metrics['precision']:.4f} | "
-                    f"Recall={global_metrics['recall']:.4f} | "
-                    f"F1={global_metrics['f1_score']:.4f} | "
-                    f"AUC={global_metrics['auc_roc']:.4f}"
-                )
-
-
-                logger.info(
-                    f"Global MSE | "
-                    f"Pre={pre_global_mse:.6f} | "
-                    f"Post={post_global_mse:.6f}"
-                )
-
-
-                logger.info(
-                    f"Routing | "
-                    f"Direct={len(direct_current_updates)} | "
-                    f"Aggregated={len(aggregation_updates)} | "
-                    f"Secondary={secondary_accepted} | "
-                    f"Quarantine={quarantine_accepted} | "
-                    f"Dropped={dropped_updates}"
-                )
-
-
-                logger.info(
-                    f"Mean Client AUC="
-                    f"{mean_client_auc:.4f}"
-                )
-
-
-            # ====================================================
-            # FINAL RUN METRICS
-            # ====================================================
-
-            if len(run_round_history) > 0:
-
-                final_record = (
-                    run_round_history[-1]
-                )
-
-
-                final_f1 = (
-                    final_record["f1"]
-                )
-
-                final_auc = (
-                    final_record["auc"]
-                )
-
-                final_mse = (
-                    final_record["post_global_mse"]
-                )
-
-
-            else:
-
-                final_f1 = 0.0
-
-                final_auc = 0.5
-
-                final_mse = float("inf")
-
-
-            # ====================================================
-            # COMET FINAL RUN METRICS
-            # ====================================================
-
-            experiment.log_metrics({
-
-                "final_f1":
-                    float(final_f1),
-
-                "final_auc":
-                    float(final_auc),
-
-                "final_global_mse":
-                    float(final_mse),
-
-                "final_mean_client_auc":
-                    float(
-                        run_round_history[-1][
-                            "mean_client_auc"
-                        ]
-                    )
-                    if run_round_history
-                    else 0.5
-            })
-
-
-            # ====================================================
-            # SAVE CLIENT-WISE AUC
-            # ====================================================
-
-            client_auc_rows = []
-
-
-            for round_data in client_auc_history:
-
-                round_number_value = (
-                    round_data["round"]
-                )
-
-
-                for client_id, metrics in (
-                    round_data["metrics"].items()
-                ):
-
-                    client_auc_rows.append({
-
-                        "round":
-                            round_number_value,
-
-                        "client":
-                            client_id,
-
-                        "auc":
-                            metrics["auc"],
-
-                        "precision":
-                            metrics["precision"],
-
-                        "recall":
-                            metrics["recall"],
-
-                        "f1":
-                            metrics["f1"]
-                    })
-
+            # =====================================================
+            # SAVE CLIENT-WISE AUC CSV FOR THIS RUN
+            # =====================================================
 
             client_auc_df = pd.DataFrame(
-                client_auc_rows
+                client_auc_history
             )
 
-
-            client_auc_path = os.path.join(
-
+            client_auc_csv_path = os.path.join(
                 args.output_dir,
-
-                f"{model_type}_run_{run + 1}"
-                "_clientwise_auc.csv"
+                f"{model_type}_run{run + 1}_client_auc_history.csv"
             )
-
 
             client_auc_df.to_csv(
-                client_auc_path,
+                client_auc_csv_path,
                 index=False
             )
 
-
-            # ====================================================
-            # SAVE CHECKPOINT
-            # ====================================================
-
-            checkpoint_path = os.path.join(
-
-                args.output_dir,
-
-                f"{model_type}_run_{run + 1}"
-                "_global_model.pt"
+            logging.info(
+                f"Saved client-wise AUC history to: "
+                f"{client_auc_csv_path}"
             )
 
+            # =====================================================
+            # FINAL ROUND CLIENT-WISE AUC
+            # =====================================================
+
+            if run_round_history:
+
+                final_client_auc = (
+                    run_round_history[-1]
+                    .get(
+                        "client_wise_auc",
+                        {}
+                    )
+                )
+
+                logging.info(
+                    "===================================================="
+                )
+
+                logging.info(
+                    f"[FINAL CLIENT-WISE AUC] "
+                    f"Model: {model_type.upper()} | "
+                    f"Run: {run + 1}"
+                )
+
+                for client_id, auc_value in (
+                    final_client_auc.items()
+                ):
+
+                    logging.info(
+                        f"{client_id}: "
+                        f"AUC = {auc_value:.4f}"
+                    )
+
+                logging.info(
+                    "===================================================="
+                )
+
+            # =====================================================
+            # SAVE CHECKPOINT
+            # =====================================================
+
+            checkpoint_path = os.path.join(
+                args.output_dir,
+                f"{model_type}_run{run + 1}_checkpoint.pth"
+            )
 
             torch.save(
-
-                global_model.state_dict(),
-
+                global_aggregator.model.state_dict(),
                 checkpoint_path
             )
 
-
-            # ====================================================
-            # SAVE RUN RESULTS
-            # ====================================================
-
-            model_results.append({
-
-                "run":
-                    run + 1,
-
-                "seed":
-                    run_seed,
-
-                "final_f1":
-                    final_f1,
-
-                "final_auc":
-                    final_auc,
-
-                "final_mse":
-                    final_mse,
-
-                "mean_client_auc":
-                    (
-                        run_round_history[-1][
-                            "mean_client_auc"
-                        ]
-                        if run_round_history
-                        else 0.5
-                    ),
-
-                "round_history":
-                    run_round_history,
-
-                "client_auc_history":
-                    client_auc_history
-            })
-
-
-            # ====================================================
-            # COMET END
-            # ====================================================
-
-            experiment.end()
-
-
-            logger.info(
-                f"Completed {model_type} "
-                f"Run {run + 1}/{num_runs}"
+            logging.info(
+                f"Saved run checkpoint to: "
+                f"{checkpoint_path}"
             )
 
+    # =============================================================
+    # SUMMARY STATISTICS
+    # =============================================================
 
-        # ========================================================
-        # MODEL SUMMARY
-        # ========================================================
+    summary_report = {}
 
-        final_f1_values = [
+    for m_type in (
+        all_experiment_results
+    ):
 
-            result["final_f1"]
-
-            for result in model_results
+        final_f1_scores = [
+            run_data[-1][
+                "test_f1"
+            ]
+            for run_data in (
+                all_experiment_results[
+                    m_type
+                ]
+            )
+            if run_data
         ]
 
-
-        final_auc_values = [
-
-            result["final_auc"]
-
-            for result in model_results
+        final_auc_scores = [
+            run_data[-1][
+                "test_auc"
+            ]
+            for run_data in (
+                all_experiment_results[
+                    m_type
+                ]
+            )
+            if run_data
         ]
 
-
-        final_mse_values = [
-
-            result["final_mse"]
-
-            for result in model_results
+        final_mse_scores = [
+            run_data[-1][
+                "global_val_mse"
+            ]
+            for run_data in (
+                all_experiment_results[
+                    m_type
+                ]
+            )
+            if run_data
         ]
 
+        final_client_auc_runs = []
 
-        mean_client_auc_values = [
+        for run_data in (
+            all_experiment_results[
+                m_type
+            ]
+        ):
 
-            result["mean_client_auc"]
+            if run_data:
 
-            for result in model_results
-        ]
+                final_client_auc_runs.append(
+                    run_data[-1].get(
+                        "client_wise_auc",
+                        {}
+                    )
+                )
 
+        summary_report[
+            m_type
+        ] = {
 
-        model_summary = {
-
-            "final_f1_mean":
-                float(
-                    np.mean(final_f1_values)
-                ),
-
-            "final_f1_std":
-                float(
-                    np.std(final_f1_values)
-                ),
-
-            "final_auc_mean":
-                float(
-                    np.mean(final_auc_values)
-                ),
-
-            "final_auc_std":
-                float(
-                    np.std(final_auc_values)
-                ),
-
-            "final_mse_mean":
-                float(
-                    np.mean(final_mse_values)
-                ),
-
-            "final_mse_std":
-                float(
-                    np.std(final_mse_values)
-                ),
-
-            "mean_client_auc":
+            "mean_f1":
                 float(
                     np.mean(
-                        mean_client_auc_values
+                        final_f1_scores
                     )
-                ),
+                )
+                if final_f1_scores
+                else 0.0,
 
-            "mean_client_auc_std":
+            "std_f1":
                 float(
                     np.std(
-                        mean_client_auc_values
+                        final_f1_scores
                     )
-                ),
+                )
+                if final_f1_scores
+                else 0.0,
 
-            "runs":
-                model_results
+            "mean_auc":
+                float(
+                    np.mean(
+                        final_auc_scores
+                    )
+                )
+                if final_auc_scores
+                else 0.0,
+
+            "std_auc":
+                float(
+                    np.std(
+                        final_auc_scores
+                    )
+                )
+                if final_auc_scores
+                else 0.0,
+
+            "mean_mse":
+                float(
+                    np.mean(
+                        final_mse_scores
+                    )
+                )
+                if final_mse_scores
+                else 0.0,
+
+            "std_mse":
+                float(
+                    np.std(
+                        final_mse_scores
+                    )
+                )
+                if final_mse_scores
+                else 0.0,
+
+            "final_client_wise_auc":
+                final_client_auc_runs
         }
 
+    # =============================================================
+    # SAVE RESULTS
+    # =============================================================
 
-        experiment_results[
-            "models"
-        ][model_type] = model_summary
-
-
-        # ========================================================
-        # MODEL SUMMARY LOG
-        # ========================================================
-
-        logger.info(
-            "\n"
-            + "=" * 80
-        )
-
-        logger.info(
-            f"SUMMARY - {model_type}"
-        )
-
-        logger.info(
-            "=" * 80
-        )
-
-        logger.info(
-            f"Final F1: "
-            f"{model_summary['final_f1_mean']:.4f} "
-            f"+/- "
-            f"{model_summary['final_f1_std']:.4f}"
-        )
-
-        logger.info(
-            f"Final AUC: "
-            f"{model_summary['final_auc_mean']:.4f} "
-            f"+/- "
-            f"{model_summary['final_auc_std']:.4f}"
-        )
-
-        logger.info(
-            f"Final MSE: "
-            f"{model_summary['final_mse_mean']:.6f} "
-            f"+/- "
-            f"{model_summary['final_mse_std']:.6f}"
-        )
-
-        logger.info(
-            f"Mean Client AUC: "
-            f"{model_summary['mean_client_auc']:.4f} "
-            f"+/- "
-            f"{model_summary['mean_client_auc_std']:.4f}"
-        )
-
-
-    # ========================================================
-    # SAVE COMPLETE EXPERIMENT RESULTS
-    # ========================================================
-
-    results_path = os.path.join(
-
+    summary_report_path = os.path.join(
         args.output_dir,
-
         "experiment_execution_results.json"
     )
 
+    output_json_struct = {
+
+        "summary":
+            summary_report,
+
+        "detailed_runs":
+            all_experiment_results,
+
+        "preprocessing": {
+
+            "original_features":
+                int(
+                    bootstrap_server_dataframe.shape[1]
+                ),
+
+            "selected_features":
+                int(
+                    actual_dim_features
+                ),
+
+            "use_log_transform":
+                True,
+
+            "feature_selection":
+                "Unsupervised variance-based selection",
+
+            "scaler":
+                "standard"
+        },
+
+        "vae": {
+
+            "hidden_dimension":
+                32,
+
+            "latent_dimension":
+                shrink_dim,
+
+            "kl_weight":
+                vae_kl_weight
+        },
+
+        "asynchronous_security": {
+
+            "latency_threshold":
+                args.latency_threshold,
+
+            "bootstrap_fraction":
+                bootstrap_fraction,
+
+            "direct_weight_factor":
+                direct_weight_factor,
+
+            "secondary_weight_factor":
+                secondary_weight_factor,
+
+            "quarantine_weight_factor":
+                quarantine_weight_factor,
+
+            "validation_rejection_ratio":
+                validation_rejection_ratio,
+
+            "aggregation_policy":
+                (
+                    "DIRECT updates aggregate in current round; "
+                    "validated SECONDARY and QUARANTINE updates "
+                    "aggregate only in the next round."
+                )
+        },
+
+        "timing_attack_experiment": {
+
+            "attacker_client":
+                TIMING_ATTACK_CLIENT,
+
+            "attack_type":
+                "timing",
+
+            "attack_start_round":
+                TIMING_ATTACK_START_ROUND,
+
+            "warmup_rounds":
+                TIMING_ATTACK_START_ROUND - 1,
+
+            "attack_parameter":
+                "3x training time",
+
+            "purpose":
+                (
+                    "Allow two clean timing observations before "
+                    "activating the controlled timing manipulation."
+                )
+        },
+
+        "client_wise_evaluation": {
+
+            "evaluation_stage":
+                "After FedOpt aggregation",
+
+            "model_used":
+                "Current global model",
+
+            "test_data":
+                "Each client's test_normal.csv + abnormal.csv",
+
+            "metric":
+                "ROC-AUC",
+
+            "clients_per_round":
+                network_size,
+
+            "rounds":
+                num_rounds
+        }
+    }
 
     with open(
-        results_path,
+        summary_report_path,
         "w"
     ) as f:
 
         json.dump(
-            experiment_results,
+            output_json_struct,
             f,
             indent=4
         )
 
+    # =============================================================
+    # FINAL CLIENT AUC CSV
+    # =============================================================
 
-    # ========================================================
-    # SAVE ALL CLIENT-WISE AUC
-    # ========================================================
+    all_client_auc_df = []
 
-    all_client_auc_rows = []
+    for m_type in all_experiment_results:
 
+        for run_index, run_data in enumerate(
+            all_experiment_results[
+                m_type
+            ],
+            start=1
+        ):
 
-    for model_type, model_summary in (
-        experiment_results["models"].items()
-    ):
+            for round_data in run_data:
 
-        for run_result in model_summary["runs"]:
-
-            run_number = (
-                run_result["run"]
-            )
-
-
-            for round_data in (
-                run_result[
-                    "client_auc_history"
-                ]
-            ):
-
-                round_number_value = (
-                    round_data["round"]
+                client_auc_data = (
+                    round_data.get(
+                        "client_wise_auc",
+                        {}
+                    )
                 )
 
-
-                for client_id, metrics in (
-                    round_data[
-                        "metrics"
-                    ].items()
+                for client_id, auc_value in (
+                    client_auc_data.items()
                 ):
 
-                    all_client_auc_rows.append({
+                    all_client_auc_df.append({
 
-                        "model":
-                            model_type,
+                        "model_type":
+                            m_type,
 
                         "run":
-                            run_number,
+                            run_index,
 
                         "round":
-                            round_number_value,
+                            round_data["round"],
 
                         "client":
                             client_id,
 
                         "auc":
-                            metrics["auc"],
-
-                        "precision":
-                            metrics["precision"],
-
-                        "recall":
-                            metrics["recall"],
-
-                        "f1":
-                            metrics["f1"]
+                            auc_value
                     })
 
+    if all_client_auc_df:
 
-    all_client_auc_df = pd.DataFrame(
-        all_client_auc_rows
-    )
+        all_client_auc_df = pd.DataFrame(
+            all_client_auc_df
+        )
 
+        final_client_auc_csv = os.path.join(
+            args.output_dir,
+            "all_client_wise_auc.csv"
+        )
 
-    all_client_auc_path = os.path.join(
+        all_client_auc_df.to_csv(
+            final_client_auc_csv,
+            index=False
+        )
 
-        args.output_dir,
+        logging.info(
+            f"All client-wise AUC results saved to: "
+            f"{final_client_auc_csv}"
+        )
 
-        "all_clientwise_auc.csv"
-    )
+    # =============================================================
+    # COMPLETED
+    # =============================================================
 
-
-    all_client_auc_df.to_csv(
-        all_client_auc_path,
-        index=False
-    )
-
-
-    # ========================================================
-    # COMPLETION
-    # ========================================================
-
-    logger.info(
+    logging.info(
         "\n"
-        + "=" * 80
+        "====================================================\n"
+        "PIPELINE EXECUTION COMPLETED\n"
+        "===================================================="
     )
 
-    logger.info(
-        "EXPERIMENT COMPLETED"
+    logging.info(
+        f"Results Summary saved successfully to: "
+        f"{summary_report_path}"
     )
-
-    logger.info(
-        "=" * 80
-    )
-
-    logger.info(
-        f"Results saved to: "
-        f"{args.output_dir}"
-    )
-
-    logger.info(
-        f"JSON: "
-        f"{results_path}"
-    )
-
-    logger.info(
-        f"Client-wise AUC: "
-        f"{all_client_auc_path}"
-    )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-if __name__ == "__main__":
-
-    main()
+  
