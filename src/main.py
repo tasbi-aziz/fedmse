@@ -63,7 +63,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from comet_logger import (
+from Evaluator.comet_logger import (
     create_experiment,
     log_round_metrics,
     finish_experiment
@@ -2607,6 +2607,7 @@ if __name__ == "__main__":
                 f"Saved run checkpoint to: "
                 f"{checkpoint_path}"
             )
+            finish_experiment(experiment)
 
     # =============================================================
     # SUMMARY STATISTICS
