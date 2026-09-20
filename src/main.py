@@ -1570,6 +1570,23 @@ if __name__ == "__main__":
             set_seeds(
                 run_seed
             )
+            experiment = create_experiment(
+                model_type=model_type,
+                run_number=run + 1,
+                run_seed=run_seed,
+                num_rounds=num_rounds,
+                epoch=epoch,
+                learning_rate=lr_rate,
+                shrink_dim=shrink_dim,
+                batch_size=batch_size,
+                latency_threshold=args.latency_threshold,
+                server_lr=args.server_lr,
+                update_type=args.update_type,
+                network_size=network_size,
+                raw_features=actual_dim_features,
+                timing_attack_client=TIMING_ATTACK_CLIENT,
+                timing_attack_start_round=TIMING_ATTACK_START_ROUND
+              )
 
             logging.info(
                 f"--- Starting Execution "
