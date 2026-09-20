@@ -63,6 +63,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+from comet_logger import (
+    create_experiment,
+    log_round_metrics,
+    finish_experiment
+)
+
 from Trainer.malicious_update_experiment2 import (
     manipulate_update
 )
