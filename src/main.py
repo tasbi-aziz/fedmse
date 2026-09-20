@@ -2478,6 +2478,24 @@ if __name__ == "__main__":
                 run_round_history.append(
                     round_record
                 )
+                log_round_metrics(
+                    experiment=experiment,
+                    round_number=round_number,
+                    global_val_mse=round_record["global_val_mse"],
+                    test_precision=round_record["test_precision"],
+                    test_recall=round_record["test_recall"],
+                    test_f1=round_record["test_f1"],
+                    test_auc=round_record["test_auc"],
+                    mean_client_auc=round_record["mean_client_auc"],
+                    direct_updates=round_record["direct_updates"],
+                    aggregated_updates=round_record["aggregated_updates"],
+                    secondary_updates=round_record["secondary_updates"],
+                    secondary_accepted=round_record["secondary_accepted"],
+                    quarantine_accepted=round_record["quarantine_accepted"],
+                    dropped_updates=round_record["dropped_updates"],
+                    buffered_updates=round_record["buffered_updates"],
+                    round_duration=round_duration
+                )
 
                 logging.info(
                     f"[Round {round_number} Finished] "
