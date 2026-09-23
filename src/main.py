@@ -1537,8 +1537,9 @@ if __name__ == "__main__":
     # MODEL TYPES
     # =============================================================
 
+    # Only the VAE-based Autoencoder is used in this experiment.
+    # Hybrid / Shrink_Autoencoder is not run.
     model_types = [
-        "hybrid",
         "autoencoder"
     ]
 
