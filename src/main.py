@@ -179,9 +179,7 @@ vae_kl_weight = 0.0001
 #
 # ------------------------------------------------
 
-TIMING_ATTACK_CLIENT = "Client-3"
-
-TIMING_ATTACK_START_ROUND = 3
+MALICIOUS_CLIENTS = ["Client-5", "Client-8"]
 
 # ------------------------------------------------
 # DELAYED UPDATE WEIGHT FACTORS
