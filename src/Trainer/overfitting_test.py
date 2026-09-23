@@ -1,129 +1,139 @@
 """
-Overfitting Test for VAE-based Anomaly Detection
+VAE Overfitting Test
 
-Purpose:
-    Check whether the VAE overfits during local training.
+Uses the SAME:
+    - data loading
+    - client selection
+    - train/validation split
+    - bootstrap dataset
+    - preprocessing
+    - VAE architecture
+    - batch size
+    - learning rate
+    - KL weight
 
-Pipeline:
-    Client normal data
-        ↓
-    Train / Validation split
-        ↓
-    Same preprocessing as main.py
-        ↓
-    VAE training
-        ↓
-    Epoch-wise Train Reconstruction MSE
-    Epoch-wise Validation Reconstruction MSE
-        ↓
-    Plot Train vs Validation Reconstruction MSE
+from main.py.
+
+No:
+    - FedOpt
+    - Security Buffer
+    - malicious update
+    - federated rounds
+    - matplotlib
+
+Results are logged to Comet ML epoch-by-epoch.
 """
 
 import os
-import sys
+import json
 import random
 import logging
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
+
 from torch.utils.data import DataLoader
 
-import matplotlib.pyplot as plt
-
-# ------------------------------------------------------------------
-# Project path
-# ------------------------------------------------------------------
-
-PROJECT_ROOT = "/content/fedmse"
-
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-# ------------------------------------------------------------------
-# Project imports
-# ------------------------------------------------------------------
-
-from Model.autoencoder import Autoencoder
-from DataLoader.data_processor import IoTDataProcessor
-from Dataloader.dataset import IoTDataset
-
-
-# ------------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------------
-
-CONFIG_PATH = os.path.join(
-    PROJECT_ROOT,
-    "Configuration",
-    "scen2-nba-iot-10clients.json"
+from DataLoader.dataloader import (
+    load_data,
+    IoTDataset,
+    IoTDataProcessor
 )
 
-DATA_SEED = 1234
-
-NETWORK_SIZE = 10
-
-BATCH_SIZE = 64
-
-EPOCHS = 50
-
-LEARNING_RATE = 1e-5
-
-LATENT_DIM = 16
-
-HIDDEN_DIM = 32
-
-TARGET_NUM_FEATURES = 64
-
-BOOTSTRAP_FRACTION = 0.10
-
-VAE_KL_WEIGHT = 0.0001
-
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+from Model import (
+    Autoencoder
 )
 
-OUTPUT_DIR = os.path.join(
-    PROJECT_ROOT,
-    "overfitting_results"
+from Evaluator.comet_logger import (
+    create_experiment,
+    finish_experiment
 )
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-
-# ------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------
+# ================================================================
+# LOGGING
+# ================================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-logger = logging.getLogger(__name__)
+
+# ================================================================
+# SAME HYPERPARAMETERS AS main.py
+# ================================================================
+
+epoch = 15
+
+lr_rate = 1e-5
+
+shrink_dim = 16
+
+network_size = 10
+
+data_seed = 1234
+
+batch_size = 64
+
+target_num_features = 64
+
+bootstrap_fraction = 0.10
+
+vae_kl_weight = 0.0001
+
+initial_epochs = 1
+
+threshold_val = 0.2
 
 
-# ------------------------------------------------------------------
-# Reproducibility
-# ------------------------------------------------------------------
+config_file = (
+    "/content/fedmse/Configuration/"
+    "scen2-nba-iot-10clients.json"
+)
 
-def set_seed(seed=1234):
+
+# ================================================================
+# OVERFITTING TEST SETTINGS
+# ================================================================
+
+# Use more epochs than the normal FL experiment so that
+# overfitting can become visible if it exists.
+OVERFITTING_EPOCHS = 50
+
+# Client to test.
+# Change only this value if you want another client.
+TEST_CLIENT_INDEX = 0
+
+
+# ================================================================
+# RANDOM SEED
+# ================================================================
+
+def set_seeds(seed):
 
     random.seed(seed)
+
     np.random.seed(seed)
 
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+
+        torch.cuda.manual_seed_all(
+            seed
+        )
 
 
-# ------------------------------------------------------------------
-# VAE loss
-# ------------------------------------------------------------------
+# ================================================================
+# VAE KL LOSS
+# ================================================================
 
-def compute_kl_loss(mu, logvar):
+def compute_kl_loss(
+    mu,
+    logvar
+):
 
     logvar = torch.clamp(
         logvar,
@@ -131,160 +141,69 @@ def compute_kl_loss(mu, logvar):
         max=10.0
     )
 
-    kl = -0.5 * (
+    kl_loss = -0.5 * (
         1
         + logvar
         - mu.pow(2)
         - logvar.exp()
     )
 
-    return kl.sum(dim=1).mean()
+    return kl_loss.sum(
+        dim=1
+    ).mean()
 
 
-# ------------------------------------------------------------------
-# Get reconstruction from VAE output
-# ------------------------------------------------------------------
+# ================================================================
+# TRAIN ONE EPOCH
+# ================================================================
 
-def get_reconstruction(output):
-
-    if isinstance(output, (tuple, list)):
-
-        for item in output:
-
-            if torch.is_tensor(item):
-                return item
-
-    return output
-
-
-# ------------------------------------------------------------------
-# Extract VAE parameters
-# ------------------------------------------------------------------
-
-def get_vae_parameters(output):
-
-    if isinstance(output, (tuple, list)):
-
-        tensors = [
-            x for x in output
-            if torch.is_tensor(x)
-        ]
-
-        if len(tensors) >= 3:
-
-            reconstruction = tensors[0]
-            mu = tensors[1]
-            logvar = tensors[2]
-
-            return reconstruction, mu, logvar
-
-    raise ValueError(
-        "VAE output does not contain reconstruction, mu and logvar."
-    )
-
-
-# ------------------------------------------------------------------
-# Validation
-# ------------------------------------------------------------------
-
-def evaluate_validation(model, validation_loader):
-
-    model.eval()
-
-    total_reconstruction_loss = 0.0
-    total_kl_loss = 0.0
-    total_samples = 0
-
-    with torch.no_grad():
-
-        for batch in validation_loader:
-
-            if isinstance(batch, (tuple, list)):
-                x = batch[0]
-            else:
-                x = batch
-
-            x = x.to(DEVICE).float()
-
-            output = model(x)
-
-            reconstruction, mu, logvar = get_vae_parameters(output)
-
-            reconstruction_loss = F.mse_loss(
-                reconstruction,
-                x,
-                reduction="sum"
-            )
-
-            kl_loss = compute_kl_loss(
-                mu,
-                logvar
-            )
-
-            batch_size = x.size(0)
-
-            total_reconstruction_loss += (
-                reconstruction_loss.item()
-            )
-
-            total_kl_loss += (
-                kl_loss.item() * batch_size
-            )
-
-            total_samples += batch_size
-
-    mean_reconstruction_loss = (
-        total_reconstruction_loss / total_samples
-    )
-
-    mean_kl_loss = (
-        total_kl_loss / total_samples
-    )
-
-    total_loss = (
-        mean_reconstruction_loss
-        + VAE_KL_WEIGHT * mean_kl_loss
-    )
-
-    return (
-        mean_reconstruction_loss,
-        mean_kl_loss,
-        total_loss
-    )
-
-
-# ------------------------------------------------------------------
-# One training epoch
-# ------------------------------------------------------------------
-
-def train_one_epoch(model, train_loader, optimizer):
+def train_one_epoch(
+    model,
+    train_loader,
+    optimizer,
+    device
+):
 
     model.train()
 
     total_reconstruction_loss = 0.0
+
     total_kl_loss = 0.0
+
     total_samples = 0
 
     for batch in train_loader:
 
-        if isinstance(batch, (tuple, list)):
-            x = batch[0]
-        else:
-            x = batch
-
-        x = x.to(DEVICE).float()
+        inputs = (
+            batch[0].to(device)
+            if isinstance(
+                batch,
+                (list, tuple)
+            )
+            else batch.to(device)
+        )
 
         optimizer.zero_grad()
 
-        output = model(x)
-
-        reconstruction, mu, logvar = get_vae_parameters(
-            output
+        outputs = model(
+            inputs
         )
+
+        # ---------------------------------------------------------
+        # VAE output:
+        #
+        # reconstruction, mu, logvar
+        # ---------------------------------------------------------
+
+        reconstruction = outputs[0]
+
+        mu = outputs[1]
+
+        logvar = outputs[2]
 
         reconstruction_loss = F.mse_loss(
             reconstruction,
-            x,
+            inputs,
             reduction="mean"
         )
 
@@ -295,7 +214,10 @@ def train_one_epoch(model, train_loader, optimizer):
 
         total_loss = (
             reconstruction_loss
-            + VAE_KL_WEIGHT * kl_loss
+            +
+            vae_kl_weight
+            *
+            kl_loss
         )
 
         total_loss.backward()
@@ -307,582 +229,735 @@ def train_one_epoch(model, train_loader, optimizer):
 
         optimizer.step()
 
-        batch_size = x.size(0)
+        current_batch_size = (
+            inputs.size(0)
+        )
 
         total_reconstruction_loss += (
-            reconstruction_loss.item() * batch_size
+            reconstruction_loss.item()
+            *
+            current_batch_size
         )
 
         total_kl_loss += (
-            kl_loss.item() * batch_size
+            kl_loss.item()
+            *
+            current_batch_size
         )
 
-        total_samples += batch_size
+        total_samples += (
+            current_batch_size
+        )
 
     mean_reconstruction_loss = (
-        total_reconstruction_loss / total_samples
+        total_reconstruction_loss
+        /
+        max(
+            total_samples,
+            1
+        )
     )
 
     mean_kl_loss = (
-        total_kl_loss / total_samples
+        total_kl_loss
+        /
+        max(
+            total_samples,
+            1
+        )
     )
 
-    total_loss = (
+    mean_total_loss = (
         mean_reconstruction_loss
-        + VAE_KL_WEIGHT * mean_kl_loss
+        +
+        vae_kl_weight
+        *
+        mean_kl_loss
     )
 
     return (
         mean_reconstruction_loss,
         mean_kl_loss,
-        total_loss
+        mean_total_loss
     )
 
 
-# ------------------------------------------------------------------
-# Load client data
-# ------------------------------------------------------------------
+# ================================================================
+# VALIDATION
+# ================================================================
 
-def load_client_data():
+def evaluate_validation(
+    model,
+    valid_loader,
+    device
+):
 
-    import json
+    model.eval()
 
-    with open(CONFIG_PATH, "r") as f:
-        config = json.load(f)
+    total_reconstruction_loss = 0.0
 
-    devices = config["devices_list"]
+    total_kl_loss = 0.0
 
-    random.seed(DATA_SEED)
+    total_samples = 0
 
-    selected_clients = random.sample(
-        devices,
-        NETWORK_SIZE
+    with torch.no_grad():
+
+        for batch in valid_loader:
+
+            inputs = (
+                batch[0].to(device)
+                if isinstance(
+                    batch,
+                    (list, tuple)
+                )
+                else batch.to(device)
+            )
+
+            outputs = model(
+                inputs
+            )
+
+            reconstruction = outputs[0]
+
+            mu = outputs[1]
+
+            logvar = outputs[2]
+
+            reconstruction_loss = F.mse_loss(
+                reconstruction,
+                inputs,
+                reduction="mean"
+            )
+
+            kl_loss = compute_kl_loss(
+                mu,
+                logvar
+            )
+
+            current_batch_size = (
+                inputs.size(0)
+            )
+
+            total_reconstruction_loss += (
+                reconstruction_loss.item()
+                *
+                current_batch_size
+            )
+
+            total_kl_loss += (
+                kl_loss.item()
+                *
+                current_batch_size
+            )
+
+            total_samples += (
+                current_batch_size
+            )
+
+    mean_reconstruction_loss = (
+        total_reconstruction_loss
+        /
+        max(
+            total_samples,
+            1
+        )
     )
 
-    logger.info(
-        "Selected %d clients.",
-        len(selected_clients)
+    mean_kl_loss = (
+        total_kl_loss
+        /
+        max(
+            total_samples,
+            1
+        )
     )
 
-    client_data = []
+    mean_total_loss = (
+        mean_reconstruction_loss
+        +
+        vae_kl_weight
+        *
+        mean_kl_loss
+    )
 
-    for client_id in selected_clients:
+    return (
+        mean_reconstruction_loss,
+        mean_kl_loss,
+        mean_total_loss
+    )
 
-        # ----------------------------------------------------------
-        # Adjust these paths only if your existing main.py uses
-        # a different data-loading function/path.
-        # ----------------------------------------------------------
 
-        train_path = client_id["train_data"]
-        abnormal_path = client_id.get("abnormal_data", None)
+# ================================================================
+# MAIN
+# ================================================================
 
-        normal_data = pd.read_csv(train_path)
+def main():
 
-        normal_data = normal_data.sample(
-            frac=1,
-            random_state=DATA_SEED
-        ).reset_index(drop=True)
+    set_seeds(
+        data_seed
+    )
 
-        # ----------------------------------------------------------
-        # Same split as main.py
-        # ----------------------------------------------------------
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
 
-        total_normal = len(normal_data)
+    logging.info(
+        f"Execution started on target device: "
+        f"{device}"
+    )
 
-        train_end = int(
-            total_normal * 0.40
+    # ============================================================
+    # LOAD CONFIGURATION
+    # ============================================================
+
+    with open(
+        config_file,
+        "r"
+    ) as config_f:
+
+        config = json.load(
+            config_f
         )
 
-        valid_end = int(
-            total_normal * 0.50
+    # ============================================================
+    # SAME CLIENT SELECTION AS main.py
+    # ============================================================
+
+    devices_list = random.sample(
+        config["devices_list"],
+        network_size
+    )
+
+    # ============================================================
+    # STEP 1:
+    # LOAD RAW CLIENT DATA
+    # ============================================================
+
+    raw_client_data = []
+
+    logging.info(
+        "Loading client datasets..."
+    )
+
+    for dev in devices_list:
+
+        normal_data_path = os.path.join(
+            config["data_path"],
+            dev["normal_data_path"]
         )
 
-        train_normal_data = normal_data.iloc[
-            :train_end
-        ].copy()
+        normal_data = (
+            load_data(
+                normal_data_path
+            )
+            .sample(
+                frac=1,
+                random_state=data_seed
+            )
+            .reset_index(
+                drop=True
+            )
+        )
 
-        valid_normal_data = normal_data.iloc[
-            train_end:valid_end
-        ].copy()
+        # --------------------------------------------------------
+        # Same normal split as main.py
+        # --------------------------------------------------------
 
-        # ----------------------------------------------------------
-        # Bootstrap
-        # ----------------------------------------------------------
+        train_normal_size = int(
+            0.4
+            *
+            len(normal_data)
+        )
+
+        valid_normal_size = int(
+            0.1
+            *
+            len(normal_data)
+        )
+
+        train_normal_data = (
+            normal_data[
+                :train_normal_size
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
+
+        valid_normal_data = (
+            normal_data[
+                train_normal_size:
+                train_normal_size
+                +
+                valid_normal_size
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
+
+        # --------------------------------------------------------
+        # Same bootstrap logic as main.py
+        # --------------------------------------------------------
 
         bootstrap_size = max(
             1,
             int(
+                bootstrap_fraction
+                *
                 len(train_normal_data)
-                * BOOTSTRAP_FRACTION
             )
         )
 
-        bootstrap_data = train_normal_data.iloc[
-            :bootstrap_size
-        ].copy()
+        bootstrap_data = (
+            train_normal_data[
+                :bootstrap_size
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
 
-        # Local train data = remaining 90%
-        local_train_data = train_normal_data.iloc[
-            bootstrap_size:
-        ].copy()
+        local_train_data = (
+            train_normal_data[
+                bootstrap_size:
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
 
         if len(local_train_data) == 0:
 
-            local_train_data = train_normal_data.copy()
+            local_train_data = (
+                train_normal_data
+            )
 
-        client_data.append(
-            {
-                "client_id": client_id,
-                "train": local_train_data,
-                "valid": valid_normal_data,
-                "bootstrap": bootstrap_data
-            }
+        raw_client_data.append({
+
+            "device":
+                dev["name"],
+
+            "bootstrap_data":
+                bootstrap_data,
+
+            "train_data":
+                local_train_data,
+
+            "valid_data":
+                valid_normal_data
+        })
+
+    # ============================================================
+    # STEP 2:
+    # SERVER BOOTSTRAP DATASET
+    # ============================================================
+
+    bootstrap_server_dataframe = (
+        __import__("pandas")
+        .concat(
+            [
+                client["bootstrap_data"]
+                for client in raw_client_data
+            ],
+            ignore_index=True
         )
-
-    return client_data
-
-
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
-
-def main():
-
-    set_seed(DATA_SEED)
-
-    logger.info("Using device: %s", DEVICE)
-
-    # --------------------------------------------------------------
-    # Load data
-    # --------------------------------------------------------------
-
-    client_data = load_client_data()
-
-    # --------------------------------------------------------------
-    # Create server bootstrap dataset
-    # --------------------------------------------------------------
-
-    bootstrap_parts = [
-        item["bootstrap"]
-        for item in client_data
-    ]
-
-    bootstrap_data = pd.concat(
-        bootstrap_parts,
-        ignore_index=True
     )
 
-    # --------------------------------------------------------------
-    # Same preprocessing as main.py
-    #
-    # 115 raw features
-    #       ↓
-    # log transform
-    #       ↓
-    # feature selection
-    #       ↓
-    # standard scaling
-    #       ↓
-    # 64 features
-    # --------------------------------------------------------------
+    logging.info(
+        f"Initial server bootstrap dataset created | "
+        f"Samples: "
+        f"{len(bootstrap_server_dataframe)}"
+    )
+
+    # ============================================================
+    # STEP 3:
+    # SAME PREPROCESSING AS main.py
+    # ============================================================
 
     data_processor = IoTDataProcessor(
         scaler="standard",
         use_log_transform=True,
-        n_selected_features=TARGET_NUM_FEATURES
+        n_selected_features=target_num_features
     )
 
-    # Fit ONLY on bootstrap/server data
-    data_processor.fit(bootstrap_data)
+    (
+        processed_bootstrap_data,
+        bootstrap_label
+    ) = data_processor.fit_transform(
+        bootstrap_server_dataframe
+    )
 
-    # --------------------------------------------------------------
-    # Prepare processed datasets
-    # --------------------------------------------------------------
+    actual_dim_features = (
+        processed_bootstrap_data.shape[1]
+    )
 
-    processed_clients = []
+    logging.info(
+        f"Feature pipeline complete | "
+        f"Original features: "
+        f"{bootstrap_server_dataframe.shape[1]} | "
+        f"Selected features: "
+        f"{actual_dim_features}"
+    )
 
-    for item in client_data:
+    # ============================================================
+    # STEP 4:
+    # PROCESS EVERY CLIENT
+    # ============================================================
 
-        train_processed = data_processor.transform(
-            item["train"]
+    client_info = []
+
+    for client in raw_client_data:
+
+        (
+            processed_train_data,
+            train_label
+        ) = data_processor.transform(
+            client["train_data"],
+            type="normal"
         )
 
-        valid_processed = data_processor.transform(
-            item["valid"]
+        (
+            processed_valid_data,
+            valid_label
+        ) = data_processor.transform(
+            client["valid_data"],
+            type="normal"
         )
 
-        processed_clients.append(
-            {
-                "client_id": item["client_id"],
-                "train": train_processed,
-                "valid": valid_processed
-            }
+        train_dataset = IoTDataset(
+            processed_train_data,
+            train_label
         )
 
-    # --------------------------------------------------------------
-    # Select one client for overfitting test
-    #
-    # We test one client first so the graph clearly shows
-    # local VAE training behaviour.
-    # --------------------------------------------------------------
+        valid_dataset = IoTDataset(
+            processed_valid_data,
+            valid_label
+        )
 
-    client = processed_clients[0]
+        train_loader = DataLoader(
+            dataset=train_dataset,
+            batch_size=batch_size,
+            pin_memory=True,
+            shuffle=True
+        )
 
-    logger.info(
-        "Testing client: %s",
-        client["client_id"]
+        valid_loader = DataLoader(
+            dataset=valid_dataset,
+            batch_size=batch_size,
+            pin_memory=True,
+            shuffle=False
+        )
+
+        client_info.append({
+
+            "device":
+                client["device"],
+
+            "train_loader":
+                train_loader,
+
+            "valid_loader":
+                valid_loader
+        })
+
+    # ============================================================
+    # SELECT CLIENT FOR OVERFITTING TEST
+    # ============================================================
+
+    test_client = client_info[
+        TEST_CLIENT_INDEX
+    ]
+
+    client_name = (
+        test_client["device"]
     )
 
-    # --------------------------------------------------------------
-    # Dataset
-    # --------------------------------------------------------------
-
-    train_dataset = IoTDataset(
-        client["train"]
+    train_loader = (
+        test_client["train_loader"]
     )
 
-    valid_dataset = IoTDataset(
-        client["valid"]
+    valid_loader = (
+        test_client["valid_loader"]
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        pin_memory=True
+    logging.info(
+        f"===================================================="
     )
 
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        pin_memory=True
+    logging.info(
+        f"OVERFITTING TEST CLIENT: "
+        f"{client_name}"
     )
 
-    # --------------------------------------------------------------
-    # Determine input dimension
-    # --------------------------------------------------------------
-
-    sample = client["train"]
-
-    if isinstance(sample, pd.DataFrame):
-        actual_dim_features = sample.shape[1]
-    else:
-        actual_dim_features = sample.shape[-1]
-
-    logger.info(
-        "Input dimension: %d",
-        actual_dim_features
+    logging.info(
+        f"Training samples: "
+        f"{len(train_loader.dataset)}"
     )
 
-    # --------------------------------------------------------------
-    # Create VAE
-    # --------------------------------------------------------------
+    logging.info(
+        f"Validation samples: "
+        f"{len(valid_loader.dataset)}"
+    )
+
+    logging.info(
+        f"===================================================="
+    )
+
+    # ============================================================
+    # CREATE VAE
+    # ============================================================
 
     model = Autoencoder(
         input_dim=actual_dim_features,
-        hidden_neus=HIDDEN_DIM,
-        latent_dim=LATENT_DIM,
+        hidden_neus=32,
+        latent_dim=shrink_dim,
         output_dim=actual_dim_features,
         use_sigmoid=False
-    ).to(DEVICE)
+    )
 
-    # --------------------------------------------------------------
-    # Optimizer
-    # --------------------------------------------------------------
+    model.to(
+        device
+    )
+
+    # ============================================================
+    # OPTIMIZER
+    # ============================================================
 
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=LEARNING_RATE
+        lr=lr_rate
     )
 
-    # --------------------------------------------------------------
-    # History
-    # --------------------------------------------------------------
+    # ============================================================
+    # COMET EXPERIMENT
+    # ============================================================
 
-    train_reconstruction_history = []
-    train_kl_history = []
-    train_total_history = []
-
-    validation_reconstruction_history = []
-    validation_kl_history = []
-    validation_total_history = []
-
-    # --------------------------------------------------------------
-    # Training
-    # --------------------------------------------------------------
-
-    logger.info(
-        "Starting overfitting test for %d epochs...",
-        EPOCHS
+    experiment = create_experiment(
+        model_type="vae_overfitting_test",
+        run_number=1,
+        run_seed=data_seed,
+        num_rounds=OVERFITTING_EPOCHS,
+        epoch=OVERFITTING_EPOCHS,
+        learning_rate=lr_rate,
+        shrink_dim=shrink_dim,
+        batch_size=batch_size,
+        latency_threshold=1.5,
+        server_lr=0.01,
+        update_type="local_vae",
+        network_size=1,
+        raw_features=actual_dim_features,
+        timing_attack_client="none",
+        timing_attack_start_round=0
     )
 
-    for epoch in range(1, EPOCHS + 1):
+    # Additional experiment parameters
+    experiment.log_parameters({
 
-        (
-            train_reconstruction,
-            train_kl,
-            train_total
-        ) = train_one_epoch(
-            model,
-            train_loader,
-            optimizer
+        "test_type":
+            "VAE overfitting",
+
+        "client":
+            client_name,
+
+        "train_samples":
+            len(train_loader.dataset),
+
+        "validation_samples":
+            len(valid_loader.dataset),
+
+        "bootstrap_fraction":
+            bootstrap_fraction,
+
+        "target_num_features":
+            target_num_features,
+
+        "use_log_transform":
+            True,
+
+        "scaler":
+            "standard",
+
+        "feature_selection":
+            "Unsupervised variance-based selection",
+
+        "vae_kl_weight":
+            vae_kl_weight
+    })
+
+    # ============================================================
+    # TRAINING HISTORY
+    # ============================================================
+
+    best_validation_mse = float(
+        "inf"
+    )
+
+    best_epoch = 0
+
+    # ============================================================
+    # OVERFITTING TRAINING
+    # ============================================================
+
+    try:
+
+        for current_epoch in range(
+            1,
+            OVERFITTING_EPOCHS + 1
+        ):
+
+            (
+                train_reconstruction_mse,
+                train_kl,
+                train_total_loss
+            ) = train_one_epoch(
+                model=model,
+                train_loader=train_loader,
+                optimizer=optimizer,
+                device=device
+            )
+
+            (
+                validation_reconstruction_mse,
+                validation_kl,
+                validation_total_loss
+            ) = evaluate_validation(
+                model=model,
+                valid_loader=valid_loader,
+                device=device
+            )
+
+            # ----------------------------------------------------
+            # Track best validation epoch
+            # ----------------------------------------------------
+
+            if (
+                validation_reconstruction_mse
+                <
+                best_validation_mse
+            ):
+
+                best_validation_mse = (
+                    validation_reconstruction_mse
+                )
+
+                best_epoch = (
+                    current_epoch
+                )
+
+            # ----------------------------------------------------
+            # Comet epoch-wise logging
+            # ----------------------------------------------------
+
+            experiment.log_metrics(
+
+                {
+
+                    "train_reconstruction_mse":
+                        float(
+                            train_reconstruction_mse
+                        ),
+
+                    "validation_reconstruction_mse":
+                        float(
+                            validation_reconstruction_mse
+                        ),
+
+                    "train_kl":
+                        float(
+                            train_kl
+                        ),
+
+                    "validation_kl":
+                        float(
+                            validation_kl
+                        ),
+
+                    "train_total_loss":
+                        float(
+                            train_total_loss
+                        ),
+
+                    "validation_total_loss":
+                        float(
+                            validation_total_loss
+                        ),
+
+                    "train_validation_gap":
+                        float(
+                            validation_reconstruction_mse
+                            -
+                            train_reconstruction_mse
+                        )
+                },
+
+                step=current_epoch
+            )
+
+            logging.info(
+
+                f"Epoch "
+                f"{current_epoch:03d}/{OVERFITTING_EPOCHS} | "
+
+                f"Train Recon MSE: "
+                f"{train_reconstruction_mse:.8f} | "
+
+                f"Val Recon MSE: "
+                f"{validation_reconstruction_mse:.8f} | "
+
+                f"Train KL: "
+                f"{train_kl:.8f} | "
+
+                f"Val KL: "
+                f"{validation_kl:.8f}"
+            )
+
+        # ========================================================
+        # FINAL RESULT
+        # ========================================================
+
+        experiment.log_parameters({
+
+            "best_validation_epoch":
+                best_epoch,
+
+            "best_validation_reconstruction_mse":
+                float(
+                    best_validation_mse
+                )
+        })
+
+        logging.info(
+            "===================================================="
         )
 
-        (
-            validation_reconstruction,
-            validation_kl,
-            validation_total
-        ) = evaluate_validation(
-            model,
-            valid_loader
+        logging.info(
+            f"Best validation reconstruction MSE: "
+            f"{best_validation_mse:.8f}"
         )
 
-        # Save history
-        train_reconstruction_history.append(
-            train_reconstruction
+        logging.info(
+            f"Best validation epoch: "
+            f"{best_epoch}"
         )
 
-        train_kl_history.append(
-            train_kl
+        logging.info(
+            "===================================================="
         )
 
-        train_total_history.append(
-            train_total
-        )
+    finally:
 
-        validation_reconstruction_history.append(
-            validation_reconstruction
-        )
-
-        validation_kl_history.append(
-            validation_kl
-        )
-
-        validation_total_history.append(
-            validation_total
-        )
-
-        logger.info(
-            "Epoch %03d | "
-            "Train Recon: %.6f | "
-            "Val Recon: %.6f | "
-            "Train KL: %.6f | "
-            "Val KL: %.6f",
-            epoch,
-            train_reconstruction,
-            validation_reconstruction,
-            train_kl,
-            validation_kl
-        )
-
-    # --------------------------------------------------------------
-    # Save history
-    # --------------------------------------------------------------
-
-    history = pd.DataFrame(
-        {
-            "epoch": range(1, EPOCHS + 1),
-
-            "train_reconstruction_mse":
-                train_reconstruction_history,
-
-            "validation_reconstruction_mse":
-                validation_reconstruction_history,
-
-            "train_kl":
-                train_kl_history,
-
-            "validation_kl":
-                validation_kl_history,
-
-            "train_total_loss":
-                train_total_history,
-
-            "validation_total_loss":
-                validation_total_history
-        }
-    )
-
-    history_path = os.path.join(
-        OUTPUT_DIR,
-        "overfitting_history.csv"
-    )
-
-    history.to_csv(
-        history_path,
-        index=False
-    )
-
-    logger.info(
-        "History saved to: %s",
-        history_path
-    )
-
-    # --------------------------------------------------------------
-    # Plot reconstruction MSE
-    # --------------------------------------------------------------
-
-    plt.figure(figsize=(10, 6))
-
-    plt.plot(
-        history["epoch"],
-        history["train_reconstruction_mse"],
-        label="Train Reconstruction MSE"
-    )
-
-    plt.plot(
-        history["epoch"],
-        history["validation_reconstruction_mse"],
-        label="Validation Reconstruction MSE"
-    )
-
-    plt.xlabel("Epoch")
-
-    plt.ylabel("Reconstruction MSE")
-
-    plt.title(
-        "VAE Overfitting Test: Train vs Validation Reconstruction MSE"
-    )
-
-    plt.legend()
-
-    plt.grid(True)
-
-    plt.tight_layout()
-
-    plot_path = os.path.join(
-        OUTPUT_DIR,
-        "overfitting_train_vs_validation.png"
-    )
-
-    plt.savefig(
-        plot_path,
-        dpi=300
-    )
-
-    plt.show()
-
-    logger.info(
-        "Plot saved to: %s",
-        plot_path
-    )
-
-    # --------------------------------------------------------------
-    # KL plot
-    # --------------------------------------------------------------
-
-    plt.figure(figsize=(10, 6))
-
-    plt.plot(
-        history["epoch"],
-        history["train_kl"],
-        label="Train KL"
-    )
-
-    plt.plot(
-        history["epoch"],
-        history["validation_kl"],
-        label="Validation KL"
-    )
-
-    plt.xlabel("Epoch")
-
-    plt.ylabel("KL Divergence")
-
-    plt.title(
-        "VAE KL Loss During Training"
-    )
-
-    plt.legend()
-
-    plt.grid(True)
-
-    plt.tight_layout()
-
-    kl_plot_path = os.path.join(
-        OUTPUT_DIR,
-        "overfitting_kl_loss.png"
-    )
-
-    plt.savefig(
-        kl_plot_path,
-        dpi=300
-    )
-
-    plt.show()
-
-    logger.info(
-        "KL plot saved to: %s",
-        kl_plot_path
-    )
-
-    # --------------------------------------------------------------
-    # Final interpretation
-    # --------------------------------------------------------------
-
-    min_val_epoch = (
-        history[
-            "validation_reconstruction_mse"
-        ].idxmin() + 1
-    )
-
-    min_val_mse = (
-        history[
-            "validation_reconstruction_mse"
-        ].min()
-    )
-
-    final_train_mse = (
-        history[
-            "train_reconstruction_mse"
-        ].iloc[-1]
-    )
-
-    final_val_mse = (
-        history[
-            "validation_reconstruction_mse"
-        ].iloc[-1]
-    )
-
-    logger.info(
-        "Best validation reconstruction MSE: %.6f "
-        "at epoch %d",
-        min_val_mse,
-        min_val_epoch
-    )
-
-    logger.info(
-        "Final Train Reconstruction MSE: %.6f",
-        final_train_mse
-    )
-
-    logger.info(
-        "Final Validation Reconstruction MSE: %.6f",
-        final_val_mse
-    )
-
-    if (
-        final_train_mse < min_val_mse
-        and final_val_mse > min_val_mse
-    ):
-
-        logger.warning(
-            "Possible overfitting detected: "
-            "validation MSE increased after reaching its minimum."
-        )
-
-    else:
-
-        logger.info(
-            "No clear overfitting pattern detected "
-            "from the final epoch comparison."
+        finish_experiment(
+            experiment
         )
 
 
-# ------------------------------------------------------------------
-# Entry point
-# ------------------------------------------------------------------
+# ================================================================
+# ENTRY POINT
+# ================================================================
 
 if __name__ == "__main__":
+
     main()
