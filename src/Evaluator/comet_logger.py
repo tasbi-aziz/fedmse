@@ -113,3 +113,26 @@ def finish_experiment(experiment):
 
     if experiment is not None:
         experiment.end()
+def log_magnitude_threshold_metrics(
+    experiment,
+    attack_factor,
+    magnitude,
+    magnitude_threshold,
+    magnitude_fail,
+):
+    """
+    Log offline magnitude-threshold experiment results.
+    """
+
+    experiment.log_metrics(
+        {
+            "attack_factor": float(attack_factor),
+            "magnitude": float(magnitude),
+            "magnitude_threshold": float(magnitude_threshold),
+            "magnitude_fail": int(magnitude_fail),
+            "magnitude_detection_rate": (
+                100.0 if magnitude_fail else 0.0
+            ),
+        },
+        step=int(round(attack_factor * 100)),
+    )
