@@ -165,21 +165,29 @@ initial_epochs = 1
 vae_kl_weight = 0.0001
 
 # ------------------------------------------------
-# TIMING ATTACK WARM-UP
+# COMBINED MALICIOUS UPDATE EXPERIMENT
 # ------------------------------------------------
 #
-# Client-3 remains CLEAN for the first 2 rounds.
+# Two malicious clients are used throughout the experiment.
 #
-# Starting from Round 3:
-#     Client-3 -> timing attack
+# Round 1:
+#     Magnitude attack only.
 #
-# This is required because SecurityBuffer uses
-# min_history = 2 before timing behavior can be
-# evaluated against historical clean timing.
+# Round 2:
+#     Magnitude + validation-loss + validation-MSE attacks.
+#     Timing remains CLEAN so the second clean timing observation
+#     can be collected.
+#
+# Round 3 onward:
+#     Magnitude + timing + validation-loss + validation-MSE attacks.
+#
+# SecurityBuffer min_history = 2 remains unchanged.
 #
 # ------------------------------------------------
 
 MALICIOUS_CLIENTS = ["Client-5", "Client-8"]
+
+TIMING_ATTACK_START_ROUND = 3
 
 # ------------------------------------------------
 # DELAYED UPDATE WEIGHT FACTORS
@@ -1582,7 +1590,7 @@ if __name__ == "__main__":
                 update_type=args.update_type,
                 network_size=network_size,
                 raw_features=actual_dim_features,
-                timing_attack_client=TIMING_ATTACK_CLIENT,
+                timing_attack_client=", ".join(MALICIOUS_CLIENTS),
                 timing_attack_start_round=TIMING_ATTACK_START_ROUND
               )
 
@@ -1920,59 +1928,75 @@ if __name__ == "__main__":
                     #
                     # Round 1:
                     #     CLEAN
+                    # -------------------------------------------------
+                    # STAGED COMBINED MALICIOUS UPDATE EXPERIMENT
+                    #
+                    # Round 1:
+                    #     Magnitude only.
                     #
                     # Round 2:
-                    #     CLEAN
+                    #     Magnitude + validation loss + validation MSE.
+                    #     Timing remains clean for the second history point.
                     #
                     # Round 3 onward:
-                    #     TIMING ATTACK
-                    #
-                    # This provides the two clean historical timing
-                    # observations required by SecurityBuffer.
+                    #     Magnitude + timing + validation loss + validation MSE.
                     # -------------------------------------------------
 
-                    if (
-                        client["device"]
-                        ==
-                        TIMING_ATTACK_CLIENT
-                    ):
+                    if client["device"] in MALICIOUS_CLIENTS:
 
-                        if (
-                            round_number
-                            >=
-                            TIMING_ATTACK_START_ROUND
-                        ):
+                        if round_number == 1:
 
                             update = manipulate_update(
                                 update,
-                                attack_type="timing"
+                                attack_type="magnitude"
                             )
 
                             logging.warning(
-                                f"[ATTACK] "
-                                f"Client-3 malicious update "
-                                f"generated | "
-                                f"Round: "
-                                f"{round_number} | "
-                                f"Attack Type: "
-                                f"{update.get('attack_type', 'unknown')} | "
+                                f"[ATTACK] {client['device']} "
+                                f"magnitude attack generated | "
+                                f"Round: {round_number} | "
                                 f"Parameter: "
                                 f"{update.get('attack_parameter', 'unknown')}"
+                            )
+
+                        elif round_number == 2:
+
+                            update = manipulate_update(
+                                update,
+                                attack_type="magnitude"
+                            )
+
+                            update = manipulate_update(
+                                update,
+                                attack_type="loss"
+                            )
+
+                            update = manipulate_update(
+                                update,
+                                attack_type="mse"
+                            )
+
+                            logging.warning(
+                                f"[ATTACK] {client['device']} "
+                                f"magnitude + loss + mse attack generated | "
+                                f"Round: {round_number}"
                             )
 
                         else:
 
                             update = manipulate_update(
                                 update,
-                                attack_type="none"
+                                attack_type="combined"
                             )
 
-                            logging.info(
-                                f"[ATTACK WARM-UP] "
-                                f"Client-3 remains CLEAN | "
-                                f"Round: "
-                                f"{round_number} | "
-                                f"Timing history is being collected."
+                            logging.warning(
+                                f"[ATTACK] {client['device']} "
+                                f"combined malicious update generated | "
+                                f"Round: {round_number} | "
+                                f"Attack Type: "
+                                f"{update.get('attack_type', 'unknown')} | "
+                                f"Parameter: "
+                                f"{update.get('attack_parameter', 'unknown')}"
                             )
 
                     else:
@@ -2811,27 +2835,37 @@ if __name__ == "__main__":
                 )
         },
 
-        "timing_attack_experiment": {
+        "malicious_update_experiment": {
 
-            "attacker_client":
-                TIMING_ATTACK_CLIENT,
+            "attacker_clients":
+                MALICIOUS_CLIENTS,
 
             "attack_type":
-                "timing",
+                "staged_combined",
 
-            "attack_start_round":
+            "attack_schedule": {
+                "round_1":
+                    "magnitude",
+                "round_2":
+                    "magnitude + validation_loss + validation_mse",
+                "round_3_onward":
+                    "magnitude + timing + validation_loss + validation_mse"
+            },
+
+            "timing_attack_start_round":
                 TIMING_ATTACK_START_ROUND,
 
             "warmup_rounds":
                 TIMING_ATTACK_START_ROUND - 1,
 
-            "attack_parameter":
-                "3x training time",
+            "attack_parameters":
+                "magnitude=5x, timing=3x, loss=5x, mse=5x",
 
             "purpose":
                 (
-                    "Allow two clean timing observations before "
-                    "activating the controlled timing manipulation."
+                    "Magnitude starts immediately; timing requires two "
+                    "clean timing observations; validation-loss and "
+                    "validation-MSE attacks start in Round 2."
                 )
         },
 
@@ -2950,4 +2984,3 @@ if __name__ == "__main__":
         f"Results Summary saved successfully to: "
         f"{summary_report_path}"
     )
-  
