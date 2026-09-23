@@ -1,12 +1,14 @@
 """
-Normal Autoencoder model definition.
+Variational Autoencoder model definition.
 
 Pipeline:
-    X raw features
+    X selected features
         ↓
     32-dimensional hidden representation
         ↓
-    16-dimensional latent representation
+    mean (mu) and log-variance (logvar)
+        ↓
+    16-dimensional latent space
         ↓
     32-dimensional decoder representation
         ↓
@@ -14,15 +16,6 @@ Pipeline:
 
 The model is designed for normal-only / unsupervised
 anomaly detection using reconstruction error.
-
-This is a standard / vanilla Autoencoder.
-It does NOT use:
-    - Variational encoding
-    - mu / logvar
-    - Reparameterization
-    - KL divergence
-    - Shrink penalty
-    - shrink_lambda
 
 @author
 - Van Tuan Nguyen (vantuan.nguyen@lqdtu.edu.vn)
@@ -36,10 +29,7 @@ from torch import nn
 import torch.nn.functional as F
 
 
-# ================================================================
-# LOGGING
-# ================================================================
-
+# Configure the logging module
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -47,21 +37,22 @@ logging.basicConfig(
 
 
 # ================================================================
-# AE ENCODER
+# VAE ENCODER
 # ================================================================
 
 class Encoder(nn.Module):
     """
-    Encoder part of a standard Autoencoder.
+    Encoder part of the Variational Autoencoder.
 
     Architecture:
 
         input_dim
             ↓
-           32
+          32
             ↓
-           16
-         latent
+        mu --------┐
+                   ├──> reparameterization -> latent z (16)
+        logvar ----┘
     """
 
     def __init__(
@@ -77,31 +68,45 @@ class Encoder(nn.Module):
         self.latent_dim = latent_dim
 
         # --------------------------------------------------------
-        # Input -> Hidden -> Latent
+        # Shared encoder network
+        #
+        # X -> 32
         # --------------------------------------------------------
 
         self.encoder_network = nn.Sequential(
-
             nn.Linear(
                 input_dim,
                 hidden_neus,
                 bias=True
             ),
+            nn.ReLU()
+        )
 
-            nn.ReLU(),
+        # --------------------------------------------------------
+        # Mean vector
+        #
+        # 32 -> 16
+        # --------------------------------------------------------
 
-            nn.Linear(
-                hidden_neus,
-                latent_dim,
-                bias=True
-            )
+        self.mu_layer = nn.Linear(
+            hidden_neus,
+            latent_dim,
+            bias=True
+        )
+
+        # --------------------------------------------------------
+        # Log variance vector
+        #
+        # 32 -> 16
+        # --------------------------------------------------------
+
+        self.logvar_layer = nn.Linear(
+            hidden_neus,
+            latent_dim,
+            bias=True
         )
 
         self.init_params()
-
-    # ============================================================
-    # INITIALIZATION
-    # ============================================================
 
     def init_params(self):
         """
@@ -130,42 +135,69 @@ class Encoder(nn.Module):
 
                 layer.bias.data.zero_()
 
-    # ============================================================
-    # FORWARD
-    # ============================================================
-
-    def forward(
-        self,
-        inputs
-    ):
+    def forward(self, inputs):
         """
-        Encodes input into latent representation.
+        Returns:
+            mu
+            logvar
+
+        logvar is clipped to a numerically stable range
+        to prevent exp(logvar) from becoming excessively
+        large during VAE training.
         """
 
-        return self.encoder_network(
+        hidden = self.encoder_network(
             inputs
         )
 
+        mu = self.mu_layer(
+            hidden
+        )
+
+        logvar = self.logvar_layer(
+            hidden
+        )
+
+        # --------------------------------------------------------
+        # Numerical stability:
+        #
+        # Prevent logvar from becoming extremely large or small.
+        #
+        # This stabilizes:
+        #
+        #     exp(logvar)
+        #
+        # and
+        #
+        #     exp(0.5 * logvar)
+        #
+        # used in KL loss and reparameterization.
+        # --------------------------------------------------------
+
+        logvar = torch.clamp(
+            logvar,
+            min=-10.0,
+            max=10.0
+        )
+
+        return mu, logvar
+
 
 # ================================================================
-# AE DECODER
+# VAE DECODER
 # ================================================================
 
 class Decoder(nn.Module):
     """
-    Decoder part of a standard Autoencoder.
+    Decoder part of the Variational Autoencoder.
 
     Architecture:
 
         latent 16
             ↓
-           32
+          32
             ↓
-        output_dim
-
-    For the current raw-data experiment:
-
-        16 -> 32 -> 115
+        output_dim (= selected X features)
     """
 
     def __init__(
@@ -187,7 +219,6 @@ class Decoder(nn.Module):
         self.output_dim = output_dim
 
         decoder_network = [
-
             nn.Linear(
                 latent_dim,
                 hidden_neus,
@@ -206,8 +237,7 @@ class Decoder(nn.Module):
         # --------------------------------------------------------
         # Optional sigmoid
         #
-        # Normally FALSE for the current raw-data experiment
-        # because the input is NOT scaled to [0,1].
+        # Use when input/output is scaled to [0,1].
         # --------------------------------------------------------
 
         if use_sigmoid:
@@ -221,10 +251,6 @@ class Decoder(nn.Module):
         )
 
         self.init_params()
-
-    # ============================================================
-    # INITIALIZATION
-    # ============================================================
 
     def init_params(self):
         """
@@ -253,17 +279,10 @@ class Decoder(nn.Module):
 
                 layer.bias.data.zero_()
 
-    # ============================================================
-    # FORWARD
-    # ============================================================
-
-    def forward(
-        self,
-        latent
-    ):
+    def forward(self, latent):
         """
         Decodes latent representation into
-        reconstructed features.
+        reconstructed selected features.
         """
 
         return self.decoder_network(
@@ -272,49 +291,29 @@ class Decoder(nn.Module):
 
 
 # ================================================================
-# NORMAL AUTOENCODER
+# VARIATIONAL AUTOENCODER
 # ================================================================
 
 class Autoencoder(nn.Module):
     """
-    Standard / Vanilla Autoencoder.
+    Variational Autoencoder.
 
     Architecture:
 
         X
         ↓
-       32
-        ↓
-       16
-        ↓
-       32
-        ↓
-       X_hat
-
-    For the current raw-data experiment:
-
-        115
-         ↓
         32
-         ↓
-        16
-         ↓
+        ↓
+      mu, logvar
+        ↓
+      z (16)
+        ↓
         32
-         ↓
-        115
+        ↓
+        X_hat
 
-    The class name "Autoencoder" is retained for
-    compatibility with the existing FedMSE codebase.
-
-    This model does NOT contain:
-
-        - mu
-        - logvar
-        - reparameterization
-        - KL divergence
-        - beta
-        - shrink penalty
-        - shrink_lambda
+    The class name "Autoencoder" is intentionally retained
+    for compatibility with the existing FedMSE codebase.
     """
 
     def __init__(
@@ -338,7 +337,7 @@ class Autoencoder(nn.Module):
         # --------------------------------------------------------
         # Encoder
         #
-        # input -> 32 -> 16
+        # X -> 32 -> mu/logvar
         # --------------------------------------------------------
 
         self.encoder = Encoder(
@@ -350,7 +349,7 @@ class Autoencoder(nn.Module):
         # --------------------------------------------------------
         # Decoder
         #
-        # 16 -> 32 -> output
+        # 16 -> 32 -> X
         # --------------------------------------------------------
 
         self.decoder = Decoder(
@@ -358,6 +357,148 @@ class Autoencoder(nn.Module):
             hidden_neus=hidden_neus,
             output_dim=output_dim,
             use_sigmoid=use_sigmoid
+        )
+
+    # ============================================================
+    # REPARAMETERIZATION
+    # ============================================================
+
+    def reparameterize(
+        self,
+        mu,
+        logvar
+    ):
+        """
+        Reparameterization trick.
+
+        sigma = exp(0.5 * logvar)
+
+        z = mu + sigma * epsilon
+
+        where:
+
+            epsilon ~ N(0, I)
+
+        logvar has already been clipped inside the encoder.
+        """
+
+        # Standard deviation
+        std = torch.exp(
+            0.5 * logvar
+        )
+
+        # Random Gaussian noise
+        eps = torch.randn_like(
+            std
+        )
+
+        # Sample latent vector
+        z = (
+            mu
+            +
+            eps * std
+        )
+
+        return z
+
+    # ============================================================
+    # KL LOSS
+    # ============================================================
+
+    def kl_loss(
+        self,
+        mu,
+        logvar
+    ):
+        """
+        KL divergence:
+
+            KL(q(z|x) || N(0,I))
+
+        Returns mean KL loss over the batch.
+
+        logvar is already bounded by the encoder.
+        """
+
+        kl = -0.5 * torch.sum(
+            1
+            +
+            logvar
+            -
+            mu.pow(2)
+            -
+            logvar.exp(),
+            dim=1
+        )
+
+        return torch.mean(
+            kl
+        )
+
+    # ============================================================
+    # RECONSTRUCTION LOSS
+    # ============================================================
+
+    def recon_loss(
+        self,
+        input,
+        output
+    ):
+        """
+        Mean Squared Reconstruction Error.
+        """
+
+        return F.mse_loss(
+            output,
+            input,
+            reduction='mean'
+        )
+
+    # ============================================================
+    # TOTAL VAE LOSS
+    # ============================================================
+
+    def vae_loss(
+        self,
+        input,
+        output,
+        mu,
+        logvar,
+        beta=0.001
+    ):
+        """
+        Total VAE loss:
+
+            reconstruction loss
+            +
+            beta * KL loss
+
+        Returns:
+            total_loss
+            reconstruction_loss
+            kl_loss
+        """
+
+        reconstruction_loss = self.recon_loss(
+            input,
+            output
+        )
+
+        kl = self.kl_loss(
+            mu,
+            logvar
+        )
+
+        total_loss = (
+            reconstruction_loss
+            +
+            beta * kl
+        )
+
+        return (
+            total_loss,
+            reconstruction_loss,
+            kl
         )
 
     # ============================================================
@@ -373,30 +514,44 @@ class Autoencoder(nn.Module):
 
         Returns:
 
-            output
+            reconstruction
+            mu
+            logvar
 
-        where output is the reconstructed input.
-
-        This is the standard Autoencoder forward flow.
+        This format is compatible with the updated
+        ClientTrainer.
         """
 
         # --------------------------------------------------------
-        # Encode
+        # Encoder
         # --------------------------------------------------------
 
-        latent = self.encoder(
+        mu, logvar = self.encoder(
             input
         )
 
         # --------------------------------------------------------
-        # Decode
+        # Sample latent vector
+        # --------------------------------------------------------
+
+        latent = self.reparameterize(
+            mu,
+            logvar
+        )
+
+        # --------------------------------------------------------
+        # Decoder
         # --------------------------------------------------------
 
         output = self.decoder(
             latent
         )
 
-        return output
+        return (
+            output,
+            mu,
+            logvar
+        )
 
     # ============================================================
     # ENCODE
@@ -407,11 +562,34 @@ class Autoencoder(nn.Module):
         input
     ):
         """
-        Returns the deterministic latent representation.
+        Returns mu, logvar.
+
+        logvar returned here is also clipped.
         """
 
         return self.encoder(
             input
+        )
+
+    # ============================================================
+    # SAMPLE LATENT
+    # ============================================================
+
+    def sample_latent(
+        self,
+        input
+    ):
+        """
+        Returns a sampled latent vector z.
+        """
+
+        mu, logvar = self.encoder(
+            input
+        )
+
+        return self.reparameterize(
+            mu,
+            logvar
         )
 
     # ============================================================
@@ -423,54 +601,11 @@ class Autoencoder(nn.Module):
         latent
     ):
         """
-        Reconstructs data from latent representation.
+        Reconstructs data from latent vector.
         """
 
         return self.decoder(
             latent
-        )
-
-    # ============================================================
-    # RECONSTRUCTION LOSS
-    # ============================================================
-
-    def recon_loss(
-        self,
-        input,
-        output
-    ):
-        """
-        Mean Squared Reconstruction Error.
-
-        This is the main training/anomaly-detection
-        loss used by the standard Autoencoder.
-        """
-
-        return F.mse_loss(
-            output,
-            input,
-            reduction='mean'
-        )
-
-    # ============================================================
-    # LOSS
-    # ============================================================
-
-    def loss(
-        self,
-        input,
-        output
-    ):
-        """
-        Returns the reconstruction MSE.
-
-        No KL loss is used because this is a
-        standard Autoencoder, not a VAE.
-        """
-
-        return self.recon_loss(
-            input,
-            output
         )
 
     # ============================================================
@@ -481,10 +616,6 @@ class Autoencoder(nn.Module):
         self,
         tensor
     ):
-        """
-        Converts a PyTorch tensor to NumPy.
-        """
-
         return (
             tensor.detach()
             .cpu()
