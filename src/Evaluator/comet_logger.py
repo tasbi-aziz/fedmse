@@ -113,6 +113,39 @@ def finish_experiment(experiment):
 
     if experiment is not None:
         experiment.end()
+
+
+def create_magnitude_experiment(
+    client_id,
+    checkpoint_path,
+    magnitude_factors,
+):
+    """
+    Create a Comet experiment for offline
+    magnitude-threshold sensitivity testing.
+    """
+
+    experiment = comet_ml.Experiment(
+        project_name="security-buffer"
+    )
+
+    experiment.set_name(
+        "magnitude-threshold-test"
+    )
+
+    experiment.log_parameters({
+        "experiment_type": "magnitude_threshold_sensitivity",
+        "client_id": client_id,
+        "checkpoint": checkpoint_path,
+        "magnitude_factors": ",".join(
+            str(x) for x in magnitude_factors
+        ),
+        "min_history": 2,
+    })
+
+    return experiment
+
+
 def log_magnitude_threshold_metrics(
     experiment,
     attack_factor,
@@ -130,6 +163,7 @@ def log_magnitude_threshold_metrics(
             "magnitude": float(magnitude),
             "magnitude_threshold": float(magnitude_threshold),
             "magnitude_fail": int(magnitude_fail),
+
             "magnitude_detection_rate": (
                 100.0 if magnitude_fail else 0.0
             ),
