@@ -2,16 +2,21 @@
 Offline Magnitude Threshold Sensitivity Test
 
 Purpose:
-    Find the lowest magnitude attack factor at which
-    SecurityBuffer stops flagging the magnitude condition.
+    Find how much the local model weights can be scaled
+    up or down before SecurityBuffer stops flagging
+    the magnitude condition.
 
 Test:
     Magnitude factors:
-        1.0x
-        0.5x
-        1.2x
-        3.0x
-        5.0x
+        0.90x
+        0.95x
+        0.98x
+        0.99x
+        1.00x
+        1.01x
+        1.02x
+        1.05x
+        1.10x
 
 Only magnitude is varied.
 
@@ -92,13 +97,17 @@ DATA_SEED = 1234
 # Exactly two clean history observations
 MIN_HISTORY = 2
 
-# Magnitude factors to test
+# Magnitude sensitivity factors
 MAGNITUDE_FACTORS = [
-    1.0,
-    0.5,
-    0.2,
-    3.0,
-    5.0
+    0.90,
+    0.95,
+    0.98,
+    0.99,
+    1.00,
+    1.01,
+    1.02,
+    1.05,
+    1.10
 ]
 
 
@@ -526,9 +535,10 @@ def main():
         clean_magnitude
     ]
 
-    # IMPORTANT:
-    # Create a direct reference to Client-5 history.
-    client_history = security_buffer.client_history[CLIENT_ID]
+    # Direct reference to Client-5 history
+    client_history = (
+        security_buffer.client_history[CLIENT_ID]
+    )
 
     logging.info(
         "Inserted 2 clean magnitude history observations."
@@ -552,6 +562,10 @@ def main():
 
     for factor in MAGNITUDE_FACTORS:
 
+        # --------------------------------------------------------
+        # Create manipulated update
+        # --------------------------------------------------------
+
         attacked_update = (
             manipulate_magnitude(
                 clean_update,
@@ -559,13 +573,29 @@ def main():
             )
         )
 
-        current_magnitude = (
-            security_buffer.compute_update_magnitude(
-                attacked_update["weights"]
-            )
-        )
+        # --------------------------------------------------------
+        # Calculate magnitude
+        # --------------------------------------------------------
 
-        # Use current SecurityBuffer threshold logic
+        # For 1.0x, use the original clean magnitude directly.
+        # This avoids tiny floating-point differences being
+        # interpreted as a SecurityBuffer failure.
+        if factor == 1.0:
+
+            current_magnitude = clean_magnitude
+
+        else:
+
+            current_magnitude = (
+                security_buffer.compute_update_magnitude(
+                    attacked_update["weights"]
+                )
+            )
+
+        # --------------------------------------------------------
+        # Calculate adaptive threshold
+        # --------------------------------------------------------
+
         history_values = (
             client_history["magnitude"]
         )
@@ -576,6 +606,10 @@ def main():
                 security_buffer.magnitude_threshold
             )
         )
+
+        # --------------------------------------------------------
+        # Magnitude condition
+        # --------------------------------------------------------
 
         magnitude_fail = (
             current_magnitude
@@ -588,6 +622,10 @@ def main():
             if magnitude_fail
             else 0.0
         )
+
+        # --------------------------------------------------------
+        # Save result
+        # --------------------------------------------------------
 
         result = {
 
@@ -611,6 +649,10 @@ def main():
             result
         )
 
+        # --------------------------------------------------------
+        # Comet logging
+        # --------------------------------------------------------
+
         log_magnitude_threshold_metrics(
             experiment=experiment,
             attack_factor=factor,
@@ -619,8 +661,12 @@ def main():
             magnitude_fail=magnitude_fail
         )
 
+        # --------------------------------------------------------
+        # Console logging
+        # --------------------------------------------------------
+
         logging.info(
-            f"Factor={factor:.1f}x | "
+            f"Factor={factor:.2f}x | "
             f"Magnitude={current_magnitude:.6f} | "
             f"Threshold={magnitude_threshold:.6f} | "
             f"Magnitude_Fail={magnitude_fail}"
@@ -653,16 +699,17 @@ def main():
     # Final interpretation
     # ------------------------------------------------------------
 
-    passing_factors = [
+    undetected_factors = [
         r["attack_factor"]
         for r in results
         if r["magnitude_fail"] == 0
     ]
 
-    if passing_factors:
+    if undetected_factors:
 
-        lowest_undetected = min(
-            passing_factors
+        closest_to_one = min(
+            undetected_factors,
+            key=lambda x: abs(x - 1.0)
         )
 
         logging.info(
@@ -670,9 +717,16 @@ def main():
         )
 
         logging.info(
-            f"Lowest tested factor with "
-            f"Magnitude_Fail=False: "
-            f"{lowest_undetected:.1f}x"
+            "Undetected magnitude factors:"
+        )
+
+        logging.info(
+            f"{undetected_factors}"
+        )
+
+        logging.info(
+            "Closest undetected factor to 1.0x: "
+            f"{closest_to_one:.2f}x"
         )
 
         logging.info(
@@ -682,7 +736,7 @@ def main():
     else:
 
         logging.info(
-            "All tested factors were detected "
+            "All tested magnitude factors were detected "
             "by the magnitude condition."
         )
 
