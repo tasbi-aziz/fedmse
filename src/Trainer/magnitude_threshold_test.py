@@ -9,7 +9,7 @@ Test:
     Magnitude factors:
         1.0x
         0.5x
-        0.2x
+        1.2x
         3.0x
         5.0x
 
