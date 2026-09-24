@@ -4,13 +4,13 @@ Variational Autoencoder model definition.
 Pipeline:
     X selected features
         ↓
-    32-dimensional hidden representation
+    80-dimensional hidden representation
         ↓
     mean (mu) and log-variance (logvar)
         ↓
-    16-dimensional latent space
+    64-dimensional latent space
         ↓
-    32-dimensional decoder representation
+    80-dimensional decoder representation
         ↓
     X reconstructed features
 
@@ -51,15 +51,15 @@ class Encoder(nn.Module):
           32
             ↓
         mu --------┐
-                   ├──> reparameterization -> latent z (16)
+                   ├──> reparameterization -> latent z (64)
         logvar ----┘
     """
 
     def __init__(
         self,
         input_dim,
-        hidden_neus=32,
-        latent_dim=16
+        hidden_neus=80,
+        latent_dim=64
     ):
         super(Encoder, self).__init__()
 
@@ -70,7 +70,7 @@ class Encoder(nn.Module):
         # --------------------------------------------------------
         # Shared encoder network
         #
-        # X -> 32
+        # X -> 80
         # --------------------------------------------------------
 
         self.encoder_network = nn.Sequential(
@@ -85,7 +85,7 @@ class Encoder(nn.Module):
         # --------------------------------------------------------
         # Mean vector
         #
-        # 32 -> 16
+        # 80 -> 64
         # --------------------------------------------------------
 
         self.mu_layer = nn.Linear(
@@ -97,7 +97,7 @@ class Encoder(nn.Module):
         # --------------------------------------------------------
         # Log variance vector
         #
-        # 32 -> 16
+        # 80 -> 64
         # --------------------------------------------------------
 
         self.logvar_layer = nn.Linear(
@@ -193,17 +193,17 @@ class Decoder(nn.Module):
 
     Architecture:
 
-        latent 16
+        latent 64
             ↓
-          32
+          80
             ↓
         output_dim (= selected X features)
     """
 
     def __init__(
         self,
-        latent_dim=16,
-        hidden_neus=32,
+        latent_dim=64,
+        hidden_neus=80,
         output_dim=None,
         use_sigmoid=False
     ):
@@ -320,8 +320,8 @@ class Autoencoder(nn.Module):
         self,
         input_dim,
         output_dim=None,
-        hidden_neus=32,
-        latent_dim=16,
+        hidden_neus=80,
+        latent_dim=64,
         use_sigmoid=False
     ):
         super(Autoencoder, self).__init__()
@@ -337,7 +337,7 @@ class Autoencoder(nn.Module):
         # --------------------------------------------------------
         # Encoder
         #
-        # X -> 32 -> mu/logvar
+        # X -> 80 -> mu/logvar
         # --------------------------------------------------------
 
         self.encoder = Encoder(
@@ -349,7 +349,7 @@ class Autoencoder(nn.Module):
         # --------------------------------------------------------
         # Decoder
         #
-        # 16 -> 32 -> X
+        # 64 -> 80 -> X
         # --------------------------------------------------------
 
         self.decoder = Decoder(
