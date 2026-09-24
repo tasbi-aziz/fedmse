@@ -30,7 +30,7 @@ import copy
 import json
 import random
 import logging
-
+sys.path.insert(0, "/content/fedmse/src")
 import numpy as np
 import torch
 
