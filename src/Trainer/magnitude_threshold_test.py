@@ -8,8 +8,8 @@ Purpose:
 Test:
     Magnitude factors:
         1.0x
-        1.5x
-        2.0x
+        0.5x
+        0.2x
         3.0x
         5.0x
 
@@ -512,18 +512,18 @@ def main():
     # ------------------------------------------------------------
 
     security_buffer.client_history[CLIENT_ID] = {
-      "magnitude": [],
-      "train_time_per_sample": [],
-      "val_loss": [],
-      "mse_mean": [],
-      "mse_std": [],
+        "magnitude": [],
+        "train_time_per_sample": [],
+        "val_loss": [],
+        "mse_mean": [],
+        "mse_std": [],
     }
 
     security_buffer.client_history[
-      CLIENT_ID
+        CLIENT_ID
     ]["magnitude"] = [
-         clean_magnitude,
-         clean_magnitude
+        clean_magnitude,
+        clean_magnitude
     ]
 
     logging.info(
@@ -546,6 +546,12 @@ def main():
 
     results = []
 
+    # FIX:
+    # Use the Client-5 history explicitly.
+    client_history = (
+        security_buffer.client_history[CLIENT_ID]
+    )
+
     for factor in MAGNITUDE_FACTORS:
 
         attacked_update = (
@@ -560,7 +566,7 @@ def main():
                 attacked_update["weights"]
             )
         )
-        client_history = security_buffer.client_history[CLIENT_ID]
+
         # Use current SecurityBuffer threshold logic
         history_values = (
             client_history["magnitude"]
