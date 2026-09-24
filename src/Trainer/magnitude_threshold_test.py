@@ -511,17 +511,19 @@ def main():
     # before Magnitude_Fail can be evaluated.
     # ------------------------------------------------------------
 
-    client_history = (
-        security_buffer.client_history[
-            CLIENT_ID
-        ]
-    )
+    security_buffer.client_history[CLIENT_ID] = {
+      "magnitude": [],
+      "train_time_per_sample": [],
+      "val_loss": [],
+      "mse_mean": [],
+      "mse_std": [],
+    }
 
-    client_history["magnitude"] = [
-
-        float(clean_magnitude),
-
-        float(clean_magnitude)
+    security_buffer.client_history[
+      CLIENT_ID
+    ]["magnitude"] = [
+         clean_magnitude,
+         clean_magnitude
     ]
 
     logging.info(
