@@ -526,6 +526,10 @@ def main():
         clean_magnitude
     ]
 
+    # IMPORTANT:
+    # Create a direct reference to Client-5 history.
+    client_history = security_buffer.client_history[CLIENT_ID]
+
     logging.info(
         "Inserted 2 clean magnitude history observations."
     )
@@ -545,12 +549,6 @@ def main():
     # ------------------------------------------------------------
 
     results = []
-
-    # FIX:
-    # Use the Client-5 history explicitly.
-    client_history = (
-        security_buffer.client_history[CLIENT_ID]
-    )
 
     for factor in MAGNITUDE_FACTORS:
 
