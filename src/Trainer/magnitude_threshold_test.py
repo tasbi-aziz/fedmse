@@ -560,7 +560,7 @@ def main():
                 attacked_update["weights"]
             )
         )
-
+        client_history = security_buffer.client_history[CLIENT_ID]
         # Use current SecurityBuffer threshold logic
         history_values = (
             client_history["magnitude"]
