@@ -130,7 +130,7 @@ num_rounds = 15
 lr_rate = 1e-5
 
 # VAE latent dimension
-shrink_dim = 16
+shrink_dim = 64
 
 threshold_val = 0.2
 
@@ -143,7 +143,7 @@ num_runs = 5
 batch_size = 64
 
 # Number of features after unsupervised feature selection
-target_num_features = 64
+target_num_features = 98
 
 # ------------------------------------------------
 # Fraction of each client's normal training data
