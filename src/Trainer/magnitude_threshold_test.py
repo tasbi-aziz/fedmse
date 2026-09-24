@@ -26,11 +26,15 @@ The test uses:
 """
 
 import os
+import sys
 import copy
 import json
 import random
 import logging
+
+# Add project src directory to Python import path
 sys.path.insert(0, "/content/fedmse/src")
+
 import numpy as np
 import torch
 
@@ -236,7 +240,7 @@ def prepare_client():
         n_selected_features=TARGET_NUM_FEATURES
     )
 
-    # Fit on bootstrap data exactly like main.py
+    # Fit on bootstrap data
     processor.fit_transform(
         bootstrap_data
     )
@@ -505,7 +509,6 @@ def main():
     #
     # SecurityBuffer requires min_history = 2
     # before Magnitude_Fail can be evaluated.
-    #
     # ------------------------------------------------------------
 
     client_history = (
@@ -668,7 +671,6 @@ def main():
 
         logging.info(
             "===================================================="
-
         )
 
     else:
