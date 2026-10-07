@@ -744,13 +744,10 @@ def main():
         learning_rate=lr_rate,
         shrink_dim=shrink_dim,
         batch_size=batch_size,
-        latency_threshold=1.5,
         server_lr=0.01,
         update_type="local_vae",
         network_size=1,
-        raw_features=actual_dim_features,
-        timing_attack_client="none",
-        timing_attack_start_round=0
+        raw_features=actual_dim_features
     )
 
     # Additional experiment parameters
