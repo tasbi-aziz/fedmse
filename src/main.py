@@ -2074,7 +2074,9 @@ if __name__ == "__main__":
             "final_client_wise_auc":
                 final_client_auc_runs
         }
-
+    direct_weight_factor = 1.0
+    secondary_weight_factor = 0.7
+    quarantine_weight_factor = 0.3
     # =============================================================
     # SAVE RESULTS
     # =============================================================
