@@ -29,16 +29,9 @@ Pipeline:
         - validation loss
         - 5-fold validation MSE list
         ↓
-    Security Buffer
+    Direct aggregation
         ↓
-    Direct / Secondary / Quarantine
-        ↓
-    Server validation for delayed updates
-        ↓
-    Delayed carryover to NEXT round
-        ↓
-    Secondary weight factor = 0.7
-    Quarantine weight factor = 0.3
+    FedOpt aggregation
         ↓
     FedOpt aggregation
         ↓
@@ -55,7 +48,6 @@ import argparse
 import copy
 import random
 import logging
-import math
 import time
 
 import numpy as np
@@ -69,9 +61,6 @@ from Evaluator.comet_logger import (
     finish_experiment
 )
 
-from Trainer.malicious_update_experiment2 import (
-    manipulate_update
-)
 
 from sklearn.metrics import (
     precision_score,
@@ -97,9 +86,6 @@ from Trainer import (
     GlobalAggregator
 )
 
-from Trainer.security_buffer import (
-    SecurityBuffer
-)
 
 from Model import (
     Shrink_Autoencoder,
@@ -164,64 +150,6 @@ initial_epochs = 1
 
 vae_kl_weight = 0.0001
 
-# ------------------------------------------------
-# COMBINED MALICIOUS UPDATE EXPERIMENT
-# ------------------------------------------------
-#
-# Two malicious clients are used throughout the experiment.
-#
-# Round 1:
-#     Magnitude attack only.
-#
-# Round 2:
-#     Magnitude + validation-loss + validation-MSE attacks.
-#     Timing remains CLEAN so the second clean timing observation
-#     can be collected.
-#
-# Round 3 onward:
-#     Magnitude + timing + validation-loss + validation-MSE attacks.
-#
-# SecurityBuffer min_history = 2 remains unchanged.
-#
-# ------------------------------------------------
-
-MALICIOUS_CLIENTS = ["Client-5", "Client-8"]
-
-TIMING_ATTACK_START_ROUND = 3
-
-# ------------------------------------------------
-# DELAYED UPDATE WEIGHT FACTORS
-# ------------------------------------------------
-#
-# FAST + CLEAN:
-#     current round aggregation
-#     factor = 1.0
-#
-# SLOW / SECONDARY:
-#     validated in current round
-#     aggregated NEXT round
-#     factor = 0.7
-#
-# QUARANTINE:
-#     validated in current round
-#     if accepted -> aggregated NEXT round
-#     factor = 0.3
-#
-# ------------------------------------------------
-
-direct_weight_factor = 1.0
-
-secondary_weight_factor = 0.7
-
-quarantine_weight_factor = 0.3
-
-# ------------------------------------------------
-# Server-side validation
-# ------------------------------------------------
-
-minimum_weight_factor = 0.10
-
-validation_rejection_ratio = 4.0
 
 
 config_file = (
@@ -728,237 +656,6 @@ def evaluate_clientwise_auc(
     return client_results
 
 
-# ================================================================
-# SERVER VALIDATION OF DELAYED UPDATE
-# ================================================================
-
-def validate_delayed_update(
-    update,
-    global_model,
-    server_val_loader,
-    current_global_mse,
-    route_type,
-    device="cpu"
-):
-    """
-    Validates a delayed Secondary or Quarantine update
-    on the server validation dataset.
-
-    IMPORTANT:
-        This function does NOT aggregate the update.
-
-    It only decides whether the update can be carried
-    to the NEXT round.
-
-    Secondary:
-        accepted -> factor 0.7 -> next round
-
-    Quarantine:
-        accepted -> factor 0.3 -> next round
-        rejected -> DROP
-    """
-
-    if (
-        update is None
-        or "weights" not in update
-        or global_model is None
-        or server_val_loader is None
-    ):
-
-        return (
-            False,
-            quarantine_weight_factor
-            if route_type == "QUARANTINE"
-            else secondary_weight_factor,
-            float("inf"),
-            "DROP"
-        )
-
-    candidate_model = copy.deepcopy(
-        global_model
-    ).to(device)
-
-    try:
-
-        candidate_model.load_state_dict(
-            update["weights"]
-        )
-
-    except Exception as exc:
-
-        logging.warning(
-            f"[Server Validation] "
-            f"Failed to load Client "
-            f"{update.get('client_id', 'unknown')} "
-            f"weights: {exc}"
-        )
-
-        return (
-            False,
-            quarantine_weight_factor
-            if route_type == "QUARANTINE"
-            else secondary_weight_factor,
-            float("inf"),
-            "DROP"
-        )
-
-    candidate_model.eval()
-
-    criterion = nn.MSELoss()
-
-    total_loss = 0.0
-
-    total_samples = 0
-
-    with torch.no_grad():
-
-        for batch in server_val_loader:
-
-            inputs = (
-                batch[0].to(device)
-                if isinstance(
-                    batch,
-                    (list, tuple)
-                )
-                else batch.to(device)
-            )
-
-            outputs = candidate_model(
-                inputs
-            )
-
-            reconstructed = (
-                extract_reconstructed_output(
-                    outputs
-                )
-            )
-
-            loss = criterion(
-                reconstructed,
-                inputs
-            )
-
-            total_loss += (
-                loss.item()
-                *
-                inputs.size(0)
-            )
-
-            total_samples += (
-                inputs.size(0)
-            )
-
-    candidate_mse = (
-        total_loss
-        /
-        max(
-            total_samples,
-            1
-        )
-    )
-
-    del candidate_model
-
-    if torch.cuda.is_available():
-
-        torch.cuda.empty_cache()
-
-    # -------------------------------------------------------------
-    # Invalid candidate
-    # -------------------------------------------------------------
-
-    if not math.isfinite(
-        candidate_mse
-    ):
-
-        return (
-            False,
-            quarantine_weight_factor
-            if route_type == "QUARANTINE"
-            else secondary_weight_factor,
-            candidate_mse,
-            "DROP"
-        )
-
-    # -------------------------------------------------------------
-    # No usable global baseline
-    # -------------------------------------------------------------
-
-    if (
-        not math.isfinite(
-            current_global_mse
-        )
-        or current_global_mse <= 0
-    ):
-
-        if route_type == "QUARANTINE":
-
-            return (
-                True,
-                quarantine_weight_factor,
-                candidate_mse,
-                "QUARANTINE_ACCEPTED"
-            )
-
-        else:
-
-            return (
-                True,
-                secondary_weight_factor,
-                candidate_mse,
-                "SECONDARY_ACCEPTED"
-            )
-
-    # -------------------------------------------------------------
-    # Compare candidate against current global model
-    # -------------------------------------------------------------
-
-    if (
-        candidate_mse
-        >
-        current_global_mse
-        *
-        validation_rejection_ratio
-    ):
-
-        logging.warning(
-            f"[Server Validation] "
-            f"Client {update.get('client_id', 'unknown')} "
-            f"failed validation | "
-            f"Candidate MSE: {candidate_mse:.6f} | "
-            f"Global MSE: {current_global_mse:.6f} | "
-            f"Allowed Ratio: {validation_rejection_ratio:.2f}"
-        )
-
-        return (
-            False,
-            quarantine_weight_factor
-            if route_type == "QUARANTINE"
-            else secondary_weight_factor,
-            candidate_mse,
-            "DROP"
-        )
-
-    # -------------------------------------------------------------
-    # Accepted delayed update
-    # -------------------------------------------------------------
-
-    if route_type == "QUARANTINE":
-
-        return (
-            True,
-            quarantine_weight_factor,
-            candidate_mse,
-            "QUARANTINE_ACCEPTED"
-        )
-
-    return (
-        True,
-        secondary_weight_factor,
-        candidate_mse,
-        "SECONDARY_ACCEPTED"
-    )
-
 
 # ================================================================
 # MAIN
@@ -973,18 +670,6 @@ if __name__ == "__main__":
         )
     )
 
-    # -------------------------------------------------------------
-    # 1.5 sec = FAST/SLOW classification threshold
-    # -------------------------------------------------------------
-
-    parser.add_argument(
-        "--latency_threshold",
-        type=float,
-        default=1.5,
-        help=(
-            "FAST/SLOW arrival latency threshold in seconds"
-        )
-    )
 
     parser.add_argument(
         "--update_type",
@@ -1529,8 +1214,6 @@ if __name__ == "__main__":
         shuffle=False
     )
 
-    criterion = nn.MSELoss()
-
     all_experiment_results = {}
 
     # =============================================================
@@ -1586,13 +1269,10 @@ if __name__ == "__main__":
                 learning_rate=lr_rate,
                 shrink_dim=shrink_dim,
                 batch_size=batch_size,
-                latency_threshold=args.latency_threshold,
                 server_lr=args.server_lr,
                 update_type=args.update_type,
                 network_size=network_size,
                 raw_features=actual_dim_features,
-                timing_attack_client=", ".join(MALICIOUS_CLIENTS),
-                timing_attack_start_round=TIMING_ATTACK_START_ROUND
               )
 
             logging.info(
@@ -1694,31 +1374,6 @@ if __name__ == "__main__":
                 max_server_update_norm=1.0
             )
 
-            # =====================================================
-            # SECURITY BUFFER
-            # =====================================================
-
-            sec_buffer_tracker = SecurityBuffer(
-                global_model=global_model,
-                window_size=5,
-                latency_threshold=args.latency_threshold,
-                alpha=0.2,
-                beta=0.01
-            )
-
-            # =====================================================
-            # DELAYED UPDATES
-            # =====================================================
-            #
-            # These updates were validated during the PREVIOUS
-            # round and are eligible for aggregation in THIS round.
-            #
-            # They must NEVER be aggregated in the round in which
-            # they were first received.
-            #
-            # =====================================================
-
-            carryover_updates = []
 
             # =====================================================
             # ROUND HISTORY
@@ -1751,21 +1406,6 @@ if __name__ == "__main__":
                     f"--- Round {round_number}/{num_rounds} ---"
                 )
 
-                # -------------------------------------------------
-                # Baseline global validation MSE
-                # -------------------------------------------------
-
-                global_mse = evaluate_global_mse(
-                    global_aggregator.model,
-                    server_val_loader,
-                    device=device
-                )
-
-                logging.info(
-                    f"[Round {round_number}] "
-                    f"Pre-Aggregation Global Val MSE: "
-                    f"{global_mse:.6f}"
-                )
 
                 # =================================================
                 # STEP A:
@@ -1924,89 +1564,6 @@ if __name__ == "__main__":
                             device_trainer.kl_loss
                     }
 
-                    # -------------------------------------------------
-                    # Client-3 = timing attacker
-                    #
-                    # Round 1:
-                    #     CLEAN
-                    # -------------------------------------------------
-                    # STAGED COMBINED MALICIOUS UPDATE EXPERIMENT
-                    #
-                    # Round 1:
-                    #     Magnitude only.
-                    #
-                    # Round 2:
-                    #     Magnitude + validation loss + validation MSE.
-                    #     Timing remains clean for the second history point.
-                    #
-                    # Round 3 onward:
-                    #     Magnitude + timing + validation loss + validation MSE.
-                    # -------------------------------------------------
-
-                    if client["device"] in MALICIOUS_CLIENTS:
-
-                        if round_number == 1:
-
-                            update = manipulate_update(
-                                update,
-                                attack_type="magnitude"
-                            )
-
-                            logging.warning(
-                                f"[ATTACK] {client['device']} "
-                                f"magnitude attack generated | "
-                                f"Round: {round_number} | "
-                                f"Parameter: "
-                                f"{update.get('attack_parameter', 'unknown')}"
-                            )
-
-                        elif round_number == 2:
-
-                            update = manipulate_update(
-                                update,
-                                attack_type="magnitude"
-                            )
-
-                            update = manipulate_update(
-                                update,
-                                attack_type="loss"
-                            )
-
-                            update = manipulate_update(
-                                update,
-                                attack_type="mse"
-                            )
-
-                            logging.warning(
-                                f"[ATTACK] {client['device']} "
-                                f"magnitude + loss + mse attack generated | "
-                                f"Round: {round_number}"
-                            )
-
-                        else:
-
-                            update = manipulate_update(
-                                update,
-                                attack_type="combined"
-                            )
-
-                            logging.warning(
-                                f"[ATTACK] {client['device']} "
-                                f"combined malicious update generated | "
-                                f"Round: {round_number} | "
-                                f"Attack Type: "
-                                f"{update.get('attack_type', 'unknown')} | "
-                                f"Parameter: "
-                                f"{update.get('attack_parameter', 'unknown')}"
-                            )
-
-                    else:
-
-                        update = manipulate_update(
-                            update,
-                            attack_type="none"
-                        )
-
                     incoming_updates.append(
                         update
                     )
@@ -2026,93 +1583,22 @@ if __name__ == "__main__":
 
                 # =================================================
                 # STEP C:
-                # SECURITY BUFFER ROUTING
+                # BASELINE DIRECT AGGREGATION
                 # =================================================
                 #
-                # ready_updates:
-                #     ONLY updates eligible for CURRENT round.
+                # Security Buffer, delayed-update validation,
+                # secondary routing, quarantine routing and
+                # carryover are disabled for the baseline experiment.
                 #
-                # buffered updates:
-                #     NOT eligible for CURRENT aggregation.
-                #
+                # Every normal client update is aggregated directly
+                # in the current round with weight factor = 1.0.
                 # =================================================
 
-                ready_updates = (
-                    sec_buffer_tracker.collect_current_round_updates(
-                        incoming_updates=incoming_updates,
-                        global_model=global_aggregator.model,
-                        val_loader=server_val_loader,
-                        criterion=criterion,
-                        global_mse=global_mse,
-                        device=device
-                    )
-                )
-
-                # =================================================
-                # STEP D:
-                # CURRENT ROUND DIRECT UPDATES
-                # =================================================
+                aggregation_updates = []
 
                 direct_current_updates = []
 
-                for update in ready_updates:
-
-                    update = copy.deepcopy(
-                        update
-                    )
-
-                    route = update.get(
-                        "aggregation_route",
-                        "DIRECT"
-                    )
-
-                    # -------------------------------------------------
-                    # Only DIRECT is allowed in current round
-                    # -------------------------------------------------
-
-                    if route == "DIRECT":
-
-                        update["weight_factor"] = (
-                            direct_weight_factor
-                        )
-
-                        update[
-                            "aggregation_route"
-                        ] = "DIRECT"
-
-                        update[
-                            "aggregation_round"
-                        ] = round_number
-
-                        direct_current_updates.append(
-                            update
-                        )
-
-                        logging.info(
-                            f"[Current Round Direct] "
-                            f"Client "
-                            f"{update.get('client_id', 'unknown')} | "
-                            f"Weight Factor: 1.00"
-                        )
-
-                    else:
-
-                        logging.info(
-                            f"[Current Round] "
-                            f"Non-direct ready update from "
-                            f"Client "
-                            f"{update.get('client_id', 'unknown')} "
-                            f"was NOT aggregated immediately."
-                        )
-
-                # =================================================
-                # STEP E:
-                # VALIDATE CURRENT BUFFERED UPDATES
-                # =================================================
-
                 secondary_updates_for_next_round = []
-
-                remaining_buffer = []
 
                 current_secondary_count = 0
 
@@ -2120,172 +1606,39 @@ if __name__ == "__main__":
 
                 current_dropped_count = 0
 
-                for buffered_update in list(
-                    sec_buffer_tracker.buffer
-                ):
+                previous_carryover_count = 0
 
-                    client_id = buffered_update.get(
-                        "client_id",
-                        "unknown"
+                for update in incoming_updates:
+
+                    update = copy.deepcopy(
+                        update
                     )
 
-                    buffer_route = buffered_update.get(
-                        "aggregation_route",
-                        "SECONDARY_CHECK"
+                    update["weight_factor"] = 1.0
+
+                    update["aggregation_route"] = "DIRECT"
+
+                    update["aggregation_round"] = round_number
+
+                    aggregation_updates.append(
+                        update
                     )
 
-                    # -------------------------------------------------
-                    # Determine validation type
-                    # -------------------------------------------------
-
-                    if buffer_route == "QUARANTINE":
-
-                        route_type = "QUARANTINE"
-
-                        current_quarantine_count += 1
-
-                    else:
-
-                        route_type = "SECONDARY"
-
-                        current_secondary_count += 1
-
-                    # -------------------------------------------------
-                    # Every delayed update must be validated before
-                    # becoming eligible for next-round aggregation.
-                    # -------------------------------------------------
-
-                    (
-                        accepted,
-                        weight_factor,
-                        server_val_mse,
-                        validation_route
-                    ) = validate_delayed_update(
-                        update=buffered_update,
-                        global_model=global_aggregator.model,
-                        server_val_loader=server_val_loader,
-                        current_global_mse=global_mse,
-                        route_type=route_type,
-                        device=device
+                    direct_current_updates.append(
+                        update
                     )
 
-                    buffered_update[
-                        "server_validation_mse"
-                    ] = server_val_mse
-
-                    # =================================================
-                    # SECONDARY ACCEPTED
-                    # =================================================
-
-                    if (
-                        accepted
-                        and
-                        route_type == "SECONDARY"
-                    ):
-
-                        buffered_update[
-                            "weight_factor"
-                        ] = secondary_weight_factor
-
-                        buffered_update[
-                            "aggregation_route"
-                        ] = "SECONDARY_ACCEPTED"
-
-                        buffered_update[
-                            "aggregation_round"
-                        ] = round_number + 1
-
-                        secondary_updates_for_next_round.append(
-                            buffered_update
-                        )
-
-                        logging.info(
-                            f"[Secondary Validation] "
-                            f"Client {client_id} ACCEPTED | "
-                            f"Server Val MSE: "
-                            f"{server_val_mse:.6f} | "
-                            f"Weight Factor: 0.70 | "
-                            f"Scheduled for Round "
-                            f"{round_number + 1}"
-                        )
-
-                    # =================================================
-                    # QUARANTINE ACCEPTED
-                    # =================================================
-
-                    elif (
-                        accepted
-                        and
-                        route_type == "QUARANTINE"
-                    ):
-
-                        buffered_update[
-                            "weight_factor"
-                        ] = quarantine_weight_factor
-
-                        buffered_update[
-                            "aggregation_route"
-                        ] = "QUARANTINE_ACCEPTED"
-
-                        buffered_update[
-                            "aggregation_round"
-                        ] = round_number + 1
-
-                        secondary_updates_for_next_round.append(
-                            buffered_update
-                        )
-
-                        logging.info(
-                            f"[Quarantine Validation] "
-                            f"Client {client_id} ACCEPTED | "
-                            f"Server Val MSE: "
-                            f"{server_val_mse:.6f} | "
-                            f"Weight Factor: 0.30 | "
-                            f"Scheduled for Round "
-                            f"{round_number + 1}"
-                        )
-
-                    # =================================================
-                    # REJECTED / DROPPED
-                    # =================================================
-
-                    else:
-
-                        current_dropped_count += 1
-
-                        logging.warning(
-                            f"[Security Validation] "
-                            f"Client {client_id} DROPPED | "
-                            f"Route: {route_type} | "
-                            f"Server Val MSE: "
-                            f"{server_val_mse:.6f}"
-                        )
-
-                # -----------------------------------------------------
-                # Validated updates have now left the SecurityBuffer.
-                # -----------------------------------------------------
-
-                sec_buffer_tracker.buffer = (
-                    remaining_buffer
-                )
+                    logging.info(
+                        f"[Current Round Direct] "
+                        f"Client "
+                        f"{update.get('client_id', 'unknown')} | "
+                        f"Weight Factor: 1.00"
+                    )
 
                 # =================================================
-                # STEP F:
-                # SAVE DELAYED UPDATES FOR NEXT ROUND
-                # =================================================
-
-                carryover_updates = (
-                    secondary_updates_for_next_round
-                )
-
-                # =================================================
-                # STEP G:
+                # STEP D:
                 # CURRENT ROUND AGGREGATION
                 # =================================================
-
-                aggregation_updates.extend(
-                    direct_current_updates
-                )
 
                 if aggregation_updates:
 
@@ -2296,8 +1649,6 @@ if __name__ == "__main__":
                     logging.info(
                         f"[Round {round_number}] "
                         f"FedOpt aggregation completed | "
-                        f"Previous delayed: "
-                        f"{previous_carryover_count} | "
                         f"Current DIRECT: "
                         f"{len(direct_current_updates)} | "
                         f"Total Aggregated: "
@@ -2456,41 +1807,19 @@ if __name__ == "__main__":
                         ),
 
                     "secondary_updates":
-                        len(
-                            secondary_updates_for_next_round
-                        ),
+                        0,
 
                     "secondary_accepted":
-                        sum(
-                            1
-                            for u in
-                            secondary_updates_for_next_round
-                            if u.get(
-                                "aggregation_route"
-                            )
-                            ==
-                            "SECONDARY_ACCEPTED"
-                        ),
+                        0,
 
                     "quarantine_accepted":
-                        sum(
-                            1
-                            for u in
-                            secondary_updates_for_next_round
-                            if u.get(
-                                "aggregation_route"
-                            )
-                            ==
-                            "QUARANTINE_ACCEPTED"
-                        ),
+                        0,
 
                     "dropped_updates":
-                        current_dropped_count,
+                        0,
 
                     "buffered_updates":
-                        len(
-                            sec_buffer_tracker.buffer
-                        ),
+                        0,
 
                     "accepted_updates":
                         len(
@@ -2528,16 +1857,8 @@ if __name__ == "__main__":
                     f"Mean Client AUC: {mean_client_auc:.4f} | "
                     f"Current DIRECT: "
                     f"{len(direct_current_updates)} | "
-                    f"Previous Delayed Aggregated: "
-                    f"{previous_carryover_count} | "
                     f"Total Aggregated: "
                     f"{len(aggregation_updates)} | "
-                    f"Scheduled Next Round: "
-                    f"{len(secondary_updates_for_next_round)} | "
-                    f"Dropped: "
-                    f"{current_dropped_count} | "
-                    f"Buffered: "
-                    f"{len(sec_buffer_tracker.buffer)} | "
                     f"Duration: "
                     f"{round_duration:.2f}s"
                 )
