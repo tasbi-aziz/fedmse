@@ -1661,11 +1661,27 @@ if __name__ == "__main__":
                 # ROUND EVALUATION
                 # =================================================
 
+
+                train_total_loss = np.mean([
+                    update["train_loss"] for update in incoming_updates
+                ])
+                train_reconstruction_mse = np.mean([
+                    update["reconstruction_loss"] for update in incoming_updates
+                ])
+                validation_total_loss = np.mean([
+                    update["val_loss"] for update in incoming_updates
+                ])
+                validation_reconstruction_mse = np.mean([
+                    np.mean(update["val_mse_list"])
+                    for update in incoming_updates
+                    if update["val_mse_list"]
+                ])
                 round_duration = (
                     time.time()
                     -
                     round_start_time
                 )
+                
 
                 # -------------------------------------------------
                 # Post aggregation global validation MSE
