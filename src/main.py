@@ -1787,7 +1787,14 @@ if __name__ == "__main__":
 
                     "global_val_mse":
                         post_eval_mse,
-
+                    "train_total_loss":
+                        train_total_loss,
+                    "validation_total_loss":
+                        validation_total_loss,
+                    "train_reconstruction_mse":
+                         train_reconstruction_mse,
+                    "validation_reconstruction_mse":
+                         validation_reconstruction_mse,
                     "test_precision":
                         global_metrics["precision"],
 
