@@ -2077,6 +2077,7 @@ if __name__ == "__main__":
     direct_weight_factor = 1.0
     secondary_weight_factor = 0.7
     quarantine_weight_factor = 0.3
+    validation_rejection_ratio = 4.0
     # =============================================================
     # SAVE RESULTS
     # =============================================================
