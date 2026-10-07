@@ -61,7 +61,6 @@ from Evaluator.comet_logger import (
     finish_experiment
 )
 
-
 from sklearn.metrics import (
     precision_score,
     recall_score,
@@ -85,7 +84,6 @@ from Trainer import (
     ClientTrainer,
     GlobalAggregator
 )
-
 
 from Model import (
     Shrink_Autoencoder,
@@ -149,7 +147,6 @@ initial_epochs = 1
 # ------------------------------------------------
 
 vae_kl_weight = 0.0001
-
 
 
 config_file = (
@@ -656,7 +653,6 @@ def evaluate_clientwise_auc(
     return client_results
 
 
-
 # ================================================================
 # MAIN
 # ================================================================
@@ -669,7 +665,6 @@ if __name__ == "__main__":
             "with VAE, FedOpt and Security Buffer"
         )
     )
-
 
     parser.add_argument(
         "--update_type",
@@ -1260,6 +1255,7 @@ if __name__ == "__main__":
             set_seeds(
                 run_seed
             )
+
             experiment = create_experiment(
                 model_type=model_type,
                 run_number=run + 1,
@@ -1273,7 +1269,7 @@ if __name__ == "__main__":
                 update_type=args.update_type,
                 network_size=network_size,
                 raw_features=actual_dim_features,
-              )
+            )
 
             logging.info(
                 f"--- Starting Execution "
@@ -1374,7 +1370,6 @@ if __name__ == "__main__":
                 max_server_update_norm=1.0
             )
 
-
             # =====================================================
             # ROUND HISTORY
             # =====================================================
@@ -1405,7 +1400,6 @@ if __name__ == "__main__":
                     f"[Run {run + 1} | Model {model_type}] "
                     f"--- Round {round_number}/{num_rounds} ---"
                 )
-
 
                 # =================================================
                 # STEP A:
@@ -1830,6 +1824,7 @@ if __name__ == "__main__":
                 run_round_history.append(
                     round_record
                 )
+
                 log_round_metrics(
                     experiment=experiment,
                     round_number=round_number,
@@ -1859,8 +1854,7 @@ if __name__ == "__main__":
                     f"{len(direct_current_updates)} | "
                     f"Total Aggregated: "
                     f"{len(aggregation_updates)} | "
-                    f"Duration: "
-                    f"{round_duration:.2f}s"
+                    f"Duration: {round_duration:.2f}s"
                 )
 
             # =====================================================
@@ -1951,7 +1945,10 @@ if __name__ == "__main__":
                 f"Saved run checkpoint to: "
                 f"{checkpoint_path}"
             )
-            finish_experiment(experiment)
+
+            finish_experiment(
+                experiment
+            )
 
     # =============================================================
     # SUMMARY STATISTICS
@@ -2131,9 +2128,6 @@ if __name__ == "__main__":
 
         "asynchronous_security": {
 
-            "latency_threshold":
-                args.latency_threshold,
-
             "bootstrap_fraction":
                 bootstrap_fraction,
 
@@ -2168,17 +2162,13 @@ if __name__ == "__main__":
             "attack_schedule": {
                 "round_1":
                     "magnitude",
+
                 "round_2":
                     "magnitude + validation_loss + validation_mse",
+
                 "round_3_onward":
                     "magnitude + timing + validation_loss + validation_mse"
             },
-
-            "timing_attack_start_round":
-                TIMING_ATTACK_START_ROUND,
-
-            "warmup_rounds":
-                TIMING_ATTACK_START_ROUND - 1,
 
             "attack_parameters":
                 "magnitude=5x, timing=3x, loss=5x, mse=5x",
