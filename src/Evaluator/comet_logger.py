@@ -54,6 +54,12 @@ def log_round_metrics(
     experiment,
     round_number,
     global_val_mse,
+
+    train_total_loss,
+    validation_total_loss,
+    train_reconstruction_mse,
+    validation_reconstruction_mse,
+
     test_precision,
     test_recall,
     test_f1,
@@ -75,6 +81,16 @@ def log_round_metrics(
     experiment.log_metrics(
         {
             "global_val_mse": float(global_val_mse),
+
+            "train_total_loss": float(train_total_loss),
+            "validation_total_loss": float(validation_total_loss),
+
+            "train_reconstruction_mse": float(
+                train_reconstruction_mse
+            ),
+            "validation_reconstruction_mse": float(
+                validation_reconstruction_mse
+            ),
 
             "test_precision": float(test_precision),
             "test_recall": float(test_recall),
