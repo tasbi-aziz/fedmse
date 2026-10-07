@@ -2169,8 +2169,8 @@ if __name__ == "__main__":
                 "round_2":
                     "magnitude + validation_loss + validation_mse",
 
-                "round_3_onward":
-                    "magnitude + timing + validation_loss + validation_mse"
+                #"round_3_onward":
+                 #   "magnitude + timing + validation_loss + validation_mse"
             },
 
             "attack_parameters":
@@ -2179,7 +2179,7 @@ if __name__ == "__main__":
             "purpose":
                 (
                     "Magnitude starts immediately; timing requires two "
-                    "clean timing observations; validation-loss and "
+                   # "clean timing observations; validation-loss and "
                     "validation-MSE attacks start in Round 2."
                 )
         },
