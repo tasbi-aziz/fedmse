@@ -12,13 +12,10 @@ def create_experiment(
     learning_rate,
     shrink_dim,
     batch_size,
-    latency_threshold,
     server_lr,
     update_type,
     network_size,
     raw_features,
-    timing_attack_client,
-    timing_attack_start_round,
 ):
     """
     Create and configure a Comet experiment for one model/run.
@@ -43,15 +40,11 @@ def create_experiment(
         "shrink_dim": shrink_dim,
         "batch_size": batch_size,
 
-        "latency_threshold": latency_threshold,
         "server_lr": server_lr,
         "update_type": update_type,
 
         "network_size": network_size,
         "raw_features": raw_features,
-
-        "timing_attack_client": timing_attack_client,
-        "timing_attack_start_round": timing_attack_start_round,
     })
 
     return experiment
