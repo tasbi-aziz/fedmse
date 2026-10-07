@@ -1385,7 +1385,7 @@ if __name__ == "__main__":
             # =====================================================
             # TRAINING ROUNDS
             # =====================================================
-
+            carryover_updates = []
             for round_idx in range(
                 num_rounds
             ):
