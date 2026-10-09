@@ -118,7 +118,7 @@ shrink_dim = 64
 
 threshold_val = 0.2
 
-network_size = 10
+network_size = 50
 
 data_seed = 1234
 
