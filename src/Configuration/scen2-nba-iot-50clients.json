@@ -1,5 +1,5 @@
 {
-    "data_path": "/content/drive/MyDrive/Prepared_dataset/nonIID-50-Client_Data",
+    "data_path": "/content/drive/MyDrive/Prepared_dataset/IID-50-Client_Data",
     "devices_list": [
        {
             "id": 1,
