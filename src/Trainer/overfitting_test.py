@@ -71,7 +71,7 @@ lr_rate = 1e-5
 
 shrink_dim = 16
 
-network_size = 10
+network_size = 50
 
 data_seed = 1234
 
@@ -90,7 +90,7 @@ threshold_val = 0.2
 
 config_file = (
     "/content/fedmse/Configuration/"
-    "scen2-nba-iot-10clients.json"
+    "scen2-nba-iot-50clients.json"
 )
 
 
