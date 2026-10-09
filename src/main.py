@@ -151,7 +151,7 @@ vae_kl_weight = 0.0001
 
 config_file = (
     "/content/fedmse/Configuration/"
-    "scen2-nba-iot-10clients.json"
+    "scen2-nba-iot-50clients.json"
 )
 
 
