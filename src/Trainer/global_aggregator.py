@@ -70,10 +70,12 @@ class GlobalAggregator:
 
         self.update_type = update_type.lower()
 
-        if self.update_type != "fedopt":
+        # "fedopt" : adaptive (Adam) server step  -> FedAdam
+        # "fedavg" : plain SGD server step         -> x = x + server_lr * avg_delta
+        #            (FedAvg is FedOpt with an SGD server optimiser, server_lr = 1)
+        if self.update_type not in ("fedopt", "fedavg"):
             raise ValueError(
-                "This GlobalAggregator is configured for "
-                "FedOpt only. Use update_type='fedopt'."
+                "update_type must be 'fedopt' or 'fedavg'."
             )
 
         self.server_lr = server_lr
@@ -235,7 +237,10 @@ class GlobalAggregator:
         # Gradient clipping
         # ---------------------------------------------------------
 
-        if grad_norm > self.max_server_update_norm:
+        if (
+            self.max_server_update_norm is not None
+            and grad_norm > self.max_server_update_norm
+        ):
 
             scale = (
                 self.max_server_update_norm
@@ -312,7 +317,10 @@ class GlobalAggregator:
         # Final server-step clipping
         # ---------------------------------------------------------
 
-        if step_norm > self.max_server_step_norm:
+        if (
+            self.max_server_step_norm is not None
+            and step_norm > self.max_server_step_norm
+        ):
 
             scale = (
                 self.max_server_step_norm
@@ -862,6 +870,25 @@ class GlobalAggregator:
                 )
 
                 # -------------------------------------------------
+                # FEDAVG: plain SGD server step, no Adam moments
+                # -------------------------------------------------
+
+                if self.update_type == "fedavg":
+
+                    new_param = (
+                        param.to(device)
+                        +
+                        (self.server_lr * grad).to(device)
+                    )
+
+                    if torch.isfinite(new_param).all():
+                        updated_global_state[key] = new_param
+                    else:
+                        updated_global_state[key] = param.clone()
+
+                    continue
+
+                # -------------------------------------------------
                 # Initialize moments if necessary
                 # -------------------------------------------------
 
@@ -1138,7 +1165,7 @@ class GlobalAggregator:
         logging.info(
             "[GlobalAggregator] "
             f"Aggregated {num_clients} valid client updates "
-            f"via FEDOPT | "
+            f"via {self.update_type.upper()} | "
             f"Rejected: {rejected_clients} | "
             f"Total Effective Weight: "
             f"{total_weight:.2f}"
