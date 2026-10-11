@@ -26,12 +26,21 @@ Pipeline of one communication round
 """
 
 import os
+import sys
 import json
 import copy
 import time
 import random
 import argparse
 import logging
+
+# Comet must be imported before torch. It is only used with --comet.
+USE_COMET = "--comet" in sys.argv
+if USE_COMET:
+    try:
+        import comet_ml  # noqa: F401
+    except ImportError:
+        sys.exit("--comet needs the comet_ml package:  pip install comet_ml")
 
 import numpy as np
 import pandas as pd
@@ -49,6 +58,85 @@ from Model.AutoEncoder import Autoencoder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main_secure")
+
+
+# ================================================================
+# COMET LOGGING (optional, switched on with --comet)
+# ================================================================
+# Uses the existing Evaluator/comet_logger.py, so the graphs appear in the same
+# Comet project ("security-buffer") with the same metric names as before.
+# A Comet problem never stops the training run.
+
+def _comet_logger():
+    """Loads Evaluator/comet_logger.py directly (without the rest of Evaluator)."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Evaluator", "comet_logger.py")
+    spec = importlib.util.spec_from_file_location("comet_logger", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def comet_start(args, run_idx, seed, n_clients, n_features, malicious):
+    if not USE_COMET:
+        return None
+    try:
+        exp = _comet_logger().create_experiment(
+            model_type=args.tag, run_number=run_idx + 1, run_seed=seed,
+            num_rounds=args.rounds, epoch=args.epochs, learning_rate=args.lr,
+            shrink_dim=args.latent, batch_size=args.batch_size, server_lr=args.server_lr,
+            update_type=args.server_mode, network_size=n_clients, raw_features=n_features,
+        )
+        exp.log_parameters({
+            "buffer": args.buffer, "attack": args.attack,
+            "attack_strength": args.attack_strength if args.attack != "none" else 0,
+            "malicious_clients": ",".join(malicious), "attack_start_round": args.attack_start_round,
+            "latency_threshold": args.latency_threshold, "rejection_ratio": args.rejection_ratio,
+            "hidden": args.hidden, "kl_weight": args.kl_weight,
+        })
+        return exp
+    except Exception as exc:
+        log.warning("Comet logging is off for this run: %s", exc)
+        return None
+
+
+def comet_round(exp, rec, extra):
+    if exp is None:
+        return
+    try:
+        _comet_logger().log_round_metrics(
+            experiment=exp, round_number=rec["round"], global_val_mse=rec["global_val_mse"],
+            train_total_loss=extra["train_total_loss"], validation_total_loss=rec["mean_local_val_mse"],
+            train_reconstruction_mse=extra["train_reconstruction_mse"],
+            validation_reconstruction_mse=rec["mean_local_val_mse"],
+            test_precision=rec["test_precision"], test_recall=rec["test_recall"],
+            test_f1=rec["test_f1"], test_auc=rec["test_auc"], mean_client_auc=rec["mean_client_auc"],
+            direct_updates=rec["direct"], aggregated_updates=rec["aggregated"],
+            secondary_updates=rec["secondary"], secondary_accepted=rec["secondary"],
+            quarantine_accepted=rec["quarantine_accepted"], dropped_updates=rec["dropped"],
+            buffered_updates=extra["waiting_for_next_round"], round_duration=rec["seconds"],
+        )
+        # extra graphs that the old logger did not have
+        exp.log_metrics({
+            "quarantined_updates": rec["quarantined"],
+            "attacked_updates": extra["attacked"],
+            "attacked_updates_quarantined": extra["attacked_quarantined"],
+            "attacked_updates_dropped": extra["attacked_dropped"],
+            "honest_updates_quarantined": extra["honest_quarantined"],
+            "min_client_auc": rec["min_client_auc"],
+            "detection_threshold": rec["threshold"],
+        }, step=rec["round"])
+    except Exception as exc:
+        log.warning("Comet round logging failed: %s", exc)
+
+
+def comet_finish(exp):
+    if exp is None:
+        return
+    try:
+        _comet_logger().finish_experiment(exp)
+    except Exception as exc:
+        log.warning("Comet finish failed: %s", exc)
 
 
 # ================================================================
@@ -217,6 +305,8 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
         buffer = SecurityBuffer(latency_threshold=args.latency_threshold,
                                 security_checks=(args.buffer == "security"))
 
+    experiment = comet_start(args, run_idx, seed, len(clients), n_features, malicious)
+
     carryover = []            # updates waiting for the NEXT round: dict(client, delta, n, weight, route)
     round_rows, routing_rows = [], []
 
@@ -240,7 +330,7 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
 
         # ---- 2. local training + 3. attack ----
         counts = {DIRECT: 0, SECONDARY: 0, QUARANTINE: 0, DROP: 0, "quarantine_accepted": 0}
-        local_val = []
+        local_val, local_train_total, local_train_recon = [], [], []
         incoming = []
         for c in clients:
             trainer = ClientTrainer(model=aggregator.model, client_id=c["name"],
@@ -249,6 +339,8 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
                                     device=str(device), kl_weight=args.kl_weight)
             trainer.run(c["train_loader"], c["valid_loader"])
             local_val.append(trainer.val_loss)
+            local_train_recon.append(trainer.reconstruction_loss)
+            local_train_total.append(trainer.reconstruction_loss + args.kl_weight * trainer.kl_loss)
 
             update = dict(
                 client_id=c["name"],
@@ -345,12 +437,24 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
                    dropped=sum(1 for r in routing_rows if r["run"] == run_idx + 1 and r["round"] == rnd and r["outcome"] == "dropped"),
                    seconds=round(time.time() - t0, 2), client_auc=client_auc)
         round_rows.append(rec)
+
+        this_round = [r for r in routing_rows if r["run"] == run_idx + 1 and r["round"] == rnd]
+        comet_round(experiment, rec, dict(
+            train_total_loss=float(np.mean(local_train_total)),
+            train_reconstruction_mse=float(np.mean(local_train_recon)),
+            waiting_for_next_round=len(carryover),
+            attacked=sum(r["attacked"] for r in this_round),
+            attacked_quarantined=sum(r["attacked"] and r["route"] == QUARANTINE for r in this_round),
+            attacked_dropped=sum(r["attacked"] and r["outcome"] == "dropped" for r in this_round),
+            honest_quarantined=sum((not r["attacked"]) and r["route"] == QUARANTINE for r in this_round),
+        ))
         log.info("[Run %d Round %d/%d] ValMSE %.4f | AUC %.4f | F1 %.4f | MeanClientAUC %.4f | "
                  "direct %d secondary %d quarantine %d (accepted %d) dropped %d | aggregated %d",
                  run_idx + 1, rnd, args.rounds, rec["global_val_mse"], rec["test_auc"], rec["test_f1"],
                  rec["mean_client_auc"], rec["direct"], rec["secondary"], rec["quarantined"],
                  rec["quarantine_accepted"], rec["dropped"], rec["aggregated"])
 
+    comet_finish(experiment)
     torch.save(aggregator.model.state_dict(), os.path.join(args.output_dir, f"{args.tag}_run{run_idx + 1}.pth"))
     return round_rows, routing_rows
 
@@ -406,6 +510,7 @@ if __name__ == "__main__":
     p.add_argument("--attack", choices=["none", "scale", "noise", "weight_scale", "report"], default="none")
     p.add_argument("--attack_strength", type=float, default=5.0)
     p.add_argument("--malicious", default="Client-7,Client-8", help="comma separated client names")
+    p.add_argument("--comet", action="store_true", help="also log every round to Comet (graphs)")
     for key, value in DEFAULTS.items():
         p.add_argument(f"--{key}", type=type(value), default=value)
     args = p.parse_args()
