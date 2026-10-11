@@ -1,0 +1,455 @@
+{
+  "data_path": "/content/drive/MyDrive/Prepared_dataset/nonIID-50-Client_Data",
+  "devices_list": [
+    {
+      "id": 1,
+      "name": "Client-1",
+      "normal_data_path": "Client-1/normal",
+      "abnormal_data_path": "Client-1/abnormal",
+      "test_normal_data_path": "Client-1/test_normal",
+      "simulated_training_time": 3.4,
+      "simulated_comm_time": 0.7
+    },
+    {
+      "id": 2,
+      "name": "Client-2",
+      "normal_data_path": "Client-2/normal",
+      "abnormal_data_path": "Client-2/abnormal",
+      "test_normal_data_path": "Client-2/test_normal",
+      "simulated_training_time": 3.2,
+      "simulated_comm_time": 0.8
+    },
+    {
+      "id": 3,
+      "name": "Client-3",
+      "normal_data_path": "Client-3/normal",
+      "abnormal_data_path": "Client-3/abnormal",
+      "test_normal_data_path": "Client-3/test_normal",
+      "simulated_training_time": 9.7,
+      "simulated_comm_time": 0.7
+    },
+    {
+      "id": 4,
+      "name": "Client-4",
+      "normal_data_path": "Client-4/normal",
+      "abnormal_data_path": "Client-4/abnormal",
+      "test_normal_data_path": "Client-4/test_normal",
+      "simulated_training_time": 3.9,
+      "simulated_comm_time": 2.1
+    },
+    {
+      "id": 5,
+      "name": "Client-5",
+      "normal_data_path": "Client-5/normal",
+      "abnormal_data_path": "Client-5/abnormal",
+      "test_normal_data_path": "Client-5/test_normal",
+      "simulated_training_time": 1.8,
+      "simulated_comm_time": 3.3
+    },
+    {
+      "id": 6,
+      "name": "Client-6",
+      "normal_data_path": "Client-6/normal",
+      "abnormal_data_path": "Client-6/abnormal",
+      "test_normal_data_path": "Client-6/test_normal",
+      "simulated_training_time": 8.4,
+      "simulated_comm_time": 0.4
+    },
+    {
+      "id": 7,
+      "name": "Client-7",
+      "normal_data_path": "Client-7/normal",
+      "abnormal_data_path": "Client-7/abnormal",
+      "test_normal_data_path": "Client-7/test_normal",
+      "simulated_training_time": 3.9,
+      "simulated_comm_time": 1.1
+    },
+    {
+      "id": 8,
+      "name": "Client-8",
+      "normal_data_path": "Client-8/normal",
+      "abnormal_data_path": "Client-8/abnormal",
+      "test_normal_data_path": "Client-8/test_normal",
+      "simulated_training_time": 9.8,
+      "simulated_comm_time": 0.5
+    },
+    {
+      "id": 9,
+      "name": "Client-9",
+      "normal_data_path": "Client-9/normal",
+      "abnormal_data_path": "Client-9/abnormal",
+      "test_normal_data_path": "Client-9/test_normal",
+      "simulated_training_time": 6.4,
+      "simulated_comm_time": 2.6
+    },
+    {
+      "id": 10,
+      "name": "Client-10",
+      "normal_data_path": "Client-10/normal",
+      "abnormal_data_path": "Client-10/abnormal",
+      "test_normal_data_path": "Client-10/test_normal",
+      "simulated_training_time": 6.7,
+      "simulated_comm_time": 3.2
+    },
+    {
+      "id": 11,
+      "name": "Client-11",
+      "normal_data_path": "Client-11/normal",
+      "abnormal_data_path": "Client-11/abnormal",
+      "test_normal_data_path": "Client-11/test_normal",
+      "simulated_training_time": 9.7,
+      "simulated_comm_time": 1.0
+    },
+    {
+      "id": 12,
+      "name": "Client-12",
+      "normal_data_path": "Client-12/normal",
+      "abnormal_data_path": "Client-12/abnormal",
+      "test_normal_data_path": "Client-12/test_normal",
+      "simulated_training_time": 8.4,
+      "simulated_comm_time": 0.9
+    },
+    {
+      "id": 13,
+      "name": "Client-13",
+      "normal_data_path": "Client-13/normal",
+      "abnormal_data_path": "Client-13/abnormal",
+      "test_normal_data_path": "Client-13/test_normal",
+      "simulated_training_time": 6.8,
+      "simulated_comm_time": 0.9
+    },
+    {
+      "id": 14,
+      "name": "Client-14",
+      "normal_data_path": "Client-14/normal",
+      "abnormal_data_path": "Client-14/abnormal",
+      "test_normal_data_path": "Client-14/test_normal",
+      "simulated_training_time": 3.0,
+      "simulated_comm_time": 2.8
+    },
+    {
+      "id": 15,
+      "name": "Client-15",
+      "normal_data_path": "Client-15/normal",
+      "abnormal_data_path": "Client-15/abnormal",
+      "test_normal_data_path": "Client-15/test_normal",
+      "simulated_training_time": 9.4,
+      "simulated_comm_time": 2.5
+    },
+    {
+      "id": 16,
+      "name": "Client-16",
+      "normal_data_path": "Client-16/normal",
+      "abnormal_data_path": "Client-16/abnormal",
+      "test_normal_data_path": "Client-16/test_normal",
+      "simulated_training_time": 2.0,
+      "simulated_comm_time": 0.9
+    },
+    {
+      "id": 17,
+      "name": "Client-17",
+      "normal_data_path": "Client-17/normal",
+      "abnormal_data_path": "Client-17/abnormal",
+      "test_normal_data_path": "Client-17/test_normal",
+      "simulated_training_time": 3.4,
+      "simulated_comm_time": 1.0
+    },
+    {
+      "id": 18,
+      "name": "Client-18",
+      "normal_data_path": "Client-18/normal",
+      "abnormal_data_path": "Client-18/abnormal",
+      "test_normal_data_path": "Client-18/test_normal",
+      "simulated_training_time": 5.1,
+      "simulated_comm_time": 0.9
+    },
+    {
+      "id": 19,
+      "name": "Client-19",
+      "normal_data_path": "Client-19/normal",
+      "abnormal_data_path": "Client-19/abnormal",
+      "test_normal_data_path": "Client-19/test_normal",
+      "simulated_training_time": 2.9,
+      "simulated_comm_time": 2.5
+    },
+    {
+      "id": 20,
+      "name": "Client-20",
+      "normal_data_path": "Client-20/normal",
+      "abnormal_data_path": "Client-20/abnormal",
+      "test_normal_data_path": "Client-20/test_normal",
+      "simulated_training_time": 4.7,
+      "simulated_comm_time": 3.1
+    },
+    {
+      "id": 21,
+      "name": "Client-21",
+      "normal_data_path": "Client-21/normal",
+      "abnormal_data_path": "Client-21/abnormal",
+      "test_normal_data_path": "Client-21/test_normal",
+      "simulated_training_time": 7.3,
+      "simulated_comm_time": 0.8
+    },
+    {
+      "id": 22,
+      "name": "Client-22",
+      "normal_data_path": "Client-22/normal",
+      "abnormal_data_path": "Client-22/abnormal",
+      "test_normal_data_path": "Client-22/test_normal",
+      "simulated_training_time": 8.7,
+      "simulated_comm_time": 1.0
+    },
+    {
+      "id": 23,
+      "name": "Client-23",
+      "normal_data_path": "Client-23/normal",
+      "abnormal_data_path": "Client-23/abnormal",
+      "test_normal_data_path": "Client-23/test_normal",
+      "simulated_training_time": 9.7,
+      "simulated_comm_time": 0.8
+    },
+    {
+      "id": 24,
+      "name": "Client-24",
+      "normal_data_path": "Client-24/normal",
+      "abnormal_data_path": "Client-24/abnormal",
+      "test_normal_data_path": "Client-24/test_normal",
+      "simulated_training_time": 9.0,
+      "simulated_comm_time": 2.9
+    },
+    {
+      "id": 25,
+      "name": "Client-25",
+      "normal_data_path": "Client-25/normal",
+      "abnormal_data_path": "Client-25/abnormal",
+      "test_normal_data_path": "Client-25/test_normal",
+      "simulated_training_time": 8.4,
+      "simulated_comm_time": 3.6
+    },
+    {
+      "id": 26,
+      "name": "Client-26",
+      "normal_data_path": "Client-26/normal",
+      "abnormal_data_path": "Client-26/abnormal",
+      "test_normal_data_path": "Client-26/test_normal",
+      "simulated_training_time": 6.1,
+      "simulated_comm_time": 0.4
+    },
+    {
+      "id": 27,
+      "name": "Client-27",
+      "normal_data_path": "Client-27/normal",
+      "abnormal_data_path": "Client-27/abnormal",
+      "test_normal_data_path": "Client-27/test_normal",
+      "simulated_training_time": 1.8,
+      "simulated_comm_time": 0.7
+    },
+    {
+      "id": 28,
+      "name": "Client-28",
+      "normal_data_path": "Client-28/normal",
+      "abnormal_data_path": "Client-28/abnormal",
+      "test_normal_data_path": "Client-28/test_normal",
+      "simulated_training_time": 5.7,
+      "simulated_comm_time": 0.6
+    },
+    {
+      "id": 29,
+      "name": "Client-29",
+      "normal_data_path": "Client-29/normal",
+      "abnormal_data_path": "Client-29/abnormal",
+      "test_normal_data_path": "Client-29/test_normal",
+      "simulated_training_time": 1.1,
+      "simulated_comm_time": 1.9
+    },
+    {
+      "id": 30,
+      "name": "Client-30",
+      "normal_data_path": "Client-30/normal",
+      "abnormal_data_path": "Client-30/abnormal",
+      "test_normal_data_path": "Client-30/test_normal",
+      "simulated_training_time": 4.7,
+      "simulated_comm_time": 3.1
+    },
+    {
+      "id": 31,
+      "name": "Client-31",
+      "normal_data_path": "Client-31/normal",
+      "abnormal_data_path": "Client-31/abnormal",
+      "test_normal_data_path": "Client-31/test_normal",
+      "simulated_training_time": 8.7,
+      "simulated_comm_time": 1.1
+    },
+    {
+      "id": 32,
+      "name": "Client-32",
+      "normal_data_path": "Client-32/normal",
+      "abnormal_data_path": "Client-32/abnormal",
+      "test_normal_data_path": "Client-32/test_normal",
+      "simulated_training_time": 8.2,
+      "simulated_comm_time": 1.0
+    },
+    {
+      "id": 33,
+      "name": "Client-33",
+      "normal_data_path": "Client-33/normal",
+      "abnormal_data_path": "Client-33/abnormal",
+      "test_normal_data_path": "Client-33/test_normal",
+      "simulated_training_time": 7.5,
+      "simulated_comm_time": 0.5
+    },
+    {
+      "id": 34,
+      "name": "Client-34",
+      "normal_data_path": "Client-34/normal",
+      "abnormal_data_path": "Client-34/abnormal",
+      "test_normal_data_path": "Client-34/test_normal",
+      "simulated_training_time": 2.2,
+      "simulated_comm_time": 2.1
+    },
+    {
+      "id": 35,
+      "name": "Client-35",
+      "normal_data_path": "Client-35/normal",
+      "abnormal_data_path": "Client-35/abnormal",
+      "test_normal_data_path": "Client-35/test_normal",
+      "simulated_training_time": 3.2,
+      "simulated_comm_time": 2.7
+    },
+    {
+      "id": 36,
+      "name": "Client-36",
+      "normal_data_path": "Client-36/normal",
+      "abnormal_data_path": "Client-36/abnormal",
+      "test_normal_data_path": "Client-36/test_normal",
+      "simulated_training_time": 5.7,
+      "simulated_comm_time": 0.3
+    },
+    {
+      "id": 37,
+      "name": "Client-37",
+      "normal_data_path": "Client-37/normal",
+      "abnormal_data_path": "Client-37/abnormal",
+      "test_normal_data_path": "Client-37/test_normal",
+      "simulated_training_time": 1.7,
+      "simulated_comm_time": 1.1
+    },
+    {
+      "id": 38,
+      "name": "Client-38",
+      "normal_data_path": "Client-38/normal",
+      "abnormal_data_path": "Client-38/abnormal",
+      "test_normal_data_path": "Client-38/test_normal",
+      "simulated_training_time": 9.3,
+      "simulated_comm_time": 0.5
+    },
+    {
+      "id": 39,
+      "name": "Client-39",
+      "normal_data_path": "Client-39/normal",
+      "abnormal_data_path": "Client-39/abnormal",
+      "test_normal_data_path": "Client-39/test_normal",
+      "simulated_training_time": 5.2,
+      "simulated_comm_time": 3.0
+    },
+    {
+      "id": 40,
+      "name": "Client-40",
+      "normal_data_path": "Client-40/normal",
+      "abnormal_data_path": "Client-40/abnormal",
+      "test_normal_data_path": "Client-40/test_normal",
+      "simulated_training_time": 8.4,
+      "simulated_comm_time": 2.8
+    },
+    {
+      "id": 41,
+      "name": "Client-41",
+      "normal_data_path": "Client-41/normal",
+      "abnormal_data_path": "Client-41/abnormal",
+      "test_normal_data_path": "Client-41/test_normal",
+      "simulated_training_time": 4.6,
+      "simulated_comm_time": 0.7
+    },
+    {
+      "id": 42,
+      "name": "Client-42",
+      "normal_data_path": "Client-42/normal",
+      "abnormal_data_path": "Client-42/abnormal",
+      "test_normal_data_path": "Client-42/test_normal",
+      "simulated_training_time": 8.0,
+      "simulated_comm_time": 0.6
+    },
+    {
+      "id": 43,
+      "name": "Client-43",
+      "normal_data_path": "Client-43/normal",
+      "abnormal_data_path": "Client-43/abnormal",
+      "test_normal_data_path": "Client-43/test_normal",
+      "simulated_training_time": 5.0,
+      "simulated_comm_time": 0.3
+    },
+    {
+      "id": 44,
+      "name": "Client-44",
+      "normal_data_path": "Client-44/normal",
+      "abnormal_data_path": "Client-44/abnormal",
+      "test_normal_data_path": "Client-44/test_normal",
+      "simulated_training_time": 1.1,
+      "simulated_comm_time": 3.2
+    },
+    {
+      "id": 45,
+      "name": "Client-45",
+      "normal_data_path": "Client-45/normal",
+      "abnormal_data_path": "Client-45/abnormal",
+      "test_normal_data_path": "Client-45/test_normal",
+      "simulated_training_time": 4.1,
+      "simulated_comm_time": 2.6
+    },
+    {
+      "id": 46,
+      "name": "Client-46",
+      "normal_data_path": "Client-46/normal",
+      "abnormal_data_path": "Client-46/abnormal",
+      "test_normal_data_path": "Client-46/test_normal",
+      "simulated_training_time": 5.7,
+      "simulated_comm_time": 0.8
+    },
+    {
+      "id": 47,
+      "name": "Client-47",
+      "normal_data_path": "Client-47/normal",
+      "abnormal_data_path": "Client-47/abnormal",
+      "test_normal_data_path": "Client-47/test_normal",
+      "simulated_training_time": 3.7,
+      "simulated_comm_time": 0.7
+    },
+    {
+      "id": 48,
+      "name": "Client-48",
+      "normal_data_path": "Client-48/normal",
+      "abnormal_data_path": "Client-48/abnormal",
+      "test_normal_data_path": "Client-48/test_normal",
+      "simulated_training_time": 9.3,
+      "simulated_comm_time": 0.6
+    },
+    {
+      "id": 49,
+      "name": "Client-49",
+      "normal_data_path": "Client-49/normal",
+      "abnormal_data_path": "Client-49/abnormal",
+      "test_normal_data_path": "Client-49/test_normal",
+      "simulated_training_time": 1.8,
+      "simulated_comm_time": 2.1
+    },
+    {
+      "id": 50,
+      "name": "Client-50",
+      "normal_data_path": "Client-50/normal",
+      "abnormal_data_path": "Client-50/abnormal",
+      "test_normal_data_path": "Client-50/test_normal",
+      "simulated_training_time": 1.5,
+      "simulated_comm_time": 2.2
+    }
+  ]
+}
