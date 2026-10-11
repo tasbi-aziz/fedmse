@@ -382,6 +382,11 @@ class Autoencoder(nn.Module):
         logvar has already been clipped inside the encoder.
         """
 
+        # Evaluation mode: use the mean (no random sampling), so that
+        # reconstruction errors / anomaly scores are deterministic.
+        if not self.training:
+            return mu
+
         # Standard deviation
         std = torch.exp(
             0.5 * logvar
