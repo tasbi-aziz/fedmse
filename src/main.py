@@ -149,7 +149,9 @@ DEFAULTS = dict(
     lr=1e-3,                   # local learning rate
     batch_size=64,
     runs=3,                    # independent repetitions (different seeds)
-    features=64,               # features kept by variance-based selection
+    features=64,               # features kept by variance-based selection (115 = keep all)
+    log_transform=1,           # 1 = clip negatives to 0 and apply log(1+x); 0 = skip (ablation)
+    scaler="standard",         # "standard" or "none" (none = raw values, ablation only)
     hidden=32,                 # VAE hidden layer
     latent=16,                 # VAE latent dimension
     kl_weight=1e-4,
@@ -210,9 +212,48 @@ def cpu_state(state):
     return {k: v.detach().cpu().clone() for k, v in state.items()}
 
 
+def client_drift(updates, global_state):
+    """
+    Measures how much the client updates of one round disagree (client drift).
+
+    cosine    : mean pairwise cosine similarity between the client updates
+                (1 = all clients move in the same direction, 0 = unrelated).
+    alignment : || weighted mean update || / weighted mean || update ||
+                (1 = no cancellation when averaging, lower = more drift).
+    """
+    keys = [k for k, v in global_state.items() if v.is_floating_point()]
+    g = torch.cat([global_state[k].flatten().float() for k in keys])
+    deltas = torch.stack([torch.cat([u["weights"][k].flatten().float() for k in keys]) - g for u in updates])
+    n = torch.tensor([float(u["dataset_size"]) for u in updates])
+    norms = deltas.norm(dim=1).clamp_min(1e-12)
+    unit = deltas / norms[:, None]
+    cos = unit @ unit.T
+    m = len(updates)
+    mean_cos = float((cos.sum() - cos.diag().sum()) / max(m * (m - 1), 1))
+    w = n / n.sum()
+    alignment = float((w[:, None] * deltas).sum(0).norm() / (w * norms).sum())
+    return mean_cos, alignment
+
+
 # ================================================================
 # DATA
 # ================================================================
+
+class RawProcessor:
+    """No preprocessing at all: the raw feature values are used as they are.
+    Only for the ablation that shows why preprocessing is needed."""
+
+    def fit_transform(self, frame):
+        return self.transform(frame)
+
+    def transform(self, frame, type="normal"):
+        x = frame.values.astype(np.float32)
+        label = np.zeros(len(x), dtype=np.float32) if type == "normal" else np.ones(len(x), dtype=np.float32)
+        return x, label
+
+
+_PROBE = {}
+
 
 def load_clients(config, data_path, args):
     """Loads every client's files and applies the common preprocessing."""
@@ -246,18 +287,47 @@ def load_clients(config, data_path, args):
 
     # Common preprocessing fitted once on the small server bootstrap set:
     # clip negatives to 0 -> log(1+x) -> top-variance features -> StandardScaler
-    processor = IoTDataProcessor(scaler="standard", use_log_transform=True,
-                                 n_selected_features=args.features)
+    if args.scaler == "none":
+        processor = RawProcessor()
+    else:
+        processor = IoTDataProcessor(scaler="standard", use_log_transform=bool(args.log_transform),
+                                     n_selected_features=args.features)
     boot_x, boot_y = processor.fit_transform(pd.concat([c["bootstrap"] for c in raw], ignore_index=True))
 
     pin = torch.cuda.is_available()
     clients = []
+    # ---- server attack probe set (behaviour check) ----
+    probe_parts, probe_take = [], {}
+    if getattr(args, "behavior_ratio", -1) > 0 or args.reserve_probe:
+        if args.probe_file:
+            px, _ = processor.transform(pd.read_csv(args.probe_file, header=None), type="abnormal")
+            rs = np.random.default_rng(args.data_seed)
+            probe_parts.append(px[rs.permutation(len(px))[:args.probe_n]])
+        else:
+            honest = [c["name"] for c in raw if c["name"] not in getattr(args, "_malicious", [])]
+            for nm in honest:
+                probe_take[nm] = max(1, args.probe_n // len(honest))
     for c in raw:
         tr_x, tr_y = processor.transform(c["train"])
         va_x, va_y = processor.transform(c["valid"])
         tn_x, _ = processor.transform(c["test_normal"])
         ab_x, _ = processor.transform(c["abnormal"], type="abnormal")
+        if probe_take.get(c["name"], 0) > 0:
+            k = probe_take[c["name"]]
+            probe_parts.append(ab_x[-k:]); ab_x = ab_x[:-k]     # server probe rows leave the test set
+        poison_loader = None
+        if args.attack == "poison" and c["name"] in getattr(args, "_malicious", []):
+            # DATA POISONING: replace a fraction of the client's normal training
+            # data with its own attack traffic (dataset size stays the same).
+            # The attack samples used for poisoning are removed from its test set.
+            n_p = min(int(args.poison_ratio * len(tr_x)), len(ab_x) // 2)
+            p_x = np.vstack([tr_x[:len(tr_x) - n_p], ab_x[:n_p]]).astype(tr_x.dtype)
+            p_y = np.zeros(len(p_x), dtype=tr_y.dtype)
+            poison_loader = DataLoader(IoTDataset(p_x, p_y), batch_size=args.batch_size, shuffle=True, pin_memory=pin)
+            ab_x = ab_x[n_p:]
+            log.info("  %s poisoned: %d of %d training rows replaced by attack traffic", c["name"], n_p, len(tr_x))
         clients.append(dict(
+            poison_loader=poison_loader,
             name=c["name"],
             train_loader=DataLoader(IoTDataset(tr_x, tr_y), batch_size=args.batch_size, shuffle=True, pin_memory=pin),
             valid_loader=DataLoader(IoTDataset(va_x, va_y), batch_size=args.batch_size, shuffle=False, pin_memory=pin),
@@ -268,6 +338,9 @@ def load_clients(config, data_path, args):
             sim_train_time=c["sim_train_time"],
             sim_comm_time=c["sim_comm_time"],
         ))
+    _PROBE["x"] = torch.tensor(np.vstack(probe_parts).astype(np.float32)) if probe_parts else None
+    if _PROBE["x"] is not None:
+        log.info("Server attack probe set: %d rows (%s)", len(_PROBE["x"]), "file" if args.probe_file else "honest clients' attack data")
     bootstrap_loader = DataLoader(IoTDataset(boot_x, boot_y), batch_size=args.batch_size, shuffle=True, pin_memory=pin)
     return clients, bootstrap_loader, boot_x.shape[1]
 
@@ -275,6 +348,55 @@ def load_clients(config, data_path, args):
 # ================================================================
 # ONE RUN
 # ================================================================
+
+
+# ================================================================
+# BASELINE ROBUST AGGREGATORS (for comparison with existing methods)
+# ================================================================
+
+def robust_aggregate(method, global_state, updates, n_malicious_assumed, server_delta=None, trim=0.2):
+    """Return a new global state from client updates with an existing robust rule.
+    median  : coordinate-wise median (Yin et al., 2018)
+    trimmed : coordinate-wise trimmed mean, trim fraction per side (Yin et al., 2018)
+    krum    : Krum, select the single most central update (Blanchard et al., 2017)
+    fltrust : FLTrust, cosine trust vs a server update on root data (Cao et al., 2021)
+    """
+    keys = [k for k in global_state if global_state[k].is_floating_point()]
+    shapes = [global_state[k].shape for k in keys]
+    sizes = [global_state[k].numel() for k in keys]
+    g = torch.cat([global_state[k].flatten().float() for k in keys])
+    D = torch.stack([torch.cat([u["weights"][k].flatten().float() for k in keys]) - g for u in updates])
+    D = torch.nan_to_num(D, nan=0.0, posinf=1e6, neginf=-1e6)
+    n = D.shape[0]
+    if method == "median":
+        agg = D.median(dim=0).values
+    elif method == "trimmed":
+        b = int(trim * n)
+        srt = D.sort(dim=0).values
+        agg = srt[b:n - b].mean(dim=0) if n - 2 * b > 0 else srt.mean(dim=0)
+    elif method == "krum":
+        f = n_malicious_assumed
+        dist = torch.cdist(D, D) ** 2
+        m = max(1, n - f - 2)
+        scores = torch.stack([dist[i][torch.arange(n) != i].sort().values[:m].sum() for i in range(n)])
+        agg = D[int(scores.argmin())]
+    elif method == "fltrust":
+        s0 = server_delta
+        s0n = s0.norm().clamp_min(1e-12)
+        dn = D.norm(dim=1).clamp_min(1e-12)
+        ts = torch.relu((D @ s0) / (dn * s0n))
+        if ts.sum() <= 0:
+            agg = torch.zeros_like(g)
+        else:
+            agg = ((ts / ts.sum())[:, None] * (D * (s0n / dn)[:, None])).sum(0)
+    else:
+        raise ValueError(method)
+    new = dict(global_state)
+    off = 0
+    for k, shp, sz in zip(keys, shapes, sizes):
+        new[k] = (g[off:off + sz] + agg[off:off + sz]).view(shp).to(global_state[k].dtype)
+        off += sz
+    return new
 
 def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malicious):
     seed = (run_idx + 1) * 10000
@@ -303,7 +425,11 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
     buffer = None
     if args.buffer != "off":
         buffer = SecurityBuffer(latency_threshold=args.latency_threshold,
-                                security_checks=(args.buffer == "security"))
+                                security_checks=(args.buffer == "security"),
+                                cos_min=(args.cos_min if args.cos_min > -1.5 else None),
+                                behavior_ratio=(args.behavior_ratio if args.behavior_ratio > 0 else None))
+    probe_ax = _PROBE.get("x")
+    probe_nx = server_val_x[:len(probe_ax)] if probe_ax is not None else None
 
     experiment = comet_start(args, run_idx, seed, len(clients), n_features, malicious)
 
@@ -313,7 +439,11 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
     for rnd in range(1, args.rounds + 1):
         t0 = time.time()
         global_state = cpu_state(aggregator.model.state_dict())
+        cost = dict(sec=0.0, fwd=0, bwd=0)
+        _t = time.perf_counter()
         global_mse = state_mse(global_model, global_state, server_val_x, device)
+        if args.buffer == "security":
+            cost["sec"] += time.perf_counter() - _t; cost["fwd"] += len(server_val_x)
 
         to_aggregate = []
 
@@ -337,7 +467,8 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
                                     save_dir=os.path.join(args.output_dir, "clients", c["name"]),
                                     epoch=args.epochs, lr_rate=args.lr, update_type="fedavg",
                                     device=str(device), kl_weight=args.kl_weight)
-            trainer.run(c["train_loader"], c["valid_loader"])
+            use_poison = (c.get("poison_loader") is not None and rnd >= args.attack_start_round)
+            trainer.run(c["poison_loader"] if use_poison else c["train_loader"], c["valid_loader"])
             local_val.append(trainer.val_loss)
             local_train_recon.append(trainer.reconstruction_loss)
             local_train_total.append(trainer.reconstruction_loss + args.kl_weight * trainer.kl_loss)
@@ -355,17 +486,64 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
 
             is_malicious = c["name"] in malicious and rnd >= args.attack_start_round and args.attack != "none"
             if is_malicious:
-                update = manipulate_update(update, global_state, args.attack, args.attack_strength)
+                if args.attack != "poison":
+                    update = manipulate_update(update, global_state, args.attack, args.attack_strength)
 
             incoming.append((c, update, bool(is_malicious)))
 
-        # ---- 4. routing of all updates received in this round's window ----
-        if buffer is not None:
-            buffer.begin_round([u for _, u, _ in incoming], global_state)
+        honest = [u for _, u, mal in incoming if not mal]
+        drift_cos, drift_align = client_drift(honest, global_state)
 
+        # ---- 4. routing of all updates received in this round's window ----
+        _t = time.perf_counter()
+        if buffer is not None:
+            bscores = None
+            if buffer.behavior_ratio is not None and buffer.security_checks and probe_ax is not None:
+                bscores = {}
+                for _, u, _ in incoming:
+                    try:
+                        ea = state_mse(global_model, u["weights"], probe_ax, device)
+                        en = state_mse(global_model, u["weights"], probe_nx, device)
+                        sc = ea / max(en, 1e-12)
+                    except Exception:
+                        sc = float("nan")
+                    bscores[str(u["client_id"])] = sc if np.isfinite(sc) else float("nan")
+                    cost["fwd"] += len(probe_ax) + len(probe_nx)
+            buffer.begin_round([u for _, u, _ in incoming], global_state, behavior_scores=bscores)
+        cost["sec"] += time.perf_counter() - _t
+
+        afl_reject = set()
+        _t = time.perf_counter()
+        if args.aflguard > 0:
+            cost["fwd"] += args.epochs * len(bootstrap_loader.dataset)
+            cost["bwd"] += args.epochs * len(bootstrap_loader.dataset)
+            # AFLGuard (Fang et al., ACSAC 2022): server update on trusted root data,
+            # accept a client update only if ||g_i - g_s|| <= lambda * ||g_s||
+            st = ClientTrainer(model=aggregator.model, client_id="SERVER_ROOT",
+                               save_dir=os.path.join(args.output_dir, "server_root"),
+                               epoch=args.epochs, lr_rate=args.lr, update_type="fedavg",
+                               device=str(device), kl_weight=args.kl_weight)
+            st.run(bootstrap_loader, None)
+            sw = cpu_state(st.get_parameters())
+            kf = [k for k in global_state if global_state[k].is_floating_point()]
+            gs = torch.cat([(sw[k] - global_state[k]).flatten().float() for k in kf])
+            for c, update, _ in incoming:
+                gi = torch.cat([(update["weights"][k] - global_state[k]).flatten().float() for k in kf])
+                gi = torch.nan_to_num(gi, nan=1e6, posinf=1e6, neginf=-1e6)
+                if (gi - gs).norm() > args.aflguard * gs.norm():
+                    afl_reject.add(c["name"])
+
+        cost["sec"] += time.perf_counter() - _t
         for c, update, is_malicious in incoming:
+            _t = time.perf_counter()
             row = dict(run=run_idx + 1, round=rnd, client=c["name"], attacked=is_malicious,
                        latency=round(update["arrival_time"], 3))
+            if c["name"] in afl_reject:
+                counts[DROP] += 1
+                row.update(latency_class="-", failed_checks="aflguard", warmup=False,
+                           route=DROP, outcome="dropped", weight=0.0)
+                routing_rows.append(row)
+                continue
 
             if buffer is None:                                   # no buffer at all
                 route, outcome, weight = DIRECT, "aggregated_now", 1.0
@@ -374,14 +552,20 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
                 diag = buffer.route(update, global_state)
                 route = diag["route"]
                 row.update(latency_class=diag["latency_class"], failed_checks="+".join(diag["failed_checks"]),
-                           warmup=diag["warmup"], relative_magnitude=diag.get("measured", {}).get("magnitude"),
+                           warmup=diag["warmup"], relative_magnitude=diag.get("measured", {}).get("magnitude"), cosine=diag.get("cosine"),
+                           behavior_score=diag.get("behavior_score"), behavior_median=diag.get("behavior_median"),
                            raw_magnitude=diag.get("raw_magnitude"))
                 if route == DIRECT:
                     outcome, weight = "aggregated_now", 1.0
                 elif route == SECONDARY:
                     outcome, weight = "next_round", args.secondary_weight
+                elif route == QUARANTINE and "behavior" in diag["failed_checks"]:
+                    # the probe test IS the server-side validation for this failure:
+                    # a model that has learned attack traffic as normal is never admitted
+                    outcome, weight = "dropped", 0.0
                 elif route == QUARANTINE:
                     # server-side validation of the suspicious local model
+                    cost["fwd"] += len(server_val_x)
                     try:
                         cand_mse = state_mse(global_model, update["weights"], server_val_x, device)
                     except Exception:
@@ -395,6 +579,7 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
                 else:
                     outcome, weight = "dropped", 0.0
 
+            cost["sec"] += time.perf_counter() - _t
             counts[route] += 1
             row.update(route=route, outcome=outcome, weight=weight)
             routing_rows.append(row)
@@ -409,7 +594,21 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
                                       weight=weight, route=route))
 
         # ---- 5. aggregation ----
-        if to_aggregate:
+        if to_aggregate and args.robust != "none":
+            server_delta = None
+            if args.robust == "fltrust":
+                st = ClientTrainer(model=aggregator.model, client_id="SERVER_ROOT",
+                                   save_dir=os.path.join(args.output_dir, "server_root"),
+                                   epoch=args.epochs, lr_rate=args.lr, update_type="fedavg",
+                                   device=str(device), kl_weight=args.kl_weight)
+                st.run(bootstrap_loader, None)
+                sw = cpu_state(st.get_parameters())
+                keys_f = [k for k in global_state if global_state[k].is_floating_point()]
+                server_delta = torch.cat([(sw[k] - global_state[k]).flatten().float() for k in keys_f])
+            n_mal = max(1, int(round(0.2 * len(to_aggregate))))
+            new_state = robust_aggregate(args.robust, global_state, to_aggregate, n_mal, server_delta)
+            aggregator.model.load_state_dict({k: v.to(next(aggregator.model.parameters()).device) for k, v in new_state.items()})
+        elif to_aggregate:
             aggregator.aggregate(client_updates=to_aggregate)
 
         # ---- 6. evaluation of the new global model ----
@@ -428,6 +627,7 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
 
         rec = dict(run=run_idx + 1, round=rnd, global_val_mse=float(np.mean(val_err)),
                    mean_local_val_mse=float(np.mean(local_val)), threshold=threshold,
+                   update_cosine=drift_cos, update_alignment=drift_align,
                    test_auc=g["auc"], test_f1=g["f1"], test_precision=g["precision"], test_recall=g["recall"],
                    mean_client_auc=float(np.mean(list(client_auc.values()))),
                    min_client_auc=float(np.min(list(client_auc.values()))),
@@ -435,7 +635,8 @@ def run_once(run_idx, clients, bootstrap_loader, n_features, args, device, malic
                    direct=counts[DIRECT], secondary=counts[SECONDARY], quarantined=counts[QUARANTINE],
                    quarantine_accepted=counts["quarantine_accepted"],
                    dropped=sum(1 for r in routing_rows if r["run"] == run_idx + 1 and r["round"] == rnd and r["outcome"] == "dropped"),
-                   seconds=round(time.time() - t0, 2), client_auc=client_auc)
+                   seconds=round(time.time() - t0, 2), client_auc=client_auc,
+                   defense_seconds=cost["sec"], server_fwd_samples=cost["fwd"], server_bwd_samples=cost["bwd"])
         round_rows.append(rec)
 
         this_round = [r for r in routing_rows if r["run"] == run_idx + 1 and r["round"] == rnd]
@@ -507,9 +708,18 @@ if __name__ == "__main__":
     p.add_argument("--output_dir", default="./results")
     p.add_argument("--tag", default=None, help="name used for the output files")
     p.add_argument("--buffer", choices=["off", "latency", "security"], default="security")
-    p.add_argument("--attack", choices=["none", "scale", "noise", "weight_scale", "report"], default="none")
+    p.add_argument("--attack", choices=["none", "scale", "noise", "weight_scale", "report", "time", "loss", "mse", "poison"], default="none")
+    p.add_argument("--poison_ratio", type=float, default=0.5, help="data poisoning: fraction of training rows replaced by attack traffic")
     p.add_argument("--attack_strength", type=float, default=5.0)
     p.add_argument("--malicious", default="Client-7,Client-8", help="comma separated client names")
+    p.add_argument("--robust", choices=["none", "median", "trimmed", "krum", "fltrust"], default="none",
+                   help="existing robust aggregation rule (use with --buffer off)")
+    p.add_argument("--behavior_ratio", type=float, default=-1.0, help="behaviour check: fail if probe score < ratio * round median (<=0 disables)")
+    p.add_argument("--reserve_probe", type=int, default=1, help="always hold out the probe rows from the test set (same test set with/without the check)")
+    p.add_argument("--probe_n", type=int, default=300, help="size of the server attack probe set")
+    p.add_argument("--probe_file", default=None, help="headerless CSV of attack rows for the server probe set (else taken from honest clients' attack data)")
+    p.add_argument("--cos_min", type=float, default=-2.0, help="direction check: min cosine to the round median update (-2 disables)")
+    p.add_argument("--aflguard", type=float, default=0.0, help="AFLGuard lambda (>0 enables; use with --buffer latency)")
     p.add_argument("--comet", action="store_true", help="also log every round to Comet (graphs)")
     for key, value in DEFAULTS.items():
         p.add_argument(f"--{key}", type=type(value), default=value)
@@ -530,6 +740,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seeds(args.data_seed)
 
+    args._malicious = malicious
     clients, bootstrap_loader, n_features = load_clients(config, data_path, args)
     log.info("Clients: %d | features: %d | buffer: %s | attack: %s (strength %s) on %s from round %d",
              len(clients), n_features, args.buffer, args.attack, args.attack_strength, malicious, args.attack_start_round)
