@@ -65,6 +65,8 @@ class SecurityBuffer:
         history_size: int = 5,
         min_history: int = 2,
         security_checks: bool = True,
+        cos_min: Optional[float] = None,
+        behavior_ratio: Optional[float] = None,
     ):
         self.latency_threshold = latency_threshold
         self.magnitude_ratio = magnitude_ratio
@@ -79,6 +81,15 @@ class SecurityBuffer:
         self.security_checks = security_checks
         self.history: Dict[str, Dict[str, List[float]]] = {}
         self.round_median_magnitude: Optional[float] = None
+        # direction check: cosine between an update and the coordinate-wise median
+        # update of the round must be >= cos_min (None disables the check)
+        self.cos_min = cos_min
+        self.round_median_delta: Optional[torch.Tensor] = None
+        # behaviour check: score = probe attack error / probe normal error of the
+        # local model (measured by the SERVER); fail if score < ratio * round median
+        self.behavior_ratio = behavior_ratio
+        self.behavior_scores: Dict[str, float] = {}
+        self.behavior_median: Optional[float] = None
 
     # ------------------------------------------------------------------
     # helpers
@@ -105,7 +116,8 @@ class SecurityBuffer:
                 total += float(torch.sum(d * d))
         return math.sqrt(total)
 
-    def begin_round(self, updates: List[Dict[str, Any]], global_state: Dict[str, torch.Tensor]) -> float:
+    def begin_round(self, updates: List[Dict[str, Any]], global_state: Dict[str, torch.Tensor],
+                    behavior_scores: Optional[Dict[str, float]] = None) -> float:
         """
         Call once per round with all updates received in this round's window.
         Stores the median update magnitude, the yardstick for check 1.
@@ -114,7 +126,22 @@ class SecurityBuffer:
         mags = [self.update_magnitude(u["weights"], global_state) for u in updates
                 if self.is_finite(u["weights"])]
         self.round_median_magnitude = float(median(mags)) if mags else None
+        self.behavior_scores = dict(behavior_scores or {})
+        fin = [v for v in self.behavior_scores.values() if math.isfinite(v)]
+        self.behavior_median = float(median(fin)) if fin else None
+        self.round_median_delta = None
+        if self.cos_min is not None:
+            ds = [self.delta_vector(u["weights"], global_state) for u in updates if self.is_finite(u["weights"])]
+            if ds:
+                self.round_median_delta = torch.stack(ds).median(dim=0).values
         return self.round_median_magnitude
+
+    @staticmethod
+    def delta_vector(weights: Dict[str, torch.Tensor], global_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        parts = [(weights[n].detach().float().cpu() - g.detach().float().cpu()).flatten()
+                 for n, g in global_state.items()
+                 if n in weights and torch.is_tensor(g) and g.is_floating_point()]
+        return torch.cat(parts)
 
     def _hist(self, client_id: str) -> Dict[str, List[float]]:
         return self.history.setdefault(
@@ -172,12 +199,31 @@ class SecurityBuffer:
             "mse_std": math.sqrt(sum((v - mse_mean) ** 2 for v in mse_list) / max(len(mse_list), 1)),
         }
         diag["measured"] = measured
+        cosine = None
+        if self.cos_min is not None and self.round_median_delta is not None:
+            d = self.delta_vector(update["weights"], global_state)
+            cosine = float(torch.nn.functional.cosine_similarity(d, self.round_median_delta, dim=0))
+        diag["cosine"] = cosine
+        bscore = self.behavior_scores.get(cid)
+        diag["behavior_score"] = bscore
+        diag["behavior_median"] = self.behavior_median
 
         failed: List[str] = []
-        refs = {k: self._reference(cid, k) for k in measured}
+        refs = {k: self._reference(cid, k) for k in self._hist(cid)}
         warmup = refs["magnitude"] is None
         diag["reference"] = refs
         diag["warmup"] = warmup
+
+        # round-relative checks need no client history -> active from round 1
+        if self.security_checks:
+            # 5. direction: update points away from the round's consensus direction
+            if cosine is not None and cosine < self.cos_min:
+                failed.append("direction")
+            # 6. behaviour on the server probe set: attack traffic reconstructed far
+            #    better than by the other clients' models -> learned attacks as normal
+            if (self.behavior_ratio is not None and bscore is not None and self.behavior_median is not None
+                    and (not math.isfinite(bscore) or bscore < self.behavior_ratio * self.behavior_median)):
+                failed.append("behavior")
 
         if self.security_checks and not warmup:
             eps = 1e-12
@@ -205,8 +251,8 @@ class SecurityBuffer:
             self.remember(cid, measured)          # clean update -> becomes reference
 
         logger.info(
-            "[SecurityBuffer] %s | %.2fs %s | relative magnitude=%.2f | failed=%s%s -> %s",
-            cid, latency, latency_class, measured["magnitude"],
+            "[SecurityBuffer] %s | %.2fs %s | relative magnitude=%.2f | cos=%s | failed=%s%s -> %s",
+            cid, latency, latency_class, measured["magnitude"], "-" if cosine is None else f"{cosine:.3f}",
             failed if failed else "none", " (warm-up)" if warmup else "", diag["route"],
         )
         return diag
